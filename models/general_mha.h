@@ -21,7 +21,9 @@ class MLPImpl : public torch::nn::Module {
         torch::Tensor forward(torch::Tensor x);
 
     private:
-        torch::nn::Linear gate_proj{nullptr}, up_proj{nullptr}, down_proj{nullptr};
+        torch::nn::Linear gate_proj{nullptr};
+        torch::nn::Linear up_proj{nullptr};
+        torch::nn::Linear down_proj{nullptr};
 };
 TORCH_MODULE(MLP);
 
