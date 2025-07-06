@@ -43,6 +43,9 @@ torch::Tensor MultiHeadAttentionImpl::forward(torch::Tensor x, torch::Tensor mas
   q = rope.apply_rotary(q);
   k = rope.apply_rotary(k);
 
+  // cache update
+  auto [k_cache_out, v_cache_out] = kv_cache->update(k, v);
+
   auto attn_scores = torch::matmul(q, k.transpose(-2, -1)) / std::sqrt((double)head_dim);
   if (mask.defined()) {
     attn_scores = attn_scores.masked_fill(mask == 0, -1e9);

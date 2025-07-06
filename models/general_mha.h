@@ -3,6 +3,7 @@
 
 #include <torch/torch.h>
 #include "rope.h"
+#include "cache.h"
 
 class RMSNormImpl : public torch::nn::Module {
     public:
@@ -39,10 +40,14 @@ class MultiHeadAttentionImpl : public torch::nn::Module {
         torch::Tensor forward(torch::Tensor x, torch::Tensor mask = {});
 
     private:
-        torch::nn::Linear q_proj{nullptr}, k_proj{nullptr}, v_proj{nullptr}, out_proj{nullptr};
+        torch::nn::Linear q_proj{nullptr};
+        torch::nn::Linear k_proj{nullptr};
+        torch::nn::Linear v_proj{nullptr};
+        torch::nn::Linear out_proj{nullptr};
         int64_t num_heads;
         int64_t head_dim;
         RotaryEmbedding rope;
+        KVCache kv_cache;
 };
 TORCH_MODULE(MultiHeadAttention);
 
