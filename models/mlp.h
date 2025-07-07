@@ -1,0 +1,14 @@
+// Multilayer Perceptron (MLP)
+#include <torch/torch.h>
+
+class MLPImpl : public torch::nn::Module {
+    public:
+        MLPImpl(int64_t input_dim, int64_t hidden_dim);
+        torch::Tensor forward(torch::Tensor x);
+
+    private:
+        torch::nn::Linear gate_proj{nullptr};
+        torch::nn::Linear up_proj{nullptr};
+        torch::nn::Linear down_proj{nullptr};
+};
+TORCH_MODULE(MLP);

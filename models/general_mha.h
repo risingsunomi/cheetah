@@ -1,48 +1,9 @@
-// general_mha.h
-#pragma once
-
 #include <torch/torch.h>
 #include "rope.h"
-
-class RMSNormImpl : public torch::nn::Module {
-    public:
-        RMSNormImpl(int64_t hidden_size, float eps = 1e-5);
-        torch::Tensor forward(const torch::Tensor& input);
-
-    private:
-        torch::Tensor weight;
-        float eps;
-};
-TORCH_MODULE(RMSNorm);
-
-class MLPImpl : public torch::nn::Module {
-    public:
-        MLPImpl(int64_t input_dim, int64_t hidden_dim);
-        torch::Tensor forward(torch::Tensor x);
-
-    private:
-        torch::nn::Linear gate_proj{nullptr}, up_proj{nullptr}, down_proj{nullptr};
-};
-TORCH_MODULE(MLP);
-
-class MultiHeadAttentionImpl : public torch::nn::Module {
-    public:
-        MultiHeadAttentionImpl(
-            int64_t embed_dim,
-            int64_t num_heads,
-            int64_t head_dim,
-            int64_t max_seq_len
-        );
-
-        torch::Tensor forward(torch::Tensor x, torch::Tensor mask = {});
-
-    private:
-        torch::nn::Linear q_proj{nullptr}, k_proj{nullptr}, v_proj{nullptr}, out_proj{nullptr};
-        int64_t num_heads;
-        int64_t head_dim;
-        RotaryEmbedding rope;
-};
-TORCH_MODULE(MultiHeadAttention);
+#include "attention.h"
+#include "cache.h"
+#include "rms.h"
+#include "mlp.h"
 
 class TransformerBlockImpl : public torch::nn::Module {
     public:

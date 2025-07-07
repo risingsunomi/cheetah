@@ -1,0 +1,12 @@
+#include <torch/torch.h>
+
+class RMSNormImpl : public torch::nn::Module {
+    public:
+        RMSNormImpl(int64_t hidden_size, float eps = 1e-5);
+        torch::Tensor forward(const torch::Tensor& input);
+
+    private:
+        torch::Tensor weight;
+        float eps;
+};
+TORCH_MODULE(RMSNorm);
