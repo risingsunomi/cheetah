@@ -1,61 +1,88 @@
-#ifndef CHEETAH_MODELS_TRANSFORMER_H
-#define CHEETAH_MODELS_TRANSFORMER_H
+#ifndef TRANSFORMER_H
+#define TRANSFORMER_H
 
 #include <torch/torch.h>
 #include <vector>
 #include <memory>
 #include "attention.h"
+#include "mlp.h"
+#include "rms.h"
 #include "cache.h"
+#include "shard.h"
 
-class TransformerDecoderImpl : public torch::nn::Module {
+class TransformerSelfAttentionLayerImpl : public torch::nn::Module {
 public:
-    TransformerDecoderImpl(
-        torch::nn::Embedding tok_embeddings,
-        std::vector<torch::nn::ModuleHolder<MultiHeadAttentionImpl>> layers,
-        int64_t max_seq_len,
-        int64_t num_heads,
-        int64_t head_dim,
-        torch::nn::ModuleHolder<torch::nn::Module> norm,
-        torch::nn::ModuleHolder<torch::nn::Module> output,
-        std::vector<int> output_hidden_states = {}
+    TransformerSelfAttentionLayerImpl(
+        MultiHeadAttention attn,
+        MLP mlp,
+        torch::nn::AnyModule sa_norm,
+        torch::nn::AnyModule mlp_norm,
+        c10::optional<torch::nn::AnyModule> sa_scale = c10::nullopt,
+        c10::optional<torch::nn::AnyModule> mlp_scale = c10::nullopt
     );
 
     torch::Tensor forward(
-        const torch::Tensor& tokens,
+        const torch::Tensor& x,
         const c10::optional<torch::Tensor>& mask = c10::nullopt,
-        const c10::optional<torch::Tensor>& encoder_input = c10::nullopt,
-        const c10::optional<torch::Tensor>& encoder_mask = c10::nullopt,
         const c10::optional<torch::Tensor>& input_pos = c10::nullopt
+    );
+
+    void setup_cache(int64_t batch_size, torch::Dtype dtype, int64_t decoder_max_seq_len);
+    bool caches_are_setup() const;
+    bool caches_are_enabled() const;
+    void reset_cache();
+
+private:
+    MultiHeadAttention attn;
+    MLP mlp;
+    torch::nn::AnyModule sa_norm;
+    torch::nn::AnyModule mlp_norm;
+    torch::nn::AnyModule sa_scale;
+    torch::nn::AnyModule mlp_scale;
+};
+
+TORCH_MODULE(TransformerSelfAttentionLayer);
+
+// ---- Sharded Transformer Decoder --- //
+class ShardTransformerDecoderImpl : public torch::nn::Module {
+public:
+    ShardTransformerDecoderImpl(
+        const Shard& shard,
+        torch::nn::Embedding tok_embeddings,
+        std::vector<TransformerSelfAttentionLayer> layers,
+        int64_t max_seq_len,
+        int64_t num_heads,
+        int64_t head_dim,
+        RMSNorm norm,
+        torch::nn::Linear  output
     );
 
     void setup_caches(
         int64_t batch_size,
         torch::Dtype dtype,
-        c10::optional<int64_t> encoder_max_seq_len = c10::nullopt,
         c10::optional<int64_t> decoder_max_seq_len = c10::nullopt
     );
 
-    void reset_caches();
-    bool caches_are_setup() const;
     bool caches_are_enabled() const;
+    void reset_caches();
 
-    void set_num_output_chunks(int64_t num_chunks);
+    torch::Tensor forward(
+        const torch::Tensor& tokens,
+        c10::optional<torch::Tensor> mask = c10::nullopt,
+        c10::optional<torch::Tensor> input_pos = c10::nullopt,
+        c10::optional<torch::Tensor> hidden_state = c10::nullopt,
+        torch::Dtype dtype = torch::kBFloat16
+    );
 
 private:
-    torch::nn::Embedding tok_embeddings;
-    std::vector<torch::nn::ModuleHolder<MultiHeadAttentionImpl>> layers;
-    torch::nn::ModuleHolder<torch::nn::Module> norm;
-    torch::nn::ModuleHolder<torch::nn::Module> output;
-
-    std::vector<int> output_hidden_states;
+    Shard shard;
+    torch::nn::Embedding tok_embeddings{nullptr};
+    std::vector<TransformerSelfAttentionLayer> layers;
+    RMSNorm norm{nullptr};
+    torch::nn::Linear output{nullptr};
     int64_t max_seq_len;
-    int64_t num_heads;
-    int64_t head_dim;
-    int64_t num_output_chunks = 0;
-
-    int64_t encoder_max_cache_seq_len = -1;
     int64_t decoder_max_cache_seq_len = -1;
 };
-TORCH_MODULE(TransformerDecoder);
+TORCH_MODULE(ShardTransformerDecoder);
 
-#endif // CHEETAH_MODELS_TRANSFORMER_H
+#endif // TRANSFORMER_H

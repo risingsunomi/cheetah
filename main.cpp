@@ -1,6 +1,7 @@
 #include <torch/torch.h>
 #include <iostream>
-#include "models/general_model.h"
+#include "models/general_mha_model.h"
+#include "models/shard.h"
 
 int main() {
   torch::manual_seed(42);
@@ -18,29 +19,38 @@ int main() {
   int64_t seq_len = 10;
 
   // Initialize model
+  auto shard = Shard("test_model", layer_start, layer_end, layer_total);
   auto model = GeneralMHAModel(
-    layer_start,
-    layer_end,
-    layer_total,
+    shard,
     vocab_size,
     embed_dim,
     hidden_dim,
     num_heads,
     num_kv_heads,
     head_dim,
-    seq_len
+    seq_len,
+    true
   );
 
-  model->eval();
+  // * currently testing only self attention layer *
 
-  // Random token input
-  auto tokens = torch::randint(0, vocab_size, {1, seq_len}, torch::kInt64);
+  model.eval();
 
-  // Run forward pass
-  auto output = model->forward(tokens);
+  // === Inputs ===
+  auto tokens = torch::randint(0, vocab_size, {1, seq_len}, torch::kLong);  
+  auto mask = torch::ones({seq_len, seq_len}, torch::kBool).tril(); 
+  mask = mask.unsqueeze(0);
+  auto input_pos = torch::arange(seq_len, torch::kLong).unsqueeze(0); 
 
-  // Print outputs
-  std::cout << "Output shape: " << output.sizes() << std::endl;
+  // === Forward ===
+  auto output = model.forward(
+    tokens,                        // tokens: [1, seq_len]
+    mask,                          // mask:   [1, seq_len, seq_len]
+    input_pos                      // input_pos: [1, seq_len]
+  );
+
+  // === Output ===
+  std::cout << "Self Attention Layer Output shape: " << output.sizes() << std::endl;
   std::cout << "First token logits (first 10 values):" << std::endl;
   std::cout << output[0][0].slice(0, 0, 10) << std::endl;
 

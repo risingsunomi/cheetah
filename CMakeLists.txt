@@ -12,7 +12,9 @@ add_executable(main
   models/rms.cpp
   models/rope.cpp
   models/cache.cpp
-  models/general_model.cpp
+  models/general_mha_model.cpp
+  models/transformer.cpp
+  models/shard.cpp
 )
 target_link_libraries(main "${TORCH_LIBRARIES}")
 set_property(TARGET main PROPERTY CXX_STANDARD 17)

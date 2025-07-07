@@ -10,38 +10,32 @@
 #include "rms.h"
 #include "mlp.h"
 #include "transformer.h"
+#include "shard.h"
 
-class GeneralMHAModelImpl : public torch::nn::Module {
+class GeneralMHAModel : public torch::nn::Module {
     public:
-        GeneralMHAModelImpl(
-            int64_t layer_start,
-            int64_t layer_end,
-            int64_t layer_total,
+        GeneralMHAModel(
+            const Shard& shard,
             int64_t vocab_size,
             int64_t embed_dim,
             int64_t hidden_dim,
             int64_t num_heads,
             int64_t num_kv_heads,
             int64_t head_dim,
-            int64_t max_seq_len
+            int64_t max_seq_len,
+            bool is_cache_enabled = false
         );
         torch::Tensor forward(
             const torch::Tensor& tokens,
             const c10::optional<torch::Tensor>& mask,
-            const c10::optional<torch::Tensor>& encoder_input,
-            const c10::optional<torch::Tensor>& encoder_mask,
             const c10::optional<torch::Tensor>& input_pos
         );
 
+        bool is_cache_enabled;
+        std::vector<TransformerSelfAttentionLayer> self_attn_layers;
+
     private:
-        torch::nn::Embedding tok_embeddings{nullptr};
-        torch::nn::Linear output_proj{nullptr};
-        TransformerDecoder decoder = nullptr;
-        RMSNorm final_norm = nullptr;
-        int64_t layer_start;
-        int64_t layer_end;
-        int64_t layer_total;
+        const Shard& shard;
 };
-TORCH_MODULE(GeneralMHAModel);
 
 #endif // GENERAL_MHA_MODEL_H

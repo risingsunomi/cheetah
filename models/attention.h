@@ -28,15 +28,15 @@ public:
     void setup_cache(
         int64_t batch_size,
         torch::Dtype dtype,
-        int64_t encoder_max_cache_seq_len,
-        int64_t decoder_max_cache_seq_len);
+        int64_t max_seq_len = 2048
+    );
     void reset_cache();
 
     torch::Tensor forward(
         torch::Tensor x,
-        torch::optional<torch::Tensor> y = torch::nullopt,
-        torch::optional<torch::Tensor> mask = torch::nullopt,
-        torch::optional<torch::Tensor> input_pos = torch::nullopt);
+        c10::optional<torch::Tensor> y = c10::nullopt,
+        c10::optional<torch::Tensor> mask = c10::nullopt,
+        c10::optional<torch::Tensor> input_pos = c10::nullopt);
 
 private:
     int64_t embed_dim;
