@@ -1,3 +1,6 @@
+#ifndef RMS_NORM_H
+#define RMS_NORM_H
+
 #include <torch/torch.h>
 
 class RMSNormImpl : public torch::nn::Module {
@@ -10,3 +13,5 @@ class RMSNormImpl : public torch::nn::Module {
         float eps;
 };
 TORCH_MODULE(RMSNorm);
+
+#endif // RMS_NORM_H
