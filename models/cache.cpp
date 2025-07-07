@@ -1,7 +1,11 @@
 #include "cache.h"
 
-KVCacheImpl::KVCacheImpl(int64_t batch_size, int64_t max_seq_len, int64_t num_kv_heads, int64_t head_dim, torch::Dtype dtype) : batch_size(batch_size)
-{
+KVCache::KVCache(
+  int64_t batch_size,
+  int64_t max_seq_len,
+  int64_t num_kv_heads,
+  int64_t head_dim,
+  torch::Dtype dtype) : batch_size(batch_size) {
     auto cache_shape = std::vector<int64_t>{batch_size, num_kv_heads, max_seq_len, head_dim};
 
     k_cache = register_buffer("k_cache", torch::zeros(cache_shape, dtype));
@@ -9,21 +13,21 @@ KVCacheImpl::KVCacheImpl(int64_t batch_size, int64_t max_seq_len, int64_t num_kv
     cache_pos = register_buffer("cache_pos", torch::arange(0, max_seq_len));
 }
 
-void KVCacheImpl::reset()
+void KVCache::reset()
 {
     k_cache.zero_();
     v_cache.zero_();
     cache_pos -= size();
 }
 
-int64_t KVCacheImpl::size() const
+int64_t KVCache::size() const
 {
     return cache_pos[0].item<int64_t>();
 }
 
 
 // Update the cache with new key and value tensors
-std::tuple<torch::Tensor, torch::Tensor> KVCacheImpl::update(
+std::tuple<torch::Tensor, torch::Tensor> KVCache::update(
     const torch::Tensor& k_val,
     const torch::Tensor& v_val
 )

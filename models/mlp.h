@@ -1,4 +1,7 @@
 // Multilayer Perceptron (MLP)
+#ifndef MLP_H
+#define MLP_H
+
 #include <torch/torch.h>
 
 class MLPImpl : public torch::nn::Module {
@@ -12,3 +15,5 @@ class MLPImpl : public torch::nn::Module {
         torch::nn::Linear down_proj{nullptr};
 };
 TORCH_MODULE(MLP);
+
+#endif // MLP_H

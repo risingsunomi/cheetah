@@ -7,9 +7,12 @@ find_package(Torch REQUIRED)
 
 add_executable(main
   main.cpp
-  models/general_mha.cpp
+  models/attention.cpp
+  models/mlp.cpp
+  models/rms.cpp
   models/rope.cpp
   models/cache.cpp
+  models/general_model.cpp
 )
 target_link_libraries(main "${TORCH_LIBRARIES}")
 set_property(TARGET main PROPERTY CXX_STANDARD 17)

@@ -13,7 +13,8 @@ MultiHeadAttentionImpl::MultiHeadAttentionImpl(
   std::shared_ptr<RotaryEmbedding> pos_emb,
   std::shared_ptr<KVCache> kv_cache,
   bool is_causal,
-  double attn_dropout
+  double attn_dropout,
+  bool is_cache_enabled
 ) :
   embed_dim(embed_dim),
   num_heads(num_heads),
@@ -27,16 +28,21 @@ MultiHeadAttentionImpl::MultiHeadAttentionImpl(
   kv_cache(kv_cache),
   is_causal(is_causal),
   attn_dropout(attn_dropout),
-  cache_enabled(false) {
+  cache_enabled(is_cache_enabled) {
     register_module("q_proj", q_proj);
     register_module("k_proj", k_proj);
     register_module("v_proj", v_proj);
     register_module("out_proj", out_proj);
 }
 
-void MultiHeadAttentionImpl::setup_cache(int64_t batch_size, torch::Dtype dtype, int64_t max_seq_len) {
+void MultiHeadAttentionImpl::setup_cache(
+  int64_t batch_size,
+  torch::Dtype dtype,
+  int64_t encoder_max_cache_seq_len,
+  int64_t decoder_max_cache_seq_len) {
   if (kv_cache) return;
-  kv_cache = std::make_shared<KVCache>(batch_size, max_seq_len, num_kv_heads, head_dim, dtype);
+  kv_cache = std::make_shared<KVCache>(
+    batch_size, max_seq_len, num_kv_heads, head_dim, dtype);
   cache_enabled = true;
 }
 
@@ -98,7 +104,7 @@ torch::Tensor MultiHeadAttentionImpl::forward(
   }
 
   if (!kv_cache || !cache_enabled) {
-    throw std::runtime_error("y is None and cache not enabled");
+    throw std::runtime_error("kv_cache is null and cache not enabled");
   }
 
   auto k = kv_cache->k_cache;

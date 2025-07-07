@@ -89,7 +89,7 @@ void RotaryEmbedding::build_rope_cache(int max_seq_len) {
 
 torch::Tensor RotaryEmbedding::apply(const torch::Tensor& x, const torch::Tensor& input_pos) {
   if (!is_cache_built) {
-    TORCH_CHECK(false, "RoPE cache not built. Call rope_init() first.");
+    rope_init();
   }
 
   int64_t b = x.size(0);

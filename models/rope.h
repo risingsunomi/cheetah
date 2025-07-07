@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ROPE_H
+#define ROPE_H
 
 #include <torch/torch.h>
 #include <optional>
@@ -38,3 +39,5 @@ private:
     torch::Tensor theta, cache;
     std::optional<std::string> cache_key;
 };
+
+#endif // ROPE_H
