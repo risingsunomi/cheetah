@@ -4,22 +4,22 @@
 TransformerSelfAttentionLayerImpl::TransformerSelfAttentionLayerImpl(
     MultiHeadAttention attn,
     MLP mlp,
-    torch::nn::AnyModule sa_norm,
-    torch::nn::AnyModule mlp_norm,
-    c10::optional<torch::nn::AnyModule> sa_scale,
-    c10::optional<torch::nn::AnyModule> mlp_scale
+    c10::optional<torch::nn::AnyModule> sa_norm_,
+    c10::optional<torch::nn::AnyModule> mlp_norm_,
+    c10::optional<torch::nn::AnyModule> sa_scale_,
+    c10::optional<torch::nn::AnyModule> mlp_scale_
 ) : attn(attn), mlp(mlp) {
-    sa_norm = sa_norm.is_empty() ? torch::nn::AnyModule(torch::nn::Identity()) : sa_norm;
-    mlp_norm = mlp_norm.is_empty() ? torch::nn::AnyModule(torch::nn::Identity()) : mlp_norm;
-    sa_scale = sa_scale ? torch::nn::AnyModule(torch::nn::Identity()) : sa_scale;
-    mlp_scale = mlp_scale ? torch::nn::AnyModule(torch::nn::Identity()) : mlp_scale;
+    sa_norm = sa_norm_.has_value() ? *sa_norm_ : torch::nn::AnyModule(torch::nn::Identity());
+    mlp_norm = mlp_norm_.has_value() ? *mlp_norm_ : torch::nn::AnyModule(torch::nn::Identity());
+    sa_scale = sa_scale_.has_value() ? *sa_scale_ : torch::nn::AnyModule(torch::nn::Identity());
+    mlp_scale = mlp_scale_.has_value() ? *mlp_scale_ : torch::nn::AnyModule(torch::nn::Identity());
 
     register_module("attn", attn);
     register_module("mlp", mlp);
     register_module("sa_norm", sa_norm.ptr());
     register_module("mlp_norm", mlp_norm.ptr());
-    register_module("sa_scale", sa_scale->ptr()); // Always register
-    register_module("mlp_scale", mlp_scale->ptr()); // Always register
+    register_module("sa_scale", sa_scale.ptr());
+    register_module("mlp_scale", mlp_scale.ptr());
 }
 
 void TransformerSelfAttentionLayerImpl::setup_cache(
@@ -48,7 +48,9 @@ torch::Tensor TransformerSelfAttentionLayerImpl::forward(
     const c10::optional<torch::Tensor>& mask,
     const c10::optional<torch::Tensor>& input_pos
 ) {
+    std::cout << "Forwarding TransformerSelfAttentionLayer" << std::endl;
     torch::Tensor h = sa_norm.forward(x);
+    std::cout << "After sa_norm: " << h.sizes() << std::endl;
     auto attn_out = attn->forward(h, h, mask, input_pos);
     h = sa_scale.forward(attn_out) + x;
     auto mlp_out = mlp->forward(mlp_norm.forward(h));
@@ -59,22 +61,24 @@ torch::Tensor TransformerSelfAttentionLayerImpl::forward(
 
 // shard_transformer_decoder.cpp
 ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
-    const Shard& shard,
-    torch::nn::Embedding tok_embeddings,
-    std::vector<TransformerSelfAttentionLayer> layers,
-    int64_t max_seq_len,
-    int64_t num_heads,
-    int64_t head_dim,
-    RMSNorm norm,
-    torch::nn::Linear output
+    const Shard& shard_,
+    torch::nn::Embedding tok_embeddings_,
+    std::vector<TransformerSelfAttentionLayer> layers_,
+    int64_t max_seq_len_,
+    int64_t num_heads_,
+    int64_t head_dim_,
+    RMSNorm norm_,
+    torch::nn::Linear output_
 ) :
-    shard(shard),
-    tok_embeddings(tok_embeddings),
-    layers(std::move(layers)),
-    norm(norm),
-    output(output),
-    max_seq_len(max_seq_len)
+    shard(shard_),
+    tok_embeddings(tok_embeddings_),
+    layers(layers_),
+    norm(norm_),
+    output(output_),
+    max_seq_len(max_seq_len_)
 {
+    std::cout << "\nCreating ShardTransformerDecoderImpl with shard: "
+              << shard.start_layer << " to " << shard.end_layer << std::endl;
     register_module("tok_embeddings", tok_embeddings);
     register_module("norm", norm);
     register_module("output", output);
@@ -118,6 +122,7 @@ torch::Tensor ShardTransformerDecoderImpl::forward(
     c10::optional<torch::Tensor> hidden_state,
     torch::Dtype dtype
 ) {
+    std::cout << "Forwarding ShardTransformerDecoderImpl" << std::endl;
     torch::Tensor h;
     if (hidden_state.has_value()) {
         h = hidden_state.value();
@@ -125,7 +130,10 @@ torch::Tensor ShardTransformerDecoderImpl::forward(
         h = tok_embeddings->forward(tokens).to(dtype);
     }
 
-    for (int i = shard.start_layer; i <= shard.end_layer; ++i) {
+    std::cout << "After token embeddings: " << h.sizes() << std::endl;
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        std::cout << "Processing layer " << i << std::endl;
         h = layers[i]->forward(
             h,
             mask.value_or(torch::Tensor()),

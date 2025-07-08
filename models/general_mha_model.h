@@ -15,7 +15,7 @@
 class GeneralMHAModel : public torch::nn::Module {
     public:
         GeneralMHAModel(
-            const Shard& shard,
+            const Shard& shard_,
             int64_t vocab_size,
             int64_t embed_dim,
             int64_t hidden_dim,
@@ -28,11 +28,13 @@ class GeneralMHAModel : public torch::nn::Module {
         torch::Tensor forward(
             const torch::Tensor& tokens,
             const c10::optional<torch::Tensor>& mask,
-            const c10::optional<torch::Tensor>& input_pos
+            const c10::optional<torch::Tensor>& input_pos,
+            const c10::optional<torch::Tensor>& hidden_state
         );
 
         bool is_cache_enabled;
         std::vector<TransformerSelfAttentionLayer> self_attn_layers;
+        ShardTransformerDecoder shard_decoder = nullptr;
 
     private:
         const Shard& shard;

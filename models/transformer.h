@@ -15,10 +15,10 @@ public:
     TransformerSelfAttentionLayerImpl(
         MultiHeadAttention attn,
         MLP mlp,
-        torch::nn::AnyModule sa_norm,
-        torch::nn::AnyModule mlp_norm,
-        c10::optional<torch::nn::AnyModule> sa_scale = c10::nullopt,
-        c10::optional<torch::nn::AnyModule> mlp_scale = c10::nullopt
+        c10::optional<torch::nn::AnyModule> sa_norm_ = c10::nullopt,
+        c10::optional<torch::nn::AnyModule> mlp_norm_ = c10::nullopt,
+        c10::optional<torch::nn::AnyModule> sa_scale_ = c10::nullopt,
+        c10::optional<torch::nn::AnyModule> mlp_scale_ = c10::nullopt
     );
 
     torch::Tensor forward(
@@ -47,14 +47,14 @@ TORCH_MODULE(TransformerSelfAttentionLayer);
 class ShardTransformerDecoderImpl : public torch::nn::Module {
 public:
     ShardTransformerDecoderImpl(
-        const Shard& shard,
-        torch::nn::Embedding tok_embeddings,
-        std::vector<TransformerSelfAttentionLayer> layers,
-        int64_t max_seq_len,
-        int64_t num_heads,
-        int64_t head_dim,
-        RMSNorm norm,
-        torch::nn::Linear  output
+        const Shard& shard_,
+        torch::nn::Embedding tok_embeddings_,
+        std::vector<TransformerSelfAttentionLayer> layers_,
+        int64_t max_seq_len_,
+        int64_t num_heads_,
+        int64_t head_dim_,
+        RMSNorm norm_,
+        torch::nn::Linear output_
     );
 
     void setup_caches(
