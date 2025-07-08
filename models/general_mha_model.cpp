@@ -3,7 +3,7 @@
 #include "attention.h"
 
 GeneralMHAModel::GeneralMHAModel(
-    const Shard& shard,
+    const Shard& shard_,
     int64_t vocab_size,
     int64_t embed_dim,
     int64_t hidden_dim,
@@ -12,7 +12,7 @@ GeneralMHAModel::GeneralMHAModel(
     int64_t head_dim,
     int64_t max_seq_len,
     bool is_cache_enabled
-) : shard(shard),
+) : shard(shard_),
     is_cache_enabled(is_cache_enabled) {
 
     // add grabbing informaiton from model json config
@@ -53,12 +53,24 @@ GeneralMHAModel::GeneralMHAModel(
         self_attn_layers.push_back(
             register_module("layer_" + std::to_string(i), transformer_layer));
     }
+
+    shard_decoder = ShardTransformerDecoder(
+        shard,
+        torch::nn::Embedding(vocab_size, embed_dim),
+        self_attn_layers,
+        max_seq_len,
+        num_heads,
+        head_dim,
+        RMSNorm(embed_dim),
+        torch::nn::Linear(embed_dim, vocab_size)
+    );
 }
 
 torch::Tensor GeneralMHAModel::forward(
     const torch::Tensor& tokens,
     const c10::optional<torch::Tensor>& mask,
-    const c10::optional<torch::Tensor>& input_pos
+    const c10::optional<torch::Tensor>& input_pos,
+    const c10::optional<torch::Tensor>& hidden_state
 ) {
-    return self_attn_layers[0]->forward(tokens, mask, input_pos);
+    return shard_decoder->forward(tokens, mask, input_pos, hidden_state);
 }

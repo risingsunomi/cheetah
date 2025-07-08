@@ -37,16 +37,17 @@ int main() {
   model.eval();
 
   // === Inputs ===
-  auto tokens = torch::randint(0, vocab_size, {1, seq_len}, torch::kLong);  
+  auto tokens = torch::randint(0, vocab_size, {1, seq_len}, torch::kLong);
   auto mask = torch::ones({seq_len, seq_len}, torch::kBool).tril(); 
   mask = mask.unsqueeze(0);
-  auto input_pos = torch::arange(seq_len, torch::kLong).unsqueeze(0); 
+  auto input_pos = torch::arange(seq_len, torch::kInt32).unsqueeze(0);
 
   // === Forward ===
   auto output = model.forward(
-    tokens,                        // tokens: [1, seq_len]
-    mask,                          // mask:   [1, seq_len, seq_len]
-    input_pos                      // input_pos: [1, seq_len]
+    tokens,
+    mask,
+    input_pos,
+    c10::nullopt
   );
 
   // === Output ===
