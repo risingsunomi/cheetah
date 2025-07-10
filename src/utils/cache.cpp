@@ -1,4 +1,4 @@
-#include "../utils/cache.h"
+#include "cache.h"
 
 KVCache::KVCache(
   int64_t batch_size,

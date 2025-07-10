@@ -1,6 +1,4 @@
 #include "general_mha_model.h"
-#include "transformer.h"
-#include "attention.h"
 
 GeneralMHAModel::GeneralMHAModel(
     const Shard& shard_,
@@ -21,7 +19,7 @@ GeneralMHAModel::GeneralMHAModel(
     for (int64_t i = shard.start_layer; i < shard.end_layer; ++i) {
         // Instantiate TransformerSelfAttentionLayer
         auto transformer_layer = register_module(
-            "transformer",
+            "transformer_self_attention_layer_" + std::to_string(i),
             TransformerSelfAttentionLayer(
                 MultiHeadAttention(
                     embed_dim,

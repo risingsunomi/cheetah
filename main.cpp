@@ -1,15 +1,15 @@
 #include <torch/torch.h>
 #include <iostream>
-#include "transformer/general_mha_model.h"
-#include "utils/shard.h"
+#include "src/general_mha_model.h"
+#include "src/utils/shard.h"
 
 int main() {
   torch::manual_seed(42);
 
   // Model hyperparameters
   int64_t layer_start = 0;
-  int64_t layer_end = 1;
-  int64_t layer_total = 1;
+  int64_t layer_end = 21;
+  int64_t layer_total = 22;
   int64_t vocab_size = 30522;
   int64_t embed_dim = 256;
   int64_t hidden_dim = 1024;
@@ -41,6 +41,11 @@ int main() {
   auto mask = torch::ones({seq_len, seq_len}, torch::kBool).tril(); 
   mask = mask.unsqueeze(0);
   auto input_pos = torch::arange(seq_len, torch::kInt32).unsqueeze(0);
+
+  std::cout << "Input tokens shape: " << tokens.sizes() << std::endl;
+  std::cout << "Input mask shape: " << mask.sizes() << std::endl;
+  std::cout << "Input positions shape: " << input_pos.sizes() << std::endl;
+  std::cout << "Input tokens: " << tokens << std::endl;
 
   // === Forward ===
   auto output = model.forward(

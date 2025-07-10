@@ -7,15 +7,15 @@ find_package(Torch REQUIRED)
 
 add_executable(main
   main.cpp
-  transformer/attention.cpp
-  transformer/mlp.cpp
-  transformer/rms.cpp
-  transformer/rope.cpp
-  transformer/general_mha_model.cpp
-  transformer/transformer.cpp
+  src/attention.cpp
+  src/mlp.cpp
+  src/rms.cpp
+  src/rope.cpp
+  src/general_mha_model.cpp
+  src/transformers.cpp
 
-  utils/cache.cpp
-  utils/shard.cpp
+  src/utils/cache.cpp
+  src/utils/shard.cpp
 )
 target_link_libraries(main "${TORCH_LIBRARIES}")
 set_property(TARGET main PROPERTY CXX_STANDARD 17)

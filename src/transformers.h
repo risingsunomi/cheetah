@@ -1,5 +1,5 @@
-#ifndef TRANSFORMER_H
-#define TRANSFORMER_H
+#ifndef TRANSFORMERS_H
+#define TRANSFORMERS_H
 
 #include <torch/torch.h>
 #include <vector>
@@ -7,8 +7,8 @@
 #include "attention.h"
 #include "mlp.h"
 #include "rms.h"
-#include "../utils/cache.h"
-#include "../utils/shard.h"
+#include "utils/cache.h"
+#include "utils/shard.h"
 
 class TransformerSelfAttentionLayerImpl : public torch::nn::Module {
 public:

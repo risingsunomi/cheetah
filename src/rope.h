@@ -4,7 +4,7 @@
 #include <torch/torch.h>
 #include <optional>
 #include <string>
-#include "../utils/cache.h"
+#include "utils/cache.h"
 
 class RotaryEmbedding
 {

@@ -1,4 +1,4 @@
-#include "../utils/shard.h"
+#include "shard.h"
 
 Shard::Shard(const std::string& model_id, int start_layer, int end_layer, int n_layers)
     : model_id(model_id),
