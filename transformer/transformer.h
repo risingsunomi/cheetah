@@ -7,8 +7,8 @@
 #include "attention.h"
 #include "mlp.h"
 #include "rms.h"
-#include "cache.h"
-#include "shard.h"
+#include "../utils/cache.h"
+#include "../utils/shard.h"
 
 class TransformerSelfAttentionLayerImpl : public torch::nn::Module {
 public:
