@@ -6,11 +6,11 @@
 #include <torch/torch.h>
 #include "rope.h"
 #include "attention.h"
-#include "cache.h"
+#include "../utils/cache.h"
 #include "rms.h"
 #include "mlp.h"
 #include "transformer.h"
-#include "shard.h"
+#include "../utils/shard.h"
 
 class GeneralMHAModel : public torch::nn::Module {
     public:

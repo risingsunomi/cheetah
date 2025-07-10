@@ -1,7 +1,7 @@
 #include <torch/torch.h>
 #include <iostream>
-#include "models/general_mha_model.h"
-#include "models/shard.h"
+#include "transformer/general_mha_model.h"
+#include "utils/shard.h"
 
 int main() {
   torch::manual_seed(42);
