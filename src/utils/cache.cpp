@@ -1,12 +1,12 @@
 #include "cache.h"
 
 KVCache::KVCache(
-  int64_t batch_size,
-  int64_t max_seq_len,
-  int64_t num_kv_heads,
-  int64_t head_dim,
+  int batch_size,
+  int max_seq_len,
+  int num_kv_heads,
+  int head_dim,
   torch::Dtype dtype) : batch_size(batch_size) {
-    auto cache_shape = std::vector<int64_t>{batch_size, num_kv_heads, max_seq_len, head_dim};
+    auto cache_shape = std::vector<int>{batch_size, num_kv_heads, max_seq_len, head_dim};
 
     k_cache = register_buffer("k_cache", torch::zeros(cache_shape, dtype));
     v_cache = register_buffer("v_cache", torch::zeros(cache_shape, dtype));
@@ -20,9 +20,9 @@ void KVCache::reset()
     cache_pos -= size();
 }
 
-int64_t KVCache::size() const
+int KVCache::size() const
 {
-    return cache_pos[0].item<int64_t>();
+    return cache_pos[0].item<int>();
 }
 
 
@@ -34,7 +34,7 @@ std::tuple<torch::Tensor, torch::Tensor> KVCache::update(
 {
     // k_val, v_val: [B, H, S, D]
     batch_size = k_val.size(0);
-    int64_t seq_len = k_val.size(2);
+    int seq_len = k_val.size(2);
 
     if (batch_size > k_cache.size(0)) {
         throw std::runtime_error("Batch size exceeds cache capacity");

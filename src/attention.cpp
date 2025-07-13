@@ -2,10 +2,10 @@
 #include "attention.h"
 
 MultiHeadAttentionImpl::MultiHeadAttentionImpl(
-  int64_t embed_dim,
-  int64_t num_heads,
-  int64_t num_kv_heads,
-  int64_t head_dim,
+  int embed_dim,
+  int num_heads,
+  int num_kv_heads,
+  int head_dim,
   torch::nn::Linear q_proj,
   torch::nn::Linear k_proj,
   torch::nn::Linear v_proj,
@@ -36,9 +36,9 @@ MultiHeadAttentionImpl::MultiHeadAttentionImpl(
 }
 
 void MultiHeadAttentionImpl::setup_cache(
-  int64_t batch_size,
+  int batch_size,
   torch::Dtype dtype,
-  int64_t max_seq_len) {
+  int max_seq_len) {
   
     if (kv_cache) return;
   
@@ -66,11 +66,11 @@ torch::Tensor MultiHeadAttentionImpl::forward(
     c10::optional<torch::Tensor> attention_mask,
     c10::optional<torch::Tensor> input_positions
 ) {
-    const int64_t batch_size = query_input.size(0);
-    const int64_t query_seq_len = query_input.size(1);
+    const int batch_size = query_input.size(0);
+    const int query_seq_len = query_input.size(1);
 
     torch::Tensor query_proj = q_proj->forward(query_input);
-    const int64_t queries_per_kv_head = num_heads / num_kv_heads;
+    const int queries_per_kv_head = num_heads / num_kv_heads;
     query_proj = query_proj.view({batch_size, query_seq_len, num_kv_heads * queries_per_kv_head, head_dim});
 
     if (pos_emb) {
@@ -80,7 +80,7 @@ torch::Tensor MultiHeadAttentionImpl::forward(
     query_proj = query_proj.transpose(1, 2);
     if (key_value_input.has_value()) {
         const torch::Tensor& kv_input = key_value_input.value();
-        const int64_t kv_seq_len = kv_input.size(1);
+        const int kv_seq_len = kv_input.size(1);
         torch::Tensor key_proj = k_proj->forward(kv_input).view({batch_size, kv_seq_len, num_kv_heads, head_dim});
         torch::Tensor value_proj = v_proj->forward(kv_input).view({batch_size, kv_seq_len, num_kv_heads, head_dim});
 
@@ -97,7 +97,7 @@ torch::Tensor MultiHeadAttentionImpl::forward(
         }
 
         if (num_heads != num_kv_heads) {
-            std::vector<int64_t> expanded_shape = {
+            std::vector<int> expanded_shape = {
                 batch_size, num_kv_heads, queries_per_kv_head, -1, head_dim
             };
             

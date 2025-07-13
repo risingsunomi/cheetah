@@ -36,7 +36,7 @@ void send_all(int sock, const void *buf, size_t len)
     }
 }
 
-torch::Tensor recv_tensor_view(const char *&buffer_ptr, size_t &offset, const std::vector<int64_t> &shape, torch::ScalarType dtype)
+torch::Tensor recv_tensor_view(const char *&buffer_ptr, size_t &offset, const std::vector<int> &shape, torch::ScalarType dtype)
 {
     size_t numel = 1;
     for (auto s : shape)
@@ -51,7 +51,7 @@ torch::Tensor recv_tensor_view(const char *&buffer_ptr, size_t &offset, const st
 
 void send_tensor(int sock, const torch::Tensor &tensor)
 {
-    std::vector<int64_t> shape_vec(tensor.sizes().begin(), tensor.sizes().end());
+    std::vector<int> shape_vec(tensor.sizes().begin(), tensor.sizes().end());
     json header = {{"command", "response"}, {"dtype", "int64"}, {"shape", shape_vec}};
     std::string header_str = header.dump();
     uint32_t header_len = htonl(header_str.size());
@@ -88,14 +88,14 @@ int main()
     int layer_start = header["layer_start"];
     int layer_end = header["layer_end"];
     std::string dtype = header["dtype"];
-    std::vector<int64_t> shape_input = header["shape_input"];
-    std::vector<int64_t> shape_mask = header["shape_mask"];
+    std::vector<int> shape_input = header["shape_input"];
+    std::vector<int> shape_mask = header["shape_mask"];
 
     torch::ScalarType scalar = (dtype == "int64") ? torch::kInt64 : throw std::runtime_error("Unsupported dtype");
     auto scalar_size = torch::elementSize(scalar);
     auto input_prod = torch::prod(torch::tensor(shape_input));
     auto mask_prod = torch::prod(torch::tensor(shape_mask));
-    size_t total_bytes = scalar_size * input_prod.item<int64_t>() + mask_prod.item<int64_t>();
+    size_t total_bytes = scalar_size * input_prod.item<int>() + mask_prod.item<int>();
 
     std::vector<char> buffer(total_bytes);
     recv_all(client_fd, buffer.data(), total_bytes);

@@ -27,7 +27,7 @@ public:
         const c10::optional<torch::Tensor>& input_pos = c10::nullopt
     );
 
-    void setup_cache(int64_t batch_size, torch::Dtype dtype, int64_t decoder_max_seq_len);
+    void setup_cache(int batch_size, torch::Dtype dtype, int decoder_max_seq_len);
     bool caches_are_setup() const;
     bool caches_are_enabled() const;
     void reset_cache();
@@ -50,15 +50,15 @@ public:
         const Shard& shard_,
         torch::nn::Embedding tok_embeddings_,
         std::vector<TransformerSelfAttentionLayer> layers_,
-        int64_t max_seq_len_,
+        int max_seq_len_,
         RMSNorm norm_,
         torch::nn::Linear output_
     );
 
     void setup_caches(
-        int64_t batch_size,
+        int batch_size,
         torch::Dtype dtype,
-        c10::optional<int64_t> decoder_max_seq_len = c10::nullopt
+        c10::optional<int> decoder_max_seq_len = c10::nullopt
     );
 
     bool caches_are_enabled() const;
@@ -78,8 +78,8 @@ private:
     std::vector<TransformerSelfAttentionLayer> layers;
     RMSNorm norm{nullptr};
     torch::nn::Linear output{nullptr};
-    int64_t max_seq_len;
-    int64_t decoder_max_cache_seq_len = -1;
+    int max_seq_len;
+    int decoder_max_cache_seq_len = -1;
 };
 TORCH_MODULE(ShardTransformerDecoder);
 

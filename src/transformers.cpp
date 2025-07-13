@@ -23,9 +23,9 @@ TransformerSelfAttentionLayerImpl::TransformerSelfAttentionLayerImpl(
 }
 
 void TransformerSelfAttentionLayerImpl::setup_cache(
-    int64_t batch_size,
+    int batch_size,
     torch::Dtype dtype,
-    int64_t decoder_max_seq_len) {
+    int decoder_max_seq_len) {
     attn->setup_cache(batch_size, dtype, decoder_max_seq_len);
 }
 
@@ -64,7 +64,7 @@ ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
     const Shard& shard_,
     torch::nn::Embedding tok_embeddings_,
     std::vector<TransformerSelfAttentionLayer> layers_,
-    int64_t max_seq_len_,
+    int max_seq_len_,
     RMSNorm norm_,
     torch::nn::Linear output_
 ) :
@@ -86,9 +86,9 @@ ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
 }
 
 void ShardTransformerDecoderImpl::setup_caches(
-    int64_t batch_size,
+    int batch_size,
     torch::Dtype dtype,
-    c10::optional<int64_t> decoder_max_seq_len
+    c10::optional<int> decoder_max_seq_len
 ) {
     decoder_max_cache_seq_len = decoder_max_seq_len.value_or(max_seq_len);
     for (auto& layer : layers) {

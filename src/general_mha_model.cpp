@@ -2,13 +2,13 @@
 
 GeneralMHAModel::GeneralMHAModel(
     const Shard& shard_,
-    int64_t vocab_size_,
-    int64_t embed_dim_,
-    int64_t hidden_dim_,
-    int64_t num_heads_,
-    int64_t num_kv_heads_,
-    int64_t head_dim_,
-    int64_t max_seq_len_,
+    int vocab_size_,
+    int embed_dim_,
+    int hidden_dim_,
+    int num_heads_,
+    int num_kv_heads_,
+    int head_dim_,
+    int max_seq_len_,
     float_t rope_scaling_,
     bool is_cache_enabled
 ) : shard(shard_),
@@ -25,7 +25,7 @@ GeneralMHAModel::GeneralMHAModel(
     // add grabbing informaiton from model json config
 
     // Create decoder layers from layer_start to layer_end
-    for (int64_t i = shard.start_layer; i < shard.end_layer; ++i) {
+    for (int i = shard.start_layer; i < shard.end_layer; ++i) {
         // Instantiate TransformerSelfAttentionLayer
         auto transformer_layer = register_module(
             "transformer_self_attention_layer_" + std::to_string(i),

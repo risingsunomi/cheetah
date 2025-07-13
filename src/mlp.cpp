@@ -1,6 +1,6 @@
 #include "mlp.h"
 
-MLPImpl::MLPImpl(int64_t embed_dim, int64_t hidden_dim) {
+MLPImpl::MLPImpl(int embed_dim, int hidden_dim) {
   gate_proj = register_module(
     "gate_proj",
     torch::nn::Linear(

@@ -8,10 +8,10 @@
 class MultiHeadAttentionImpl : public torch::nn::Module {
 public:
     MultiHeadAttentionImpl(
-        int64_t embed_dim,
-        int64_t num_heads,
-        int64_t num_kv_heads,
-        int64_t head_dim,
+        int embed_dim,
+        int num_heads,
+        int num_kv_heads,
+        int head_dim,
         torch::nn::Linear q_proj,
         torch::nn::Linear k_proj,
         torch::nn::Linear v_proj,
@@ -26,9 +26,9 @@ public:
     std::shared_ptr<KVCache> kv_cache;
     bool is_cache_enabled;
     void setup_cache(
-        int64_t batch_size,
+        int batch_size,
         torch::Dtype dtype,
-        int64_t max_seq_len = 2048
+        int max_seq_len = 2048
     );
     void reset_cache();
 
@@ -39,11 +39,11 @@ public:
         c10::optional<torch::Tensor> input_pos = c10::nullopt);
 
 private:
-    int64_t embed_dim;
-    int64_t num_heads;
-    int64_t num_kv_heads;
-    int64_t head_dim;
-    int64_t max_seq_len;
+    int embed_dim;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int max_seq_len;
     double attn_dropout;
     bool is_causal;
     

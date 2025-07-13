@@ -5,7 +5,7 @@
 
 class RMSNormImpl : public torch::nn::Module {
     public:
-        RMSNormImpl(int64_t hidden_size, float eps = 1e-5);
+        RMSNormImpl(int hidden_size, float eps = 1e-5);
         torch::Tensor forward(const torch::Tensor& input);
 
     private:

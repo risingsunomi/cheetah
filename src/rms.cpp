@@ -1,6 +1,6 @@
 #include "rms.h"
 
-RMSNormImpl::RMSNormImpl(int64_t hidden_size, float eps)
+RMSNormImpl::RMSNormImpl(int hidden_size, float eps)
     : eps(eps) {
   weight = register_parameter("weight", torch::ones({hidden_size}));
 }
