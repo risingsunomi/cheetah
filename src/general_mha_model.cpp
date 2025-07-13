@@ -2,16 +2,25 @@
 
 GeneralMHAModel::GeneralMHAModel(
     const Shard& shard_,
-    int64_t vocab_size,
-    int64_t embed_dim,
-    int64_t hidden_dim,
-    int64_t num_heads,
-    int64_t num_kv_heads,
-    int64_t head_dim,
-    int64_t max_seq_len,
+    int64_t vocab_size_,
+    int64_t embed_dim_,
+    int64_t hidden_dim_,
+    int64_t num_heads_,
+    int64_t num_kv_heads_,
+    int64_t head_dim_,
+    int64_t max_seq_len_,
+    float_t rope_scaling_,
     bool is_cache_enabled
 ) : shard(shard_),
-    is_cache_enabled(is_cache_enabled) {
+    is_cache_enabled(is_cache_enabled),
+    vocab_size(vocab_size_),
+    embed_dim(embed_dim_),
+    hidden_dim(hidden_dim_),
+    num_heads(num_heads_),
+    num_kv_heads(num_kv_heads_),
+    head_dim(head_dim_),
+    max_seq_len(max_seq_len_),
+    rope_scaling(rope_scaling_){
 
     // add grabbing informaiton from model json config
 
@@ -57,8 +66,6 @@ GeneralMHAModel::GeneralMHAModel(
         torch::nn::Embedding(vocab_size, embed_dim),
         self_attn_layers,
         max_seq_len,
-        num_heads,
-        head_dim,
         RMSNorm(embed_dim),
         torch::nn::Linear(embed_dim, vocab_size)
     );

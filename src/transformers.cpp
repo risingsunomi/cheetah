@@ -65,8 +65,6 @@ ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
     torch::nn::Embedding tok_embeddings_,
     std::vector<TransformerSelfAttentionLayer> layers_,
     int64_t max_seq_len_,
-    int64_t num_heads_,
-    int64_t head_dim_,
     RMSNorm norm_,
     torch::nn::Linear output_
 ) :

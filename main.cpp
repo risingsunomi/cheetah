@@ -10,14 +10,14 @@ int main() {
   int64_t layer_start = 0;
   int64_t layer_end = 21;
   int64_t layer_total = 22;
-  int64_t vocab_size = 30522;
-  int64_t embed_dim = 256;
-  int64_t hidden_dim = 1024;
-  int64_t num_heads = 8;
-  int64_t num_kv_heads = 8;
-  int64_t head_dim = 32;
-  int64_t seq_len = 10;
-
+  float_t rope_scaling = 32.0; // rope_scaling.factor *
+  int64_t vocab_size = 30522; // vocab_size *
+  int64_t embed_dim = 256; // hidden_size *
+  int64_t hidden_dim = 1024; // hidden_size / num_attention_heads *
+  int64_t num_heads = 8; // *
+  int64_t num_kv_heads = 8; // num_key_value_heads *
+  int64_t head_dim = 32; // *
+  int64_t seq_len = 10; // max_seq_len - max_position_embeddings
   // Initialize model
   auto shard = Shard("test_model", layer_start, layer_end, layer_total);
   auto model = GeneralMHAModel(

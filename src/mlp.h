@@ -6,7 +6,7 @@
 
 class MLPImpl : public torch::nn::Module {
     public:
-        MLPImpl(int64_t input_dim, int64_t hidden_dim);
+        MLPImpl(int64_t embed_dim, int64_t hidden_dim);
         torch::Tensor forward(torch::Tensor x);
 
     private:

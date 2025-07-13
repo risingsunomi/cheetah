@@ -16,13 +16,14 @@ class GeneralMHAModel : public torch::nn::Module {
     public:
         GeneralMHAModel(
             const Shard& shard_,
-            int64_t vocab_size,
-            int64_t embed_dim,
-            int64_t hidden_dim,
-            int64_t num_heads,
-            int64_t num_kv_heads,
-            int64_t head_dim,
-            int64_t max_seq_len,
+            int64_t vocab_size_,
+            int64_t embed_dim_,
+            int64_t hidden_dim_,
+            int64_t num_heads_,
+            int64_t num_kv_heads_,
+            int64_t head_dim_,
+            int64_t max_seq_len_,
+            float_t rope_scaling_,
             bool is_cache_enabled = false
         );
         torch::Tensor forward(
@@ -38,6 +39,15 @@ class GeneralMHAModel : public torch::nn::Module {
 
     private:
         const Shard& shard;
+        int64_t vocab_size;
+        int64_t embed_dim;
+        int64_t hidden_dim;
+        int64_t num_heads;
+        int64_t num_kv_heads;
+        int64_t head_dim;
+        int64_t max_seq_len;
+        float_t rope_scaling;
+        bool is_cache_enabled;
 };
 
 #endif // GENERAL_MHA_MODEL_H
