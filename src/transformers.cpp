@@ -49,8 +49,8 @@ void TransformerSelfAttentionLayerImpl::reset_cache() {
 
 torch::Tensor TransformerSelfAttentionLayerImpl::forward(
     const torch::Tensor& x_,
-    const c10::optional<torch::Tensor&> mask_,
-    const c10::optional<torch::Tensor&> input_pos_
+    const c10::optional<torch::Tensor> mask_,
+    const c10::optional<torch::Tensor> input_pos_
 ) {
     std::cout << "Forwarding TransformerSelfAttentionLayer" << std::endl;
     torch::Tensor h = sa_norm.forward(x_);
@@ -71,10 +71,10 @@ torch::Tensor TransformerSelfAttentionLayerImpl::forward(
 // shard_transformer_decoder.cpp
 ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
     const Shard& shard_,
-    std::shared_ptr<torch::nn::Embedding> tok_embeddings_,
+    torch::nn::Embedding tok_embeddings_,
     std::vector<TransformerSelfAttentionLayer> layers_,
     int max_seq_len_,
-    std::shared_ptr<RMSNorm> norm_,
+    RMSNorm norm_,
     torch::nn::Linear output_
 ) :
     shard(shard_),
@@ -85,8 +85,8 @@ ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
 {
     std::cout << "\nCreating ShardTransformerDecoderImpl with shard: "
               << shard.start_layer << " to " << shard.end_layer << std::endl;
-    register_module("tok_embeddings", tok_embeddings->ptr());
-    register_module("norm", norm->ptr());
+    register_module("tok_embeddings", tok_embeddings);
+    register_module("norm", norm);
     register_module("output", output);
     for (size_t i = 0; i < layers.size(); ++i) {
         register_module("layer_" + std::to_string(i), layers[i]);
@@ -94,9 +94,9 @@ ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
 }
 
 void ShardTransformerDecoderImpl::setup_caches(
-    int& batch_size_,
-    torch::Dtype& dtype_,
-    int& decoder_max_seq_len_
+    int batch_size_,
+    torch::Dtype dtype_,
+    int decoder_max_seq_len_
 ) {
     for (auto& layer : layers) {
         if (layer.ptr() != nullptr) {
@@ -122,9 +122,9 @@ void ShardTransformerDecoderImpl::reset_caches() {
 
 torch::Tensor ShardTransformerDecoderImpl::forward(
     const torch::Tensor& tokens_,
-    c10::optional<torch::Tensor&> mask_,
-    c10::optional<torch::Tensor&> input_pos_,
-    c10::optional<torch::Tensor&> hidden_state_,
+    c10::optional<torch::Tensor> mask_,
+    c10::optional<torch::Tensor> input_pos_,
+    c10::optional<torch::Tensor> hidden_state_,
     torch::Dtype dtype_
 ) {
     std::cout << "Forwarding ShardTransformerDecoderImpl" << std::endl;
@@ -132,7 +132,7 @@ torch::Tensor ShardTransformerDecoderImpl::forward(
     if (hidden_state_.has_value()) {
         h = hidden_state_.value();
     } else {
-        h = tok_embeddings->ptr()->forward(tokens_).to(dtype_);
+        h = tok_embeddings->forward(tokens_).to(dtype_);
     }
 
     std::cout << "After token embeddings: " << h.sizes() << std::endl;
@@ -147,7 +147,7 @@ torch::Tensor ShardTransformerDecoderImpl::forward(
     }
 
     if (shard.is_last_layer()) {
-        h = norm->ptr()->forward(h);
+        h = norm->forward(h);
         auto out = output->forward(h);
         return out;
     } else {

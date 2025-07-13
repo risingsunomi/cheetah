@@ -15,6 +15,7 @@ GeneralMHAModel::GeneralMHAModel(
             "transformer_self_attention_layer_" + std::to_string(i),
             TransformerSelfAttentionLayer(
                 MultiHeadAttention(
+                    i,
                     config.embed_dim,
                     config.num_heads,
                     config.num_kv_heads,
@@ -23,11 +24,11 @@ GeneralMHAModel::GeneralMHAModel(
                     torch::nn::Linear(config.embed_dim, config.embed_dim), // k_proj
                     torch::nn::Linear(config.embed_dim, config.embed_dim), // v_proj
                     torch::nn::Linear(config.embed_dim, config.embed_dim), // out_proj
-                    std::make_shared<RotaryEmbedding>(
+                    RotaryEmbedding(
                         config.head_dim, 
                         config.max_seq_len
                     ),
-                    nullptr,
+                    c10::nullopt,
                     true,
                     config.attn_dropout,
                     use_cache
@@ -48,19 +49,36 @@ GeneralMHAModel::GeneralMHAModel(
 
     shard_decoder = ShardTransformerDecoder(
         shard,
-        std::make_shared<torch::nn::Embedding>(config.vocab_size, config.embed_dim),
+        torch::nn::Embedding(config.vocab_size, config.embed_dim),
         self_attn_layers,
         config.max_seq_len,
-        std::make_shared<RMSNorm>(config.embed_dim),
+        RMSNorm(config.embed_dim),
         torch::nn::Linear(config.embed_dim, config.vocab_size)
     );
 }
 
 torch::Tensor GeneralMHAModel::forward(
     const torch::Tensor& tokens_,
-    const c10::optional<torch::Tensor&> mask_,
-    const c10::optional<torch::Tensor&> input_pos_,
-    const c10::optional<torch::Tensor&> hidden_state_
+    const c10::optional<torch::Tensor> mask_,
+    const c10::optional<torch::Tensor> input_pos_,
+    const c10::optional<torch::Tensor> hidden_state_
 ) {
+    if(use_cache) {
+        // fix this in model_config.h
+        // if(config.torch_dtype == "bfloat32") {
+        //     shard_decoder->setup_caches(
+        //         1,
+        //         torch::kBFloat16,
+        //         config.max_seq_len
+        //     );
+        // } else {
+        shard_decoder->setup_caches(
+            1,
+            torch::kFloat32,
+            config.max_seq_len
+        );
+        // }
+        
+    }
     return shard_decoder->forward(tokens_, mask_, input_pos_, hidden_state_);
 }

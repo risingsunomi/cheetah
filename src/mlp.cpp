@@ -1,8 +1,8 @@
 #include "mlp.h"
 
 MLPImpl::MLPImpl(
-  const int& embed_dim_,
-  const int& hidden_dim_,
+  int embed_dim_,
+  int hidden_dim_,
   const std::string& hidden_act_
 ) : embed_dim(embed_dim_),
     hidden_dim(hidden_dim_),

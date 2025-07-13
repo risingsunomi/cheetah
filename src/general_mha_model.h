@@ -22,9 +22,9 @@ class GeneralMHAModel : public torch::nn::Module {
         );
         torch::Tensor forward(
             const torch::Tensor& tokens_,
-            const c10::optional<torch::Tensor&> mask_,
-            const c10::optional<torch::Tensor&> input_pos_,
-            const c10::optional<torch::Tensor&> hidden_state_
+            const c10::optional<torch::Tensor> mask_,
+            const c10::optional<torch::Tensor> input_pos_,
+            const c10::optional<torch::Tensor> hidden_state_
         );
 
         std::vector<TransformerSelfAttentionLayer> self_attn_layers;

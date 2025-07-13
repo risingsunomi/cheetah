@@ -1,10 +1,14 @@
 #include "shard.h"
 
-Shard::Shard(const std::string& model_id, int start_layer, int end_layer, int n_layers)
-    : model_id(model_id),
-    start_layer(start_layer),
-    end_layer(end_layer),
-    n_layers(n_layers) {}
+Shard::Shard(
+    const std::string model_id_,
+    int& start_layer_,
+    int& end_layer_,
+    int& n_layers_)
+    : model_id(model_id_),
+    start_layer(start_layer_),
+    end_layer(end_layer_),
+    n_layers(n_layers_) {}
 
 bool Shard::is_first_layer() const {
     return start_layer == 0;

@@ -23,8 +23,8 @@ public:
 
     torch::Tensor forward(
         const torch::Tensor& x_,
-        const c10::optional<torch::Tensor&> mask_ = c10::nullopt,
-        const c10::optional<torch::Tensor&> input_pos_ = c10::nullopt
+        const c10::optional<torch::Tensor> mask_ = c10::nullopt,
+        const c10::optional<torch::Tensor> input_pos_ = c10::nullopt
     );
 
     void setup_cache(
@@ -53,17 +53,17 @@ class ShardTransformerDecoderImpl : public torch::nn::Module {
 public:
     ShardTransformerDecoderImpl(
         const Shard& shard_,
-        std::shared_ptr<torch::nn::Embedding> tok_embeddings_,
+        torch::nn::Embedding tok_embeddings_,
         std::vector<TransformerSelfAttentionLayer> layers_,
         int max_seq_len_,
-        std::shared_ptr<RMSNorm> norm_,
+        RMSNorm norm_,
         torch::nn::Linear output_
     );
 
     void setup_caches(
-        int& batch_size_,
-        torch::Dtype& dtype_,
-        int& decoder_max_seq_len_
+        int batch_size_,
+        torch::Dtype dtype_,
+        int decoder_max_seq_len_
     );
 
     bool caches_are_enabled() const;
@@ -71,17 +71,17 @@ public:
 
     torch::Tensor forward(
         const torch::Tensor& tokens,
-        c10::optional<torch::Tensor&> mask = c10::nullopt,
-        c10::optional<torch::Tensor&> input_pos = c10::nullopt,
-        c10::optional<torch::Tensor&> hidden_state = c10::nullopt,
-        torch::Dtype dtype = torch::kBFloat16
+        c10::optional<torch::Tensor> mask = c10::nullopt,
+        c10::optional<torch::Tensor> input_pos = c10::nullopt,
+        c10::optional<torch::Tensor> hidden_state = c10::nullopt,
+        torch::Dtype dtype = torch::kFloat32
     );
 
 private:
     Shard shard;
-    std::shared_ptr<torch::nn::Embedding> tok_embeddings;
+    torch::nn::Embedding tok_embeddings{nullptr};
     std::vector<TransformerSelfAttentionLayer> layers;
-    std::shared_ptr<RMSNorm> norm;
+    RMSNorm norm = nullptr;
     torch::nn::Linear output{nullptr};
 };
 TORCH_MODULE(ShardTransformerDecoder);

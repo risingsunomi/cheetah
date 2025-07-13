@@ -11,12 +11,12 @@
 class ModelConfig {
     public:
         ModelConfig(
-            const std::string& config_path_
+            const std::string config_path_
         );
 
         void load_config();
 
-        const std::string& config_path;
+        const std::string config_path;
         float rope_scaling;
         int embed_dim;
         int num_heads;

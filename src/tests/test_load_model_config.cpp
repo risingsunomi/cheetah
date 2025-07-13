@@ -1,6 +1,8 @@
+#include "./../utils/shard.h"
 #include "./../utils/model_config.h"
+#include "./../general_mha_model.h"
 
-#include <string>
+
 #include <iostream>
 
 int main() {
@@ -16,8 +18,27 @@ int main() {
         std::cout << "Head Dim: " << config.head_dim << std::endl;
         std::cout << "Num KV Heads: " << config.num_kv_heads << std::endl;
         std::cout << "Max Seq Len: " << config.max_seq_len << std::endl;
+
+        std::cout << "Loading General MHA..." << std::endl;
+
+        const std::string model_name("Llama-3.2-1B-Instruct");
+        Shard shard(
+            model_name,
+            0,
+            21,
+            22
+        );
+
+        auto general_mha = GeneralMHAModel(
+            shard,
+            config,
+            config.use_cache
+        );
+        
     } catch (const std::exception& e) {
         std::cerr << "Error loading model configuration: " << e.what() << std::endl;
     }
+
+
     return 0;
 }

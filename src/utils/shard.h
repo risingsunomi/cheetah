@@ -6,11 +6,17 @@
 
 class Shard {
 public:
-    Shard(const std::string& model_id, int start_layer, int end_layer, int n_layers);
-    std::string model_id;
-    int start_layer;
-    int end_layer;
-    int n_layers;
+    Shard(
+        const std::string model_id_,
+        int& start_layer_,
+        int& end_layer_,
+        int& n_layers_
+    );
+
+    const std::string model_id;
+    int& start_layer;
+    int& end_layer;
+    int& n_layers;
 
     bool is_first_layer() const;
     bool is_last_layer() const;
