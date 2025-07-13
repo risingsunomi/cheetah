@@ -61,7 +61,9 @@ torch::Tensor TransformerSelfAttentionLayerImpl::forward(
         mask_, 
         input_pos_
     );
+    std::cout << "attn_out " << attn_out.sizes() << std::endl;
     h = sa_scale.forward(attn_out) + x_;
+    std::cout << "h sa_scale " << h.sizes() << std::endl;
     auto mlp_out = mlp->forward(mlp_norm.forward(h));
     return h + mlp_scale.forward(mlp_out);
 }
