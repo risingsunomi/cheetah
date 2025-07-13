@@ -8,46 +8,45 @@
 class MultiHeadAttentionImpl : public torch::nn::Module {
 public:
     MultiHeadAttentionImpl(
-        int embed_dim,
-        int num_heads,
-        int num_kv_heads,
-        int head_dim,
-        torch::nn::Linear q_proj,
-        torch::nn::Linear k_proj,
-        torch::nn::Linear v_proj,
-        torch::nn::Linear out_proj,
-        std::shared_ptr<RotaryEmbedding> pos_emb = nullptr,
-        std::shared_ptr<KVCache> kv_cache = nullptr,
-        bool is_causal = true,
-        double attn_dropout = 0.0,
-        bool is_cache_enabled = false
+        int& embed_dim_,
+        int& num_heads_,
+        int& num_kv_heads_,
+        int& head_dim_,
+        torch::nn::Linear q_proj_,
+        torch::nn::Linear k_proj_,
+        torch::nn::Linear v_proj_,
+        torch::nn::Linear out_proj_,
+        std::shared_ptr<RotaryEmbedding> pos_emb_,
+        std::shared_ptr<KVCache> kv_cache_,
+        bool& is_causal_,
+        float& attn_dropout_,
+        bool& use_cache_
     );
 
-    std::shared_ptr<KVCache> kv_cache;
-    bool is_cache_enabled;
     void setup_cache(
-        int batch_size,
-        torch::Dtype dtype,
-        int max_seq_len = 2048
+        int& batch_size_,
+        torch::Dtype& dtype_,
+        int& max_seq_len_
     );
     void reset_cache();
 
     torch::Tensor forward(
-        torch::Tensor x,
-        c10::optional<torch::Tensor> y = c10::nullopt,
-        c10::optional<torch::Tensor> mask = c10::nullopt,
-        c10::optional<torch::Tensor> input_pos = c10::nullopt);
+        torch::Tensor& x_,
+        c10::optional<torch::Tensor&> y_,
+        c10::optional<torch::Tensor&> mask_,
+        c10::optional<torch::Tensor&> input_pos_);
+
+    std::shared_ptr<KVCache> kv_cache;
+    bool& use_cache;
 
 private:
-    int embed_dim;
-    int num_heads;
-    int num_kv_heads;
-    int head_dim;
-    int max_seq_len;
-    double attn_dropout;
-    bool is_causal;
+    int& embed_dim;
+    int& num_heads;
+    int& num_kv_heads;
+    int& head_dim;
+    bool& is_causal;
+    float& attn_dropout;
     
-
     torch::nn::Linear q_proj{nullptr};
     torch::nn::Linear k_proj{nullptr};
     torch::nn::Linear v_proj{nullptr};

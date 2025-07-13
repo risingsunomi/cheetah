@@ -12,7 +12,7 @@ public:
     RotaryEmbedding(
         int dim,
         int max_seq_len = 4096,
-        int base = 10000,
+        float base = 500000.0f,
         bool use_scaling = true,
         float scale_factor = 8.0f,
         int low_freq_factor = 1,
@@ -34,7 +34,9 @@ private:
         int high_freq_factor,
         int old_context_len);
 
-    int dim, max_seq_len, base;
+    int dim; 
+    int max_seq_len;
+    float base;
     bool use_scaling;
     float scale_factor;
     int low_freq_factor;

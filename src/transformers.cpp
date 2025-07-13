@@ -2,13 +2,13 @@
 #include <iostream>
 
 TransformerSelfAttentionLayerImpl::TransformerSelfAttentionLayerImpl(
-    MultiHeadAttention attn,
-    MLP mlp,
+    MultiHeadAttention attn_,
+    MLP mlp_,
     c10::optional<torch::nn::AnyModule> sa_norm_,
     c10::optional<torch::nn::AnyModule> mlp_norm_,
     c10::optional<torch::nn::AnyModule> sa_scale_,
     c10::optional<torch::nn::AnyModule> mlp_scale_
-) : attn(attn), mlp(mlp) {
+) : attn(attn_), mlp(mlp_) {
     sa_norm = sa_norm_.has_value() ? *sa_norm_ : torch::nn::AnyModule(torch::nn::Identity());
     mlp_norm = mlp_norm_.has_value() ? *mlp_norm_ : torch::nn::AnyModule(torch::nn::Identity());
     sa_scale = sa_scale_.has_value() ? *sa_scale_ : torch::nn::AnyModule(torch::nn::Identity());
@@ -23,10 +23,14 @@ TransformerSelfAttentionLayerImpl::TransformerSelfAttentionLayerImpl(
 }
 
 void TransformerSelfAttentionLayerImpl::setup_cache(
-    int batch_size,
-    torch::Dtype dtype,
-    int decoder_max_seq_len) {
-    attn->setup_cache(batch_size, dtype, decoder_max_seq_len);
+    int& batch_size_,
+    torch::Dtype& dtype_,
+    int& decoder_max_seq_len_) {
+    attn->setup_cache(
+        batch_size_,
+        dtype_,
+        decoder_max_seq_len_
+    );
 }
 
 bool TransformerSelfAttentionLayerImpl::caches_are_setup() const {
@@ -34,7 +38,7 @@ bool TransformerSelfAttentionLayerImpl::caches_are_setup() const {
 }
 
 bool TransformerSelfAttentionLayerImpl::caches_are_enabled() const {
-    return attn->is_cache_enabled;
+    return attn->use_cache;
 }
 
 void TransformerSelfAttentionLayerImpl::reset_cache() {
@@ -44,15 +48,20 @@ void TransformerSelfAttentionLayerImpl::reset_cache() {
 }
 
 torch::Tensor TransformerSelfAttentionLayerImpl::forward(
-    const torch::Tensor& x,
-    const c10::optional<torch::Tensor>& mask,
-    const c10::optional<torch::Tensor>& input_pos
+    const torch::Tensor& x_,
+    const c10::optional<torch::Tensor&> mask_,
+    const c10::optional<torch::Tensor&> input_pos_
 ) {
     std::cout << "Forwarding TransformerSelfAttentionLayer" << std::endl;
-    torch::Tensor h = sa_norm.forward(x);
+    torch::Tensor h = sa_norm.forward(x_);
     std::cout << "After sa_norm: " << h.sizes() << std::endl;
-    auto attn_out = attn->forward(h, h, mask, input_pos);
-    h = sa_scale.forward(attn_out) + x;
+    auto attn_out = attn->forward(
+        h, 
+        c10::nullopt, 
+        mask_, 
+        input_pos_
+    );
+    h = sa_scale.forward(attn_out) + x_;
     auto mlp_out = mlp->forward(mlp_norm.forward(h));
     return h + mlp_scale.forward(mlp_out);
 }
@@ -62,23 +71,22 @@ torch::Tensor TransformerSelfAttentionLayerImpl::forward(
 // shard_transformer_decoder.cpp
 ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
     const Shard& shard_,
-    torch::nn::Embedding tok_embeddings_,
+    std::shared_ptr<torch::nn::Embedding> tok_embeddings_,
     std::vector<TransformerSelfAttentionLayer> layers_,
     int max_seq_len_,
-    RMSNorm norm_,
+    std::shared_ptr<RMSNorm> norm_,
     torch::nn::Linear output_
 ) :
     shard(shard_),
     tok_embeddings(tok_embeddings_),
     layers(layers_),
     norm(norm_),
-    output(output_),
-    max_seq_len(max_seq_len_)
+    output(output_)
 {
     std::cout << "\nCreating ShardTransformerDecoderImpl with shard: "
               << shard.start_layer << " to " << shard.end_layer << std::endl;
-    register_module("tok_embeddings", tok_embeddings);
-    register_module("norm", norm);
+    register_module("tok_embeddings", tok_embeddings->ptr());
+    register_module("norm", norm->ptr());
     register_module("output", output);
     for (size_t i = 0; i < layers.size(); ++i) {
         register_module("layer_" + std::to_string(i), layers[i]);
@@ -86,14 +94,13 @@ ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
 }
 
 void ShardTransformerDecoderImpl::setup_caches(
-    int batch_size,
-    torch::Dtype dtype,
-    c10::optional<int> decoder_max_seq_len
+    int& batch_size_,
+    torch::Dtype& dtype_,
+    int& decoder_max_seq_len_
 ) {
-    decoder_max_cache_seq_len = decoder_max_seq_len.value_or(max_seq_len);
     for (auto& layer : layers) {
         if (layer.ptr() != nullptr) {
-            layer->setup_cache(batch_size, dtype, decoder_max_cache_seq_len);
+            layer->setup_cache(batch_size_, dtype_, decoder_max_seq_len_);
         }
     }
 }
@@ -114,18 +121,18 @@ void ShardTransformerDecoderImpl::reset_caches() {
 }
 
 torch::Tensor ShardTransformerDecoderImpl::forward(
-    const torch::Tensor& tokens,
-    c10::optional<torch::Tensor> mask,
-    c10::optional<torch::Tensor> input_pos,
-    c10::optional<torch::Tensor> hidden_state,
-    torch::Dtype dtype
+    const torch::Tensor& tokens_,
+    c10::optional<torch::Tensor&> mask_,
+    c10::optional<torch::Tensor&> input_pos_,
+    c10::optional<torch::Tensor&> hidden_state_,
+    torch::Dtype dtype_
 ) {
     std::cout << "Forwarding ShardTransformerDecoderImpl" << std::endl;
     torch::Tensor h;
-    if (hidden_state.has_value()) {
-        h = hidden_state.value();
+    if (hidden_state_.has_value()) {
+        h = hidden_state_.value();
     } else {
-        h = tok_embeddings->forward(tokens).to(dtype);
+        h = tok_embeddings->ptr()->forward(tokens_).to(dtype_);
     }
 
     std::cout << "After token embeddings: " << h.sizes() << std::endl;
@@ -134,13 +141,13 @@ torch::Tensor ShardTransformerDecoderImpl::forward(
         std::cout << "Processing layer " << i << std::endl;
         h = layers[i]->forward(
             h,
-            mask.value_or(torch::Tensor()),
-            input_pos.value_or(torch::Tensor())
+            mask_.value_or(torch::Tensor()),
+            input_pos_.value_or(torch::Tensor())
         );
     }
 
     if (shard.is_last_layer()) {
-        h = norm->forward(h);
+        h = norm->ptr()->forward(h);
         auto out = output->forward(h);
         return out;
     } else {

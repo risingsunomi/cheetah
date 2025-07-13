@@ -3,7 +3,7 @@
 RotaryEmbedding::RotaryEmbedding(
   int dim,
   int max_seq_len,
-  int base,
+  float base,
   bool use_scaling,
   float scale_factor,
   int low_freq_factor,
@@ -25,7 +25,8 @@ RotaryEmbedding::RotaryEmbedding(
 void RotaryEmbedding::rope_init() {
   auto freqs = 1.0 / torch::pow(
     torch::tensor(base, torch::kFloat32),
-    torch::arange(0, dim, 2, torch::kFloat32) / dim
+    torch::arange(0, dim, 2, torch::kFloat32)
+      .slice(0, 0, dim / 2) / dim
   );
 
   if (freqs.device().is_meta()) return;
