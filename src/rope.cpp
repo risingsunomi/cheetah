@@ -3,24 +3,30 @@
 RotaryEmbedding::RotaryEmbedding(
   int dim,
   int max_seq_len,
-  int base,
+  float base,
   bool use_scaling,
-  int scale_factor,
+  float scale_factor,
   int low_freq_factor,
   int high_freq_factor,
   int old_context_len,
   std::optional<std::string> cache_key
-) : dim(dim), max_seq_len(max_seq_len), base(base), use_scaling(use_scaling),
-    scale_factor(scale_factor), low_freq_factor(low_freq_factor),
-    high_freq_factor(high_freq_factor), old_context_len(old_context_len),
-    cache_key(cache_key) {
+) : dim(dim),
+  max_seq_len(max_seq_len),
+  base(base),
+  use_scaling(use_scaling),
+  scale_factor(scale_factor),
+  low_freq_factor(low_freq_factor),
+  high_freq_factor(high_freq_factor),
+  old_context_len(old_context_len),
+  cache_key(cache_key) {
   rope_init();
 }
 
 void RotaryEmbedding::rope_init() {
   auto freqs = 1.0 / torch::pow(
     torch::tensor(base, torch::kFloat32),
-    torch::arange(0, dim, 2, torch::kFloat32) / dim
+    torch::arange(0, dim, 2, torch::kFloat32)
+      .slice(0, 0, dim / 2) / dim
   );
 
   if (freqs.device().is_meta()) return;
@@ -49,7 +55,7 @@ void RotaryEmbedding::rope_init() {
 
 torch::Tensor RotaryEmbedding::apply_scaling(
   const torch::Tensor& freqs,
-  int scale_factor,
+  float scale_factor,
   int low_freq_factor,
   int high_freq_factor,
   int old_context_len
@@ -92,10 +98,10 @@ torch::Tensor RotaryEmbedding::apply(const torch::Tensor& x, const torch::Tensor
     rope_init();
   }
 
-  int64_t b = x.size(0);
-  int64_t s = x.size(1);
-  int64_t nh = x.size(2);
-  int64_t hd = x.size(3);
+  int b = x.size(0);
+  int s = x.size(1);
+  int nh = x.size(2);
+  int hd = x.size(3);
 
   torch::Tensor rope_cache = input_pos.defined()
     ? cache.index_select(0, input_pos.view(-1))

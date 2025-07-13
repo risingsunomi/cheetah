@@ -8,9 +8,9 @@
 
 class KVCache : public torch::nn::Module {
     public:
-        KVCache(int64_t batch_size, int64_t max_seq_len, int64_t num_kv_heads, int64_t head_dim, torch::Dtype dtype);
+        KVCache(int batch_size, int max_seq_len, int num_kv_heads, int head_dim, torch::Dtype dtype);
         void reset();
-        int64_t size() const;
+        int size() const;
         std::tuple<torch::Tensor, torch::Tensor> update(
             const torch::Tensor& k_val,
             const torch::Tensor& v_val
@@ -21,7 +21,7 @@ class KVCache : public torch::nn::Module {
 
     private:
         std::vector<int> cache_shape;
-        int64_t batch_size;
+        int batch_size;
         torch::Tensor cache_pos;
         torch::Tensor k_out;
         torch::Tensor v_out;

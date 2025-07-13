@@ -11,33 +11,29 @@
 #include "mlp.h"
 #include "transformers.h"
 #include "utils/shard.h"
+#include "utils/model_config.h"
 
 class GeneralMHAModel : public torch::nn::Module {
     public:
         GeneralMHAModel(
             const Shard& shard_,
-            int64_t vocab_size,
-            int64_t embed_dim,
-            int64_t hidden_dim,
-            int64_t num_heads,
-            int64_t num_kv_heads,
-            int64_t head_dim,
-            int64_t max_seq_len,
-            bool is_cache_enabled = false
+            const ModelConfig& config_,
+            bool& use_cache_
         );
         torch::Tensor forward(
-            const torch::Tensor& tokens,
-            const c10::optional<torch::Tensor>& mask,
-            const c10::optional<torch::Tensor>& input_pos,
-            const c10::optional<torch::Tensor>& hidden_state
+            const torch::Tensor& tokens_,
+            const c10::optional<torch::Tensor> mask_,
+            const c10::optional<torch::Tensor> input_pos_,
+            const c10::optional<torch::Tensor> hidden_state_
         );
 
-        bool is_cache_enabled;
         std::vector<TransformerSelfAttentionLayer> self_attn_layers;
         ShardTransformerDecoder shard_decoder = nullptr;
 
     private:
         const Shard& shard;
+        const ModelConfig& config;
+        bool use_cache;
 };
 
 #endif // GENERAL_MHA_MODEL_H

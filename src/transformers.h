@@ -13,8 +13,8 @@
 class TransformerSelfAttentionLayerImpl : public torch::nn::Module {
 public:
     TransformerSelfAttentionLayerImpl(
-        MultiHeadAttention attn,
-        MLP mlp,
+        MultiHeadAttention attn_ = nullptr,
+        MLP mlp_ = nullptr,
         c10::optional<torch::nn::AnyModule> sa_norm_ = c10::nullopt,
         c10::optional<torch::nn::AnyModule> mlp_norm_ = c10::nullopt,
         c10::optional<torch::nn::AnyModule> sa_scale_ = c10::nullopt,
@@ -22,12 +22,17 @@ public:
     );
 
     torch::Tensor forward(
-        const torch::Tensor& x,
-        const c10::optional<torch::Tensor>& mask = c10::nullopt,
-        const c10::optional<torch::Tensor>& input_pos = c10::nullopt
+        const torch::Tensor& x_,
+        const c10::optional<torch::Tensor> mask_ = c10::nullopt,
+        const c10::optional<torch::Tensor> input_pos_ = c10::nullopt
     );
 
-    void setup_cache(int64_t batch_size, torch::Dtype dtype, int64_t decoder_max_seq_len);
+    void setup_cache(
+        int& batch_size_,
+        torch::Dtype& dtype_,
+        int& decoder_max_seq_len_
+    );
+
     bool caches_are_setup() const;
     bool caches_are_enabled() const;
     void reset_cache();
@@ -50,17 +55,15 @@ public:
         const Shard& shard_,
         torch::nn::Embedding tok_embeddings_,
         std::vector<TransformerSelfAttentionLayer> layers_,
-        int64_t max_seq_len_,
-        int64_t num_heads_,
-        int64_t head_dim_,
+        int max_seq_len_,
         RMSNorm norm_,
         torch::nn::Linear output_
     );
 
     void setup_caches(
-        int64_t batch_size,
-        torch::Dtype dtype,
-        c10::optional<int64_t> decoder_max_seq_len = c10::nullopt
+        int batch_size_,
+        torch::Dtype dtype_,
+        int decoder_max_seq_len_
     );
 
     bool caches_are_enabled() const;
@@ -71,17 +74,15 @@ public:
         c10::optional<torch::Tensor> mask = c10::nullopt,
         c10::optional<torch::Tensor> input_pos = c10::nullopt,
         c10::optional<torch::Tensor> hidden_state = c10::nullopt,
-        torch::Dtype dtype = torch::kBFloat16
+        torch::Dtype dtype = torch::kFloat32
     );
 
 private:
     Shard shard;
     torch::nn::Embedding tok_embeddings{nullptr};
     std::vector<TransformerSelfAttentionLayer> layers;
-    RMSNorm norm{nullptr};
+    RMSNorm norm = nullptr;
     torch::nn::Linear output{nullptr};
-    int64_t max_seq_len;
-    int64_t decoder_max_cache_seq_len = -1;
 };
 TORCH_MODULE(ShardTransformerDecoder);
 
