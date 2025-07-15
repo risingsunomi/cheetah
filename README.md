@@ -23,6 +23,11 @@ $ cmake --build .
 $ ./main
 ```
 
+To manually set the sequence length, use the environment variable
+```console
+CHEETAH_MAX_SEQ_LEN
+```
+
 ## Building for NVIDIA
 Work in progress
 
