@@ -81,7 +81,7 @@ Tensor MultiHeadAttentionImpl::forward(
   // Project query
   Tensor q = q_proj->forward(query_input_);  // [B, S_q, num_heads * head_dim]
   q = q.view({B, S_q, num_kv_heads * q_per_kv, head_dim});
-  q = pos_emb.apply(q, input_positions_.value_or(Tensor()));
+  q = pos_emb.forward(q, input_positions_.value_or(Tensor()));
   q = q.transpose(1, 2);  // [B, num_heads, S_q, head_dim]
 
   Tensor k, v;
@@ -91,7 +91,7 @@ Tensor MultiHeadAttentionImpl::forward(
 
     k = k_proj->forward(kv).view({B, S_kv, num_kv_heads, head_dim});
     v = v_proj->forward(kv).view({B, S_kv, num_kv_heads, head_dim});
-    k = pos_emb.apply(k, input_positions_.value_or(Tensor()));
+    k = pos_emb.forward(k, input_positions_.value_or(Tensor()));
     k = k.transpose(1, 2);  // [B, num_kv_heads, S_kv, head_dim]
     v = v.transpose(1, 2);
 

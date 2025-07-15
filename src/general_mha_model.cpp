@@ -26,7 +26,8 @@ GeneralMHAModel::GeneralMHAModel(
                     torch::nn::Linear(config.embed_dim, config.embed_dim), // out_proj
                     RotaryEmbedding(
                         config.head_dim, 
-                        config.max_seq_len
+                        config.max_seq_len,
+                        config.rope_base
                     ),
                     c10::nullopt,
                     true,

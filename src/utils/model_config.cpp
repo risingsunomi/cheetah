@@ -31,7 +31,7 @@ void ModelConfig::load_config() {
     // update this to scale with how much ram is detected
     if(is_low_memory()) {
         max_seq_len = config_json["rope_scaling"].value(
-            "original_max_position_embeddings", 8192);
+            "original_max_position_embeddings", 1024);
         std::cout << 
             "LOW RAM DETECTED (>20GB), USING ORIGINAL MAX SEQ LEN " <<
             std::to_string(max_seq_len) << 
