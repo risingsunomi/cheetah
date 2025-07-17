@@ -12,12 +12,14 @@
 #include "transformers.h"
 #include "utils/shard.h"
 #include "utils/model_config.h"
+#include "utils/safetensors_loader.h"
 
 class GeneralMHAModel : public torch::nn::Module {
     public:
         GeneralMHAModel(
             const Shard& shard_,
             const ModelConfig& config_,
+            const std::string safetensors_path_,
             bool& use_cache_
         );
         torch::Tensor forward(
@@ -33,6 +35,7 @@ class GeneralMHAModel : public torch::nn::Module {
     private:
         const Shard& shard;
         const ModelConfig& config;
+        const std::string safetensors_path;
         bool use_cache;
 };
 

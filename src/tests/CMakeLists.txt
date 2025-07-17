@@ -15,14 +15,22 @@ FetchContent_MakeAvailable(json)
 
 # Build test server
 # add_executable(server tensor_server.cpp)
-add_executable(test_load_config
-    test_load_model_config.cpp
-    ../utils/model_config.cpp
-    ../utils/shard.cpp
+add_executable(test_inference
+    test_inference.cpp
+    ../attention.cpp
+    ../mlp.cpp
+    ../rms.cpp
+    ../rope.cpp
     ../general_mha_model.cpp
+    ../transformers.cpp
+
+    ../utils/cache.cpp
+    ../utils/shard.cpp
+    ../utils/model_config.cpp
+    ../utils/safetensors_loader.cpp
 )
 
 # target_link_libraries(server PRIVATE "${TORCH_LIBRARIES}" nlohmann_json::nlohmann_json)
 # set_property(TARGET server PROPERTY CXX_STANDARD 17)
-target_link_libraries(test_load_config PRIVATE "${TORCH_LIBRARIES}" nlohmann_json::nlohmann_json)
-set_property(TARGET test_load_config PROPERTY CXX_STANDARD 17)
+target_link_libraries(test_inference PRIVATE "${TORCH_LIBRARIES}" nlohmann_json::nlohmann_json)
+set_property(TARGET test_inference PROPERTY CXX_STANDARD 17)

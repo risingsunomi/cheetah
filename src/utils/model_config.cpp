@@ -30,8 +30,14 @@ void ModelConfig::load_config() {
     // need to shrink max_seq_len in low ram environements
     // update this to scale with how much ram is detected
     if(is_low_memory()) {
-        max_seq_len = config_json["rope_scaling"].value(
-            "original_max_position_embeddings", 8192);
+        char * max_seq_len_env = std::getenv("CHEETAH_MAX_SEQ_LEN");
+        if(max_seq_len_env != NULL) {
+            max_seq_len = std::atoi(max_seq_len_env);
+        } else {
+            max_seq_len = config_json["rope_scaling"].value(
+            "original_max_position_embeddings", 1024);
+        }
+        
         std::cout << 
             "LOW RAM DETECTED (>20GB), USING ORIGINAL MAX SEQ LEN " <<
             std::to_string(max_seq_len) << 

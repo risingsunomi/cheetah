@@ -22,6 +22,7 @@ add_executable(main
   src/utils/cache.cpp
   src/utils/shard.cpp
   src/utils/model_config.cpp
+  src/utils/safetensors_loader.cpp
 )
 
 
