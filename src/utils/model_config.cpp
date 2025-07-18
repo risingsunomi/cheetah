@@ -1,5 +1,5 @@
 #include "model_config.h"
-#include "system_utils.h"
+#include "helpers.h"
 
 ModelConfig::ModelConfig(
     const std::string config_path_
@@ -8,6 +8,9 @@ ModelConfig::ModelConfig(
 }
 
 void ModelConfig::load_config() {
+    // load helpers
+    Helpers model_helpers = Helpers();
+
     // Load the configuration from a JSON file
     std::ifstream config_file(config_path);
     if (!config_file.is_open()) {
@@ -29,7 +32,7 @@ void ModelConfig::load_config() {
     
     // need to shrink max_seq_len in low ram environements
     // update this to scale with how much ram is detected
-    if(is_low_memory()) {
+    if(model_helpers.is_low_memory("linux", 20000)) {
         char * max_seq_len_env = std::getenv("CHEETAH_MAX_SEQ_LEN");
         if(max_seq_len_env != NULL) {
             max_seq_len = std::atoi(max_seq_len_env);

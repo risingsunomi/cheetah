@@ -25,7 +25,7 @@ int main()
     std::cout << "layer_start " << std::to_string(layer_start) << std::endl;
     std::cout << "layer_end " << std::to_string(layer_end) << std::endl;
     std::cout << "layer_total " << std::to_string(layer_total) << std::endl;
-    auto shard = Shard("test_model", layer_start, layer_end, layer_total);
+    auto shard = Shard("Llama-3.2-1B-Instruct", layer_start, layer_end, layer_total);
 
     const std::string safetensors_path(
         "/home/t0kenl1mit/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct/snapshots/eb49081324edb2ff14f848ce16393c067c6f4976/model.safetensors");

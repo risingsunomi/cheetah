@@ -13,6 +13,7 @@
 #include "utils/shard.h"
 #include "utils/model_config.h"
 #include "utils/safetensors_loader.h"
+#include "utils/helpers.h"
 
 class GeneralMHAModel : public torch::nn::Module {
     public:

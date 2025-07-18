@@ -21,13 +21,14 @@ add_executable(test_inference
     ../mlp.cpp
     ../rms.cpp
     ../rope.cpp
-    ../general_mha_model.cpp
     ../transformers.cpp
-
+    ../general_mha_model.cpp
+    
     ../utils/cache.cpp
     ../utils/shard.cpp
     ../utils/model_config.cpp
     ../utils/safetensors_loader.cpp
+    ../utils/helpers.cpp
 )
 
 # target_link_libraries(server PRIVATE "${TORCH_LIBRARIES}" nlohmann_json::nlohmann_json)
