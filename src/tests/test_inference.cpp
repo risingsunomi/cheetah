@@ -20,6 +20,9 @@ int main()
     std::cout << "Loading model config @ " + config_path << std::endl;
     ModelConfig config(config_path);
 
+    layer_total = config.num_layers;
+    layer_end = layer_total - 1;
+
     // Initialize model
     std::cout << "Loading shard information" << std::endl;
     std::cout << "layer_start " << std::to_string(layer_start) << std::endl;

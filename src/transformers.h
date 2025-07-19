@@ -14,12 +14,13 @@ class TransformerSelfAttentionLayerImpl : public torch::nn::Module
 {
 public:
   TransformerSelfAttentionLayerImpl(
+    int layer_idx_,
     MultiHeadAttention &attn_,
-    MLP mlp_,
-    c10::optional<torch::nn::AnyModule> sa_norm_,
-    c10::optional<torch::nn::AnyModule> mlp_norm_,
-    c10::optional<torch::nn::AnyModule> sa_scale_,
-    c10::optional<torch::nn::AnyModule> mlp_scale_,
+    MLP &mlp_,
+    c10::optional<torch::nn::AnyModule> input_layernorm_,
+    c10::optional<torch::nn::AnyModule> post_attn_layernorm_,
+    c10::optional<torch::nn::AnyModule> input_scale_,
+    c10::optional<torch::nn::AnyModule> post_attn_scale_,
     const c10::ScalarType &model_dtype_);
 
   torch::Tensor forward(
@@ -36,12 +37,13 @@ public:
   void reset_cache();
 
 private:
+  int layer_idx = 0;
   MultiHeadAttention attn;
   MLP mlp;
-  torch::nn::AnyModule sa_norm;
-  torch::nn::AnyModule mlp_norm;
-  torch::nn::AnyModule sa_scale;
-  torch::nn::AnyModule mlp_scale;
+  torch::nn::AnyModule input_layernorm;
+  torch::nn::AnyModule post_attn_layernorm;
+  torch::nn::AnyModule input_scale;
+  torch::nn::AnyModule post_attn_scale;
   const c10::ScalarType model_dtype;
 };
 

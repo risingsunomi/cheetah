@@ -34,10 +34,25 @@ MultiHeadAttentionImpl::MultiHeadAttentionImpl(
   attn_dropout(attn_dropout_),
   use_cache(use_cache_),
   model_dtype(model_dtype_) {
-    register_module("q_proj", q_proj);
-    register_module("k_proj", k_proj);
-    register_module("v_proj", v_proj);
-    register_module("out_proj", out_proj);
+    register_module(
+      "model__layers__" +
+      std::to_string(layer_id) +
+      "__self_attn__q_proj", q_proj);
+
+    register_module(
+      "model__layers__" +
+      std::to_string(layer_id) +
+      "__self_attn__k_proj", k_proj);
+
+    register_module(
+      "model__layers__" +
+      std::to_string(layer_id) +
+      "__self_attn__v_proj", v_proj);
+
+    register_module(
+      "model__layers__" +
+      std::to_string(layer_id) +
+      "__self_attn__o_proj", out_proj);
 }
 
 void MultiHeadAttentionImpl::setup_cache(
@@ -73,20 +88,12 @@ torch::Tensor MultiHeadAttentionImpl::forward(
   c10::optional<torch::Tensor> attention_mask_,
   c10::optional<torch::Tensor> input_positions_
 ) {
-  std::cout << "MHA forward called" << std::endl;
-  std::cout << "query_input_ " << query_input_.sizes() << std::endl;
-  std::cout << "query_input_ " << query_input_.dtype().name() << std::endl;
   const int B = query_input_.size(0);
   const int S_q = query_input_.size(1);
   const int q_per_kv = num_heads / num_kv_heads;
-  std::cout << "B " << B << std::endl;
 
   // Project query
-  std::cout << "project query" << std::endl;
-  std::cout << q_proj << std::endl;
-  torch::Tensor q = q_proj->forward(query_input_.to(torch::kFloat)).to(model_dtype);  //[B, S_q, num_heads * head_dim]
-  std::cout << "q " << q.sizes() << std::endl;
-  std::cout << "q " << q.dtype().name() << std::endl;
+  torch::Tensor q = q_proj->forward(query_input_);  //[B, S_q, num_heads * head_dim]
   q = q.view({B, S_q, num_kv_heads * q_per_kv, head_dim});
   q = pos_emb.forward(q, input_positions_.value_or(torch::Tensor()));
   q = q.transpose(1, 2);  // [B, num_heads, S_q, head_dim]
@@ -97,8 +104,8 @@ torch::Tensor MultiHeadAttentionImpl::forward(
     torch::Tensor kv = key_value_input_.value();
     const int S_kv = kv.size(1);
 
-    k = k_proj->forward(kv).view({B, S_kv, num_kv_heads, head_dim}).to(model_dtype);
-    v = v_proj->forward(kv).view({B, S_kv, num_kv_heads, head_dim}).to(model_dtype);
+    k = k_proj->forward(kv).view({B, S_kv, num_kv_heads, head_dim});
+    v = v_proj->forward(kv).view({B, S_kv, num_kv_heads, head_dim});
     k = pos_emb.forward(k, input_positions_.value_or(torch::Tensor()));
     k = k.transpose(1, 2);  // [B, num_kv_heads, S_kv, head_dim]
     v = v.transpose(1, 2);
@@ -111,13 +118,6 @@ torch::Tensor MultiHeadAttentionImpl::forward(
     k = kv_cache->k_cache;
     v = kv_cache->v_cache;
   }
-
-  std::cout << "k " << k.sizes() << std::endl;
-  std::cout << "k " << k.dtype().name() << std::endl;
-  std::cout << "v " << v.sizes() << std::endl;
-  std::cout << "v " << v.dtype().name() << std::endl;
-  std::cout << "q " << q.sizes() << std::endl;
-  std::cout << "q " << q.dtype().name() << std::endl;
   // GQA: expand kv to match query heads if needed
   if (num_heads != num_kv_heads) {
     auto expand_shape = std::vector<int64_t>{B, num_kv_heads, q_per_kv, -1, head_dim};
@@ -129,26 +129,14 @@ torch::Tensor MultiHeadAttentionImpl::forward(
   torch::Tensor attn_scores = torch::matmul(q, k.transpose(-2, -1));
   attn_scores = attn_scores / std::sqrt((double)head_dim);
 
-  std::cout << "attn_scores " << attn_scores.sizes() << std::endl;
-  std::cout << "attn_scores " << attn_scores.dtype().name() << std::endl;
-
   if (attention_mask_) {
     attn_scores = attn_scores.masked_fill(attention_mask_.value() == 0, -1e9);
   }
 
-  std::cout << "attn_scores 2 " << attn_scores.sizes() << std::endl;
-  std::cout << "attn_scores 2 " << attn_scores.dtype().name() << std::endl;
-
   torch::Tensor attn_weights = torch::softmax(attn_scores, -1);
-  std::cout << "attn_weights " << attn_weights.sizes() << std::endl;
-  std::cout << "attn_weights " << attn_weights.dtype().name() << std::endl;
-
   torch::Tensor attn_output = torch::matmul(attn_weights, v);  // [B, num_heads, S_q, head_dim]
-  std::cout << "attn_output " << attn_output.sizes() << std::endl;
-  std::cout << "attn_output " << attn_output.dtype().name() << std::endl;
 
-  attn_output = attn_output.transpose(1, 2).contiguous().view({B, S_q, num_heads * head_dim}).to(torch::kFloat);
-  std::cout << "attn_output" << attn_output.sizes() << std::endl;
-  std::cout << "attn_output" << attn_output.dtype().name() << std::endl;
-  return out_proj->forward(attn_output).to(model_dtype);
+  attn_output = attn_output.transpose(1, 2).contiguous().view({B, S_q, num_heads * head_dim});
+
+  return out_proj->forward(attn_output);
 }

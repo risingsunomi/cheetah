@@ -15,7 +15,6 @@ class MLPImpl : public torch::nn::Module {
         );
         torch::Tensor forward(const torch::Tensor& x_);
 
-    private:
         int embed_dim;
         int hidden_dim;
         const std::string& hidden_act;
