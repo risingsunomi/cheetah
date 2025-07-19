@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <torch/torch.h>
 
 class ModelConfig {
     public:
@@ -31,7 +32,7 @@ class ModelConfig {
         int num_layers;
         int attn_bias;
         std::string hidden_act;
-        std::string torch_dtype;
+        torch::ScalarType torch_dtype;
         bool use_cache;
 };
 

@@ -1,11 +1,11 @@
 #include "general_mha_model.h"
 
 GeneralMHAModel::GeneralMHAModel(
-    const Shard &shard_,
-    const ModelConfig &config_,
-    const std::string safetensors_path_,
-    bool &use_cache_
-  ) : shard(shard_),
+  const Shard &shard_,
+  const ModelConfig &config_,
+  const std::string safetensors_path_,
+  bool &use_cache_
+) : shard(shard_),
   config(config_),
   use_cache(use_cache_),
   safetensors_path(safetensors_path_) {
@@ -59,33 +59,43 @@ GeneralMHAModel::GeneralMHAModel(
     // Instantiate TransformerSelfAttentionLayer
     auto q_proj = torch::nn::Linear(config.embed_dim, config.embed_dim);
 
-    auto transformer_layer = register_module(
-        "transformer_self_attention_layer_" + std::to_string(i),
-        TransformerSelfAttentionLayer(
-            MultiHeadAttention(
-                i,
-                config.embed_dim,
-                config.num_heads,
-                config.num_kv_heads,
-                config.head_dim,
-                q_proj,                                                // q_proj
-                torch::nn::Linear(config.embed_dim, config.embed_dim), // k_proj
-                torch::nn::Linear(config.embed_dim, config.embed_dim), // v_proj
-                torch::nn::Linear(config.embed_dim, config.embed_dim), // out_proj
-                RotaryEmbedding(
-                    config.head_dim,
-                    config.max_seq_len,
-                    config.rope_base),
-                c10::nullopt,
-                true,
-                config.attn_dropout,
-                use_cache),
-            MLP(
-                config.embed_dim,
-                config.intermediate_size,
-                config.hidden_act),
-            torch::nn::AnyModule(rms_norm),
-            torch::nn::AnyModule(rms_norm)));
+    auto mha = MultiHeadAttention(
+      i,
+      config.embed_dim,
+      config.num_heads,
+      config.num_kv_heads,
+      config.head_dim,
+      q_proj,
+      torch::nn::Linear(config.embed_dim, config.embed_dim), // k_proj
+      torch::nn::Linear(config.embed_dim, config.embed_dim), // v_proj
+      torch::nn::Linear(config.embed_dim, config.embed_dim), // out_proj
+      RotaryEmbedding(
+        config.head_dim,
+        config.max_seq_len,
+        config.rope_base),
+      c10::nullopt,
+      true,
+      config.attn_dropout,
+      use_cache,
+      config.torch_dtype
+    );
+
+    auto transformer_layer = register_module
+    (
+      "transformer_self_attention_layer_" + std::to_string(i),
+      TransformerSelfAttentionLayer(
+        mha,
+        MLP(
+          config.embed_dim,
+          config.intermediate_size,
+          config.hidden_act),
+        torch::nn::AnyModule(rms_norm),
+        torch::nn::AnyModule(rms_norm),
+        c10::nullopt,
+        c10::nullopt,
+        config.torch_dtype
+      )
+    );
 
     self_attn_layers.push_back(
         register_module("layer_" + std::to_string(i), transformer_layer));
@@ -97,7 +107,9 @@ GeneralMHAModel::GeneralMHAModel(
       self_attn_layers,
       config.max_seq_len,
       rms_norm,
-      std_out_proj);
+      std_out_proj,
+      config.torch_dtype
+    );
 }
 
 torch::Tensor GeneralMHAModel::forward(
@@ -109,8 +121,8 @@ torch::Tensor GeneralMHAModel::forward(
   if (use_cache) {
     shard_decoder->setup_caches(
         1,
-        torch::kFloat32,
-        config.max_seq_len);
+        config.max_seq_len
+      );
   }
   return shard_decoder->forward(tokens_, mask_, input_pos_, hidden_state_);
 }

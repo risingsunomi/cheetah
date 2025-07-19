@@ -59,6 +59,13 @@ void ModelConfig::load_config() {
     num_layers = config_json.value("num_hidden_layers", 12);
     attn_bias = config_json.value("attention_bias", 0);
     hidden_act = config_json.value("hidden_act", "silu");
-    torch_dtype = config_json.value("torch_dtype", "bfloat32");
     use_cache = config_json.value("use_cache", true);
+
+    std::string torch_dtype_name = config_json.value("torch_dtype", "bfloat16");
+    if(torch_dtype_name == "bfloat16") torch_dtype = torch::kBFloat16;
+    else if(torch_dtype_name == "float16") torch_dtype = torch::kFloat16;
+    else if(torch_dtype_name == "float32") torch_dtype = torch::kFloat32;
+    else if(torch_dtype_name == "int16") torch_dtype = torch::kInt16;
+    else if(torch_dtype_name == "int32") torch_dtype = torch::kInt32;
+    else throw std::runtime_error("Unsupported dtype: " + torch_dtype_name);
 }

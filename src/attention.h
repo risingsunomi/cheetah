@@ -21,12 +21,12 @@ public:
         c10::optional<KVCache> kv_cache_,
         bool is_causal_,
         float attn_dropout_,
-        bool use_cache_
+        bool use_cache_,
+        const c10::ScalarType& model_dtype_
     );
 
     void setup_cache(
         int batch_size_,
-        torch::Dtype dtype_,
         int max_seq_len_
     );
     void reset_cache();
@@ -49,6 +49,7 @@ private:
     int head_dim;
     bool is_causal;
     float attn_dropout;
+    const c10::ScalarType model_dtype;
     
     torch::nn::Linear q_proj{nullptr};
     torch::nn::Linear k_proj{nullptr};
