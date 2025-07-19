@@ -57,10 +57,7 @@ MultiHeadAttentionImpl::MultiHeadAttentionImpl(
 
 void MultiHeadAttentionImpl::setup_cache(
   int batch_size_,
-  int max_seq_len_) {
-
-    std::cout << "MHA Setting up Cache for layer " << layer_id << std::endl;
-  
+  int max_seq_len_) {  
     if (kv_cache) return;
   
     kv_cache = KVCache(

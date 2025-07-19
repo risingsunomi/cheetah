@@ -13,8 +13,6 @@ GeneralMHAModel::GeneralMHAModel(
   Helpers model_helpers = Helpers();
 
   // load safetensors
-  std::cout << "generlmha constructor called" << std::endl;
-  std::cout << "Loading safetensors from " + safetensors_path_ << std::endl;
   SafeTensorsLoader safetensors_loader(safetensors_path_);
   auto model_weights = safetensors_loader.getTensors();
 
@@ -177,6 +175,8 @@ torch::Tensor GeneralMHAModel::forward(
     const c10::optional<torch::Tensor> input_pos_,
     const c10::optional<torch::Tensor> hidden_state_
 ){
+  c10::InferenceMode guard;
+
   if (use_cache) {
     shard_decoder->setup_caches(
         1,

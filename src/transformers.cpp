@@ -94,29 +94,17 @@ torch::Tensor TransformerSelfAttentionLayerImpl::forward(
     const c10::optional<torch::Tensor> mask_,
     const c10::optional<torch::Tensor> input_pos_
 ) {
-    std::cout << "Forwarding TransformerSelfAttentionLayer" << std::endl;
     torch::Tensor h = input_layernorm.forward(x_);
-    std::cout << "After input_layernorm: " << h.sizes() << std::endl;
-    std::cout << h.dtype().name() << std::endl;
-    std::cout << "Mask " << mask_->sizes() << "\\" << mask_->dtype().name() << std::endl;
-    std::cout << "Input POS " << input_pos_->sizes() << "\\" << input_pos_->dtype().name() << std::endl;
     auto attn_out = attn->forward(
         h, 
         c10::nullopt, 
         mask_, 
         input_pos_
     );
-    std::cout << "attn_out " << attn_out.sizes() << std::endl;
     auto input_scale_out = input_scale.forward(attn_out);
     h = input_scale_out + x_;
-    std::cout << "h input_scale " << h.sizes() << std::endl;
-    std::cout << h.dtype().name() << std::endl;
     auto post_attn_layernorm_out = post_attn_layernorm.forward(h);
-    std::cout << "post_attn_layernorm_out " << post_attn_layernorm_out.sizes() << std::endl;
-    std::cout << "post_attn_layernorm_out " << post_attn_layernorm_out.dtype().name() << std::endl;
     auto mlp_out = mlp->forward(post_attn_layernorm_out);
-    std::cout << "mlp_out " << mlp_out.sizes() << std::endl;
-    std::cout << "mlp_out " << mlp_out.dtype().name() << std::endl;
     return h + post_attn_scale.forward(mlp_out);
 }
 
@@ -181,7 +169,6 @@ torch::Tensor ShardTransformerDecoderImpl::forward(
     c10::optional<torch::Tensor> input_pos_,
     c10::optional<torch::Tensor> hidden_state_
 ) {
-    std::cout << "Forwarding ShardTransformerDecoderImpl" << std::endl;
     torch::Tensor h;
     if (hidden_state_.has_value()) {
         h = hidden_state_.value();
@@ -189,10 +176,7 @@ torch::Tensor ShardTransformerDecoderImpl::forward(
         h = tok_embeddings->forward(tokens_).to(model_dtype);
     }
 
-    std::cout << "After token embeddings: " << h.sizes() << std::endl;
-
     for (size_t i = 0; i < layers.size(); ++i) {
-        std::cout << "Processing layer " << i << std::endl;
         h = layers[i]->forward(
             h,
             mask_.value_or(torch::Tensor()),

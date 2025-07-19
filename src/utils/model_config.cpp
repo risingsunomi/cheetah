@@ -17,10 +17,7 @@ void ModelConfig::load_config() {
         throw std::runtime_error("Could not open config file: " + config_path);
     }
     
-    std::cout << "Parsing model configuration from: " << config_path << std::endl;
     nlohmann::json config_json = nlohmann::json::parse(config_file);
-    std::cout << "Model configuration parsed successfully." << std::endl;
-    std::cout << config_json << std::endl;
     config_file.close();
 
     // Parse the JSON configuration
