@@ -13,7 +13,7 @@ Right now we are focusing on CPU based inference along with using large lanaguag
 ## Building for CPU
 For Linux and MacOS
 
-Creating a automated install. 
+*Still developing an automated install.* 
 - Download a copy of the [pytorch](https://pytorch.org/) C++ library for CPU and unzip it in the "libs" folder.
 
 ```console
