@@ -2,8 +2,6 @@
 #include <iostream>
 #include "attention.h"
 
-using namespace torch;
-
 MultiHeadAttentionImpl::MultiHeadAttentionImpl(
   int layer_id_,
   int embed_dim_,
@@ -18,7 +16,8 @@ MultiHeadAttentionImpl::MultiHeadAttentionImpl(
   c10::optional<KVCache> kv_cache_,
   bool is_causal_,
   float attn_dropout_,
-  bool use_cache_
+  bool use_cache_,
+  const c10::ScalarType& model_dtype_
 ) :
   layer_id(layer_id_),
   embed_dim(embed_dim_),
@@ -33,20 +32,32 @@ MultiHeadAttentionImpl::MultiHeadAttentionImpl(
   kv_cache(kv_cache_),
   is_causal(is_causal_),
   attn_dropout(attn_dropout_),
-  use_cache(use_cache_) {
-    register_module("q_proj", q_proj);
-    register_module("k_proj", k_proj);
-    register_module("v_proj", v_proj);
-    register_module("out_proj", out_proj);
+  use_cache(use_cache_),
+  model_dtype(model_dtype_) {
+    register_module(
+      "model__layers__" +
+      std::to_string(layer_id) +
+      "__self_attn__q_proj", q_proj);
+
+    register_module(
+      "model__layers__" +
+      std::to_string(layer_id) +
+      "__self_attn__k_proj", k_proj);
+
+    register_module(
+      "model__layers__" +
+      std::to_string(layer_id) +
+      "__self_attn__v_proj", v_proj);
+
+    register_module(
+      "model__layers__" +
+      std::to_string(layer_id) +
+      "__self_attn__o_proj", out_proj);
 }
 
 void MultiHeadAttentionImpl::setup_cache(
   int batch_size_,
-  torch::Dtype dtype_,
-  int max_seq_len_) {
-
-    std::cout << "MHA Setting up Cache for layer " << layer_id << std::endl;
-  
+  int max_seq_len_) {  
     if (kv_cache) return;
   
     kv_cache = KVCache(
@@ -54,7 +65,7 @@ void MultiHeadAttentionImpl::setup_cache(
       max_seq_len_,
       num_kv_heads,
       head_dim,
-      dtype_
+      model_dtype
     );
     
     use_cache = true;
@@ -68,30 +79,31 @@ void MultiHeadAttentionImpl::reset_cache() {
   
 }
 
-Tensor MultiHeadAttentionImpl::forward(
-  Tensor& query_input_,
-  c10::optional<Tensor> key_value_input_,
-  c10::optional<Tensor> attention_mask_,
-  c10::optional<Tensor> input_positions_
+torch::Tensor MultiHeadAttentionImpl::forward(
+  torch::Tensor& query_input_,
+  c10::optional<torch::Tensor> key_value_input_,
+  c10::optional<torch::Tensor> attention_mask_,
+  c10::optional<torch::Tensor> input_positions_
 ) {
   const int B = query_input_.size(0);
   const int S_q = query_input_.size(1);
   const int q_per_kv = num_heads / num_kv_heads;
 
   // Project query
-  Tensor q = q_proj->forward(query_input_);  // [B, S_q, num_heads * head_dim]
+  torch::Tensor q = q_proj->forward(query_input_);  //[B, S_q, num_heads * head_dim]
   q = q.view({B, S_q, num_kv_heads * q_per_kv, head_dim});
-  q = pos_emb.forward(q, input_positions_.value_or(Tensor()));
+  q = pos_emb.forward(q, input_positions_.value_or(torch::Tensor()));
   q = q.transpose(1, 2);  // [B, num_heads, S_q, head_dim]
 
-  Tensor k, v;
+  torch::Tensor v, k;
+
   if (key_value_input_.has_value()) {
-    Tensor kv = key_value_input_.value();
+    torch::Tensor kv = key_value_input_.value();
     const int S_kv = kv.size(1);
 
     k = k_proj->forward(kv).view({B, S_kv, num_kv_heads, head_dim});
     v = v_proj->forward(kv).view({B, S_kv, num_kv_heads, head_dim});
-    k = pos_emb.forward(k, input_positions_.value_or(Tensor()));
+    k = pos_emb.forward(k, input_positions_.value_or(torch::Tensor()));
     k = k.transpose(1, 2);  // [B, num_kv_heads, S_kv, head_dim]
     v = v.transpose(1, 2);
 
@@ -99,11 +111,10 @@ Tensor MultiHeadAttentionImpl::forward(
       std::tie(k, v) = kv_cache->update(k, v);
     }
   } else {
-    TORCH_CHECK(kv_cache && cache_enabled, "KV cache must be enabled for decoding.");
+    TORCH_CHECK(kv_cache && cache_enabled, "KV cache must be enabled for decoding or key_value_input_ must be provided.");
     k = kv_cache->k_cache;
     v = kv_cache->v_cache;
   }
-
   // GQA: expand kv to match query heads if needed
   if (num_heads != num_kv_heads) {
     auto expand_shape = std::vector<int64_t>{B, num_kv_heads, q_per_kv, -1, head_dim};
@@ -112,16 +123,17 @@ Tensor MultiHeadAttentionImpl::forward(
   }
 
   // Scaled dot-product attention
-  Tensor attn_scores = torch::matmul(q, k.transpose(-2, -1));
+  torch::Tensor attn_scores = torch::matmul(q, k.transpose(-2, -1));
   attn_scores = attn_scores / std::sqrt((double)head_dim);
 
   if (attention_mask_) {
     attn_scores = attn_scores.masked_fill(attention_mask_.value() == 0, -1e9);
   }
 
-  Tensor attn_weights = torch::softmax(attn_scores, -1);
-  Tensor attn_output = torch::matmul(attn_weights, v);  // [B, num_heads, S_q, head_dim]
+  torch::Tensor attn_weights = torch::softmax(attn_scores, -1);
+  torch::Tensor attn_output = torch::matmul(attn_weights, v);  // [B, num_heads, S_q, head_dim]
 
   attn_output = attn_output.transpose(1, 2).contiguous().view({B, S_q, num_heads * head_dim});
+
   return out_proj->forward(attn_output);
 }

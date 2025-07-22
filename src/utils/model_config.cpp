@@ -1,5 +1,5 @@
 #include "model_config.h"
-#include "system_utils.h"
+#include "helpers.h"
 
 ModelConfig::ModelConfig(
     const std::string config_path_
@@ -8,16 +8,16 @@ ModelConfig::ModelConfig(
 }
 
 void ModelConfig::load_config() {
+    // load helpers
+    Helpers model_helpers = Helpers();
+
     // Load the configuration from a JSON file
     std::ifstream config_file(config_path);
     if (!config_file.is_open()) {
         throw std::runtime_error("Could not open config file: " + config_path);
     }
     
-    std::cout << "Parsing model configuration from: " << config_path << std::endl;
     nlohmann::json config_json = nlohmann::json::parse(config_file);
-    std::cout << "Model configuration parsed successfully." << std::endl;
-    std::cout << config_json << std::endl;
     config_file.close();
 
     // Parse the JSON configuration
@@ -29,7 +29,7 @@ void ModelConfig::load_config() {
     
     // need to shrink max_seq_len in low ram environements
     // update this to scale with how much ram is detected
-    if(is_low_memory()) {
+    if(model_helpers.is_low_memory("linux", 20000)) {
         char * max_seq_len_env = std::getenv("CHEETAH_MAX_SEQ_LEN");
         if(max_seq_len_env != NULL) {
             max_seq_len = std::atoi(max_seq_len_env);
@@ -56,6 +56,13 @@ void ModelConfig::load_config() {
     num_layers = config_json.value("num_hidden_layers", 12);
     attn_bias = config_json.value("attention_bias", 0);
     hidden_act = config_json.value("hidden_act", "silu");
-    torch_dtype = config_json.value("torch_dtype", "bfloat32");
     use_cache = config_json.value("use_cache", true);
+
+    std::string torch_dtype_name = config_json.value("torch_dtype", "bfloat16");
+    if(torch_dtype_name == "bfloat16") torch_dtype = torch::kBFloat16;
+    else if(torch_dtype_name == "float16") torch_dtype = torch::kFloat16;
+    else if(torch_dtype_name == "float32") torch_dtype = torch::kFloat32;
+    else if(torch_dtype_name == "int16") torch_dtype = torch::kInt16;
+    else if(torch_dtype_name == "int32") torch_dtype = torch::kInt32;
+    else throw std::runtime_error("Unsupported dtype: " + torch_dtype_name);
 }
