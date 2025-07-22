@@ -13,23 +13,38 @@
 #include <unistd.h>
 #include <nlohmann/json.hpp>
 #include <torch/torch.h>
+#include "shard.h"
 
 class SafeTensorsLoader {
 public:
-  explicit SafeTensorsLoader(const std::string& filename);
+  explicit SafeTensorsLoader(
+    const std::string model_path_,
+    Shard shard_
+  );
+
   ~SafeTensorsLoader();
-  std::vector<std::string> keys() const;
-  std::unordered_map<std::string, torch::Tensor> getTensors();
+  torch::Tensor findWeight(const std::string weight_name_);
+  
 
 private:
-  void parseHeader();
+  torch::Tensor loadWeight(
+    const std::string filen_path_,
+    const std::string weight_name_
+  );
+
+  std::string searchIndex(
+    const std::string index_path_,
+    const std::string weight_name_
+  );
+  
   int fd;
   size_t file_size;
   uint64_t header_len;
   void* map_ptr;
   uint8_t* data_ptr;
+  std::string model_path;
+  Shard shard;
   std::unordered_map<std::string, nlohmann::json> json_map;
-  std::unordered_map<std::string, torch::Tensor> safetensors;
 };
 
 #endif // SAFETENSORS_LOADER_H

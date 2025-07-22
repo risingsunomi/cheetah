@@ -7,6 +7,8 @@
 
 int main()
 {
+    std::string model_id = "Llama-3.2-1B-Instruct";
+    std::cout << "Testing inference with model " + model_id << std::endl;
     torch::manual_seed(42);
 
     // Model hyperparameters
@@ -14,8 +16,9 @@ int main()
     int layer_end = 1;
     int layer_total = 2;
 
-    const std::string config_path(
-        "/home/t0kenl1mit/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct/snapshots/eb49081324edb2ff14f848ce16393c067c6f4976/config.json");
+    const std::string model_path = "/home/t0kenl1mit/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct/snapshots/eb49081324edb2ff14f848ce16393c067c6f4976";
+
+    const std::string config_path = model_path + "/config.json";
     
     std::cout << "Loading model config @ " + config_path << std::endl;
     ModelConfig config(config_path);
@@ -28,16 +31,17 @@ int main()
     std::cout << "layer_start " << std::to_string(layer_start) << std::endl;
     std::cout << "layer_end " << std::to_string(layer_end) << std::endl;
     std::cout << "layer_total " << std::to_string(layer_total) << std::endl;
-    auto shard = Shard("Llama-3.2-1B-Instruct", layer_start, layer_end, layer_total);
+    auto shard = Shard(
+        model_id,
+        layer_start,
+        layer_end,
+        layer_total
+    );
 
-    const std::string safetensors_path(
-        "/home/t0kenl1mit/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct/snapshots/eb49081324edb2ff14f848ce16393c067c6f4976/model.safetensors");
-    
-    std::cout << "Loading model with weights @ " << safetensors_path << std::endl;
     auto model = GeneralMHAModel(
         shard,
         config,
-        safetensors_path,
+        model_path,
         config.use_cache);
 
     // * currently testing only self attention layer *

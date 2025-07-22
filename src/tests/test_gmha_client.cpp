@@ -35,27 +35,44 @@ void send_all(int sock, const void *buf, size_t len) {
   }
 }
 
-torch::Tensor recv_tensor_view(const char *&buffer_ptr, size_t &offset, const std::vector<int> &shape, torch::ScalarType dtype) {
+torch::Tensor recv_tensor_view(
+  const char *&buffer_ptr,
+  size_t &offset,
+  const std::vector<int> &shape,
+  torch::ScalarType dtype
+) {
   size_t numel = 1;
   for (auto s : shape) numel *= s;
   size_t byte_size = numel * torch::elementSize(dtype);
-  torch::Tensor tensor = torch::from_blob((void *)(buffer_ptr + offset), shape, torch::TensorOptions().dtype(dtype)).clone();
+  std::vector<int64_t> shape64(shape.begin(), shape.end());
+  torch::Tensor tensor = torch::from_blob(
+    (void *)(buffer_ptr + offset),
+    shape64,
+    torch::TensorOptions().dtype(dtype)
+  ).clone();
   offset += byte_size;
   return tensor;
 }
 
 void send_tensor(int sock, const torch::Tensor &tensor) {
   std::vector<int> shape_vec(tensor.sizes().begin(), tensor.sizes().end());
-  json header = {{"command", "response"}, {"dtype", "float32"}, {"shape", shape_vec}};
+  
+  json header = {
+    {"command", "response"},
+    {"dtype", "bfloat16"},
+    {"shape", shape_vec}
+  };
+
   std::string header_str = header.dump();
   uint32_t header_len = htonl(header_str.size());
+  
   send_all(sock, &header_len, 4);
   send_all(sock, header_str.data(), header_str.size());
   send_all(sock, tensor.data_ptr(), tensor.nbytes());
 }
 
 int main() {
-  const char *socket_path = "/tmp/tensor_socket";
+  const char *socket_path = "/run/cheetah_infra";
   unlink(socket_path);
   int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
@@ -76,42 +93,59 @@ int main() {
   recv_all(client_fd, header_buf.data(), header_len);
   json header = json::parse(header_buf.begin(), header_buf.end());
 
+  std::string model_id = header["model"];
   std::string config_path = header["config_path"];
   int layer_start = header["layer_start"];
   int layer_end = header["layer_end"];
+  int layer_total = header["layer_total"]
   std::string dtype = header["dtype"];
   std::vector<int> shape_input = header["shape_input"];
   std::vector<int> shape_mask = header["shape_mask"];
 
+  // Load shard
+  Shard shard(model_id, layer_start, layer_end
   // Load model config
   std::cout << "Loading model config @ " << config_path << std::endl;
   ModelConfig config(config_path);
-  int total_layers = config.num_hidden_layers;
+  int total_layers = config.num_layers;
 
   std::cout << "Layer range: " << layer_start << " to " << layer_end << " / " << total_layers << std::endl;
-  std::cout << "Hidden dim: " << config.hidden_size << " | Heads: " << config.num_attention_heads << std::endl;
+  std::cout << "Hidden dim: " << config.embed_dim << " | Heads: " << config.num_attention_heads << std::endl;
 
   // Receive tensors
   torch::ScalarType scalar = (dtype == "int64") ? torch::kInt64 : throw std::runtime_error("Unsupported dtype");
   auto scalar_size = torch::elementSize(scalar);
   auto input_prod = torch::prod(torch::tensor(shape_input));
   auto mask_prod = torch::prod(torch::tensor(shape_mask));
-  size_t total_bytes = scalar_size * (input_prod.item<int>() + mask_prod.item<int>());
+  size_t total_bytes = scalar_size * (
+    input_prod.item<int>() + mask_prod.item<int>());
 
   std::vector<char> buffer(total_bytes);
   recv_all(client_fd, buffer.data(), total_bytes);
   size_t offset = 0;
   const char *ptr = buffer.data();
-  torch::Tensor input_ids = recv_tensor_view(ptr, offset, shape_input, scalar);
-  torch::Tensor attention_mask = recv_tensor_view(ptr, offset, shape_mask, scalar);
+  
+  torch::Tensor input_ids = recv_tensor_view(
+    ptr,
+    offset,
+    shape_input,
+    scalar
+  );
+  
+  torch::Tensor attention_mask = recv_tensor_view(
+    ptr,
+    offset,
+    shape_mask,
+    scalar
+  );
 
   std::cout << "Input IDs shape: " << input_ids.sizes() << "\n";
   std::cout << "Attention mask shape: " << attention_mask.sizes() << "\n";
 
   // Run GeneralMHA inference
-  GeneralMHA_Model model(config, layer_start, layer_end, total_layers);
+  GeneralMHAModel model(config, layer_start, layer_end, total_layers);
   model.eval();
-  torch::NoGradGuard no_grad;
+  torch::InferenceMode guard;
 
   auto logits = model.forward(input_ids, attention_mask);
   std::cout << "Logits shape: " << logits.sizes() << "\n";

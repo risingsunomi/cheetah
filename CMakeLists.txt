@@ -16,13 +16,14 @@ add_executable(main
   src/mlp.cpp
   src/rms.cpp
   src/rope.cpp
-  src/general_mha_model.cpp
   src/transformers.cpp
-
+  src/general_mha_model.cpp
+  
   src/utils/cache.cpp
   src/utils/shard.cpp
   src/utils/model_config.cpp
   src/utils/safetensors_loader.cpp
+  src/utils/helpers.cpp
 )
 
 

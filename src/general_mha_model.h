@@ -16,28 +16,31 @@
 #include "utils/helpers.h"
 
 class GeneralMHAModel : public torch::nn::Module {
-    public:
-        GeneralMHAModel(
-            const Shard& shard_,
-            const ModelConfig& config_,
-            const std::string safetensors_path_,
-            bool& use_cache_
-        );
-        torch::Tensor forward(
-            const torch::Tensor& tokens_,
-            const c10::optional<torch::Tensor> mask_,
-            const c10::optional<torch::Tensor> input_pos_,
-            const c10::optional<torch::Tensor> hidden_state_
-        );
+public:
+  GeneralMHAModel(
+      Shard shard_,
+      ModelConfig config_,
+      const std::string model_path_,
+      bool& use_cache_
+  );
+  torch::Tensor forward(
+      const torch::Tensor& tokens_,
+      const c10::optional<torch::Tensor> mask_,
+      const c10::optional<torch::Tensor> input_pos_,
+      const c10::optional<torch::Tensor> hidden_state_
+  );
 
-        std::vector<TransformerSelfAttentionLayer> self_attn_layers;
-        ShardTransformerDecoder shard_decoder = nullptr;
+  std::vector<TransformerSelfAttentionLayer> self_attn_layers;
+  ShardTransformerDecoder shard_decoder = nullptr;
+  const std::string model_path;
 
-    private:
-        const Shard& shard;
-        const ModelConfig& config;
-        const std::string safetensors_path;
-        bool use_cache;
+private:
+  Shard shard;
+  ModelConfig config;
+  bool use_cache;
+  std::string model_prefix = "model.";
+  std::string model_layer_prefix = "model.layers.";
+  std::string model_postfix = ".weight";
 };
 
 #endif // GENERAL_MHA_MODEL_H
