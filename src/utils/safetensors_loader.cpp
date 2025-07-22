@@ -37,6 +37,19 @@ std::string SafeTensorsLoader::searchIndex(
 torch::Tensor SafeTensorsLoader::findWeight(
   const std::string weight_name_
 ) {
+  if(!json_map.empty()) {
+    // check if key present
+    for(const auto& kv : json_map){ 
+      if(kv.first.find(weight_name_) != std::string::npos) {
+        return loadWeight(
+          model_path,
+          weight_name_,
+          true
+        );
+      }
+    }
+  }
+
   fs::path path(model_path);
   if (fs::is_directory(path)) {
     auto safetensor_index = model_path +
@@ -69,39 +82,41 @@ torch::Tensor SafeTensorsLoader::findWeight(
 
 torch::Tensor SafeTensorsLoader::loadWeight(
   const std::string file_path_,
-  const std::string weight_name_
+  const std::string weight_name_,
+  bool is_loaded_
 ) {
-  fd = ::open(file_path_.c_str(), O_RDONLY);
-  if (fd < 0) {
-    throw std::runtime_error("Failed to open file: " + file_path_);
+  if(!is_loaded_) {
+    fd = ::open(file_path_.c_str(), O_RDONLY);
+    if (fd < 0) {
+      throw std::runtime_error("Failed to open file: " + file_path_);
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+      ::close(fd);
+      throw std::runtime_error("Failed to stat file: " + file_path_);
+    }
+    file_size = st.st_size;
+
+    map_ptr = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_ptr == MAP_FAILED) {
+      ::close(fd);
+      throw std::runtime_error("mmap failed for file: " + file_path_);
+    }
+
+    // parse header
+    size_t headerLen = *reinterpret_cast<uint64_t*>(map_ptr);
+    char* headerStart = reinterpret_cast<char*>(map_ptr) + 8;
+
+    std::string headerJson(headerStart, headerStart + headerLen);
+    json j = json::parse(headerJson);
+
+    for (auto& item : j.items()) {
+      json_map[item.key()] = item.value();
+    }
+
+    data_ptr = reinterpret_cast<uint8_t*>(map_ptr) + 8 + headerLen;
   }
-
-  struct stat st;
-  if (fstat(fd, &st) < 0) {
-    ::close(fd);
-    throw std::runtime_error("Failed to stat file: " + file_path_);
-  }
-  file_size = st.st_size;
-
-  map_ptr = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (map_ptr == MAP_FAILED) {
-    ::close(fd);
-    throw std::runtime_error("mmap failed for file: " + file_path_);
-  }
-
-  // parse header
-  size_t headerLen = *reinterpret_cast<uint64_t*>(map_ptr);
-  char* headerStart = reinterpret_cast<char*>(map_ptr) + 8;
-
-  std::string headerJson(headerStart, headerStart + headerLen);
-  json j = json::parse(headerJson);
-
-  for (auto& item : j.items()) {
-    if(item.key() == weight_name_)
-    json_map[item.key()] = item.value();
-  }
-
-  data_ptr = reinterpret_cast<uint8_t*>(map_ptr) + 8 + headerLen;
   
   for(const auto& kv : json_map){
     if(kv.first.find(weight_name_) != std::string::npos) {

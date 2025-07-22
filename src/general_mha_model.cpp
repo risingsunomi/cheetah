@@ -56,7 +56,7 @@ GeneralMHAModel::GeneralMHAModel(
     mlp->up_proj->weight = st_loader.findWeight(
       model_layer_prefix + 
       std::to_string(i) + 
-      ".mlp.up_proj"
+      ".mlp.up_proj" + model_postfix
     );
     mlp->down_proj->weight = st_loader.findWeight(
       model_layer_prefix +
@@ -65,7 +65,8 @@ GeneralMHAModel::GeneralMHAModel(
     );
     mlp->gate_proj->weight = st_loader.findWeight(
       model_layer_prefix +
-      std::to_string(i) + ".mlp.gate_proj"
+      std::to_string(i) +
+      ".mlp.gate_proj" + model_postfix
     );
 
     auto post_attn_layernorm = RMSNorm(config.embed_dim);

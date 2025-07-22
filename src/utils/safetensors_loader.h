@@ -29,7 +29,8 @@ public:
 private:
   torch::Tensor loadWeight(
     const std::string filen_path_,
-    const std::string weight_name_
+    const std::string weight_name_,
+    bool is_loaded_ = false
   );
 
   std::string searchIndex(

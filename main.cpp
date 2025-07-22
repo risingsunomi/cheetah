@@ -41,62 +41,118 @@ void handle_client(int client_fd) {
     util_helper.recv_all(client_fd, header_buf.data(), header_len);
     json header = json::parse(header_buf.begin(), header_buf.end());
 
+    // to do - handle hidden state
     std::string node_id = header["node_id"];
     std::string model_id = header["model"];
-    std::string config_path = header["config_path"];
-    std::vector<std::string> safetensors_path = header["safetensors_path"];
+    std::string model_path = header["model_path"];
     int layer_start = header["layer_start"];
     int layer_end = header["layer_end"];
     int layer_total = header["layer_total"];
     std::string dtype = header["dtype"];
-    std::vector<int> shape_input = header["shape_input"];
-    std::vector<int> shape_mask = header["shape_mask"];
+    std::vector<int> input_id_shape = header["input_id_shape"];
+    std::vector<int> mask_shape = header["mask_shape"];
+    std::vector<int> input_pos_shape = header["input_pos_shape"];
 
     std::cout << "Received request from node: " << node_id << std::endl;
-    Shard shard(model_id, layer_start, layer_end, layer_total);
-    std::cout << "Loading model config @ " << config_path << std::endl;
-    ModelConfig config(config_path);
-    int total_layers = config.num_layers;
-    std::cout << "Layer range: " << layer_start << " to " << layer_end << " / " << total_layers << std::endl;
+    
+    Shard shard(
+      model_id,
+      layer_start,
+      layer_end,
+      layer_total
+    );
 
+    std::cout << "Loading model config @ " << model_path << std::endl;
+    ModelConfig config(model_path);
+    
+    std::cout << "Layer range: " << layer_start << " to " << layer_end << " / " << layer_total << std::endl;
+
+    // recieve tensors
     torch::ScalarType scalar;
     if (dtype == "int64") scalar = torch::kInt64;
     else if (dtype == "int32") scalar = torch::kInt32;
     else throw std::runtime_error("Unsupported dtype");
 
     auto scalar_size = torch::elementSize(scalar);
-    auto input_prod = torch::prod(torch::tensor(shape_input));
-    auto mask_prod = torch::prod(torch::tensor(shape_mask));
-    size_t tensor_total_bytes = scalar_size * (input_prod.item<int>() + mask_prod.item<int>());
+    auto input_id_prod = torch::prod(torch::tensor(input_id_shape));
+    auto mask_prod = torch::prod(torch::tensor(mask_shape));
+    auto input_pos_prod = torch::prod(torch::tensor(input_pos_shape));
+    size_t tensor_total_bytes = scalar_size * (
+      input_id_prod.item<int>() +
+      mask_prod.item<int>() +
+      input_pos_prod.item<int>()
+    );
 
     std::vector<char> buffer(tensor_total_bytes);
-    util_helper.recv_all(client_fd, buffer.data(), tensor_total_bytes);
+    util_helper.recv_all(
+      client_fd,
+      buffer.data(),
+      tensor_total_bytes
+    );
 
     size_t offset = 0;
     const char *ptr = buffer.data();
-
-    torch::Tensor input_ids = util_helper.recv_tensor_view(ptr, offset, shape_input, scalar);
-    torch::Tensor attention_mask = util_helper.recv_tensor_view(ptr, offset, shape_mask, scalar);
+    torch::Tensor input_ids = util_helper.recv_tensor_view(
+      ptr,
+      offset,
+      input_id_shape,
+      scalar
+    );
+    torch::Tensor attention_mask = util_helper.recv_tensor_view(
+      ptr,
+      offset,
+      mask_shape,
+      scalar
+    );
+    torch::Tensor input_pos = util_helper.recv_tensor_view(
+      ptr,
+      offset,
+      input_pos_shape,
+      scalar
+    );
 
     std::cout << "Input IDs shape: " << input_ids.sizes() << std::endl;
     std::cout << "Attention mask shape: " << attention_mask.sizes() << std::endl;
 
     std::cout << "Loading GeneralMHAModel" << std::endl;
     auto model = GeneralMHAModel(
-        shard,
-        config,
-        safetensors_path,
-        config.use_cache);
+      shard,
+      config,
+      model_path,
+      config.use_cache);
+    
+    model.eval();
 
-    // TODO: Perform model inference or response handling here
+    // infer forward
+    torch::Tensor model_out = model.forward(
+      input_ids,
+      attention_mask,
+      input_pos,
+      c10::nullopt);
+
+    // return tensor
+    util_helper.send_tensor(client_fd, model_out);
+    close(client_fd);
+    
   } catch (const std::exception &e) {
     std::cerr << "Error while handling client: " << e.what() << std::endl;
   }
+}
 
-  close(client_fd);
+void show_logo() {
+  std::cout << R"(
+
+░░      ░░░  ░░░░  ░░        ░░        ░░        ░░░      ░░░  ░░░░  ░
+▒  ▒▒▒▒  ▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒▒▒▒▒  ▒▒▒▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒  ▒
+▓  ▓▓▓▓▓▓▓▓        ▓▓      ▓▓▓▓      ▓▓▓▓▓▓▓  ▓▓▓▓▓  ▓▓▓▓  ▓▓        ▓
+█  ████  ██  ████  ██  ████████  ███████████  █████        ██  ████  █
+██      ███  ████  ██        ██        █████  █████  ████  ██  ████  █
+                                                                                                                                      
+  )" << std::endl;
 }
 
 int main() {
+  show_logo();
   std::cout << "Starting Cheetah Service..." << std::endl;
   std::signal(SIGINT, cleanup);
 
@@ -126,9 +182,9 @@ int main() {
   }
 
   std::cout << "Socket started @ " << socket_path << std::endl;
+  std::cout << "Waiting for input data..." << std::endl;
 
   while (true) {
-    util_helper.print_waiting();
     int client_fd = accept(server_fd, nullptr, nullptr);
     if (client_fd == -1) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
