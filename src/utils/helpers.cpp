@@ -76,12 +76,12 @@ torch::Tensor Helpers::recv_tensor_view(
   return tensor;
 }
 
-void Helpers::send_tensor(int sock, const torch::Tensor &tensor) {
+void Helpers::send_tensor(int sock, const torch::Tensor &tensor, std::string dtype) {
   std::vector<int> shape_vec(tensor.sizes().begin(), tensor.sizes().end());
   
   nlohmann::json header = {
     {"command", "response"},
-    {"dtype", "bfloat16"},
+    {"dtype", dtype},
     {"shape", shape_vec}
   };
 

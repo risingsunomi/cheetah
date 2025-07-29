@@ -113,6 +113,7 @@ void handle_client(int client_fd) {
 
     std::cout << "Input IDs shape: " << input_ids.sizes() << std::endl;
     std::cout << "Attention mask shape: " << attention_mask.sizes() << std::endl;
+    std::cout << "Input POS shape: " << input_pos.sizes() << std::endl;
 
     std::cout << "Loading GeneralMHAModel" << std::endl;
     auto model = GeneralMHAModel(

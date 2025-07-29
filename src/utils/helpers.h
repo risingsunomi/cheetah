@@ -31,7 +31,8 @@ class Helpers {
   );
   void send_tensor(
     int sock,
-    const torch::Tensor &tensor
+    const torch::Tensor &tensor,
+    const std::string dtype = "float32"
   );
   void print_waiting();
 
