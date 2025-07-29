@@ -48,8 +48,16 @@ void handle_client(int client_fd) {
     int layer_start = header["layer_start"];
     int layer_end = header["layer_end"];
     int layer_total = header["layer_total"];
-    std::string dtype = header["dtype"];
-    std::vector<int> input_id_shape = header["input_id_shape"];
+    torch::ScalarType dtype_input_id = util_helper.dtype_from_string(
+      header["dtype_input_ids"]
+    );
+    torch::ScalarType dtype_mask = util_helper.dtype_from_string(
+      header["dtype_mask"]
+    );
+    torch::ScalarType dtype_input_pos = util_helper.dtype_from_string(
+      header["dtype_input_pos"]
+    );
+    std::vector<int> input_id_shape = header["input_ids_shape"];
     std::vector<int> mask_shape = header["mask_shape"];
     std::vector<int> input_pos_shape = header["input_pos_shape"];
 
@@ -63,25 +71,20 @@ void handle_client(int client_fd) {
     );
 
     std::cout << "Loading model config @ " << model_path << std::endl;
-    ModelConfig config(model_path);
+    ModelConfig config(model_path + "/config.json");
     
     std::cout << "Layer range: " << layer_start << " to " << layer_end << " / " << layer_total << std::endl;
 
     // recieve tensors
-    torch::ScalarType scalar;
-    if (dtype == "int64") scalar = torch::kInt64;
-    else if (dtype == "int32") scalar = torch::kInt32;
-    else throw std::runtime_error("Unsupported dtype");
+    size_t tensor_total_bytes =
+    torch::elementSize(dtype_input_id) *
+    torch::prod(torch::tensor(input_id_shape)).item<int>() +
+    torch::elementSize(dtype_mask) *
+    torch::prod(torch::tensor(mask_shape)).item<int>() +
+    torch::elementSize(dtype_input_pos) *
+    torch::prod(torch::tensor(input_pos_shape)).item<int>();
 
-    auto scalar_size = torch::elementSize(scalar);
-    auto input_id_prod = torch::prod(torch::tensor(input_id_shape));
-    auto mask_prod = torch::prod(torch::tensor(mask_shape));
-    auto input_pos_prod = torch::prod(torch::tensor(input_pos_shape));
-    size_t tensor_total_bytes = scalar_size * (
-      input_id_prod.item<int>() +
-      mask_prod.item<int>() +
-      input_pos_prod.item<int>()
-    );
+    std::cout << "Total tensor size in bytes: " << tensor_total_bytes << std::endl;
 
     std::vector<char> buffer(tensor_total_bytes);
     util_helper.recv_all(
@@ -90,25 +93,27 @@ void handle_client(int client_fd) {
       tensor_total_bytes
     );
 
+    std::cout << "Received tensors of total size: " << tensor_total_bytes << " bytes" << std::endl;
+
     size_t offset = 0;
     const char *ptr = buffer.data();
     torch::Tensor input_ids = util_helper.recv_tensor_view(
       ptr,
       offset,
       input_id_shape,
-      scalar
+      dtype_input_id
     );
     torch::Tensor attention_mask = util_helper.recv_tensor_view(
       ptr,
       offset,
       mask_shape,
-      scalar
+      dtype_mask
     );
     torch::Tensor input_pos = util_helper.recv_tensor_view(
       ptr,
       offset,
       input_pos_shape,
-      scalar
+      dtype_input_pos
     );
 
     std::cout << "Input IDs shape: " << input_ids.sizes() << std::endl;
@@ -125,6 +130,7 @@ void handle_client(int client_fd) {
     model.eval();
 
     // infer forward
+    std::cout << "Running model forward..." << std::endl;
     torch::Tensor model_out = model.forward(
       input_ids,
       attention_mask,
@@ -132,7 +138,8 @@ void handle_client(int client_fd) {
       c10::nullopt);
 
     // return tensor
-    util_helper.send_tensor(client_fd, model_out);
+    std::cout << "Returning model tensor output of shape: " << model_out.sizes() << std::endl;
+    util_helper.send_tensor(client_fd, model_out.to(torch::kFloat32));
     close(client_fd);
     
   } catch (const std::exception &e) {

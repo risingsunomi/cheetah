@@ -93,8 +93,40 @@ void Helpers::send_tensor(int sock, const torch::Tensor &tensor, std::string dty
   send_all(sock, tensor.data_ptr(), tensor.nbytes());
 }
 
-void Helpers::print_waiting() {
-  static int state = 0;
-  const char cursor[] = {'|', '/', '-', '\\'};
-  std::cout << "\r Waiting" << cursor[state++ % 4] << std::flush;
+torch::Dtype Helpers::dtype_from_string(const std::string& name) {
+  static const std::unordered_map<std::string, torch::Dtype> map = {
+    {"float16", torch::kFloat16},
+    {"bfloat16", torch::kBFloat16},
+    {"float32", torch::kFloat32},
+    {"float64", torch::kFloat64},
+    {"int8", torch::kInt8},
+    {"int16", torch::kInt16},
+    {"int32", torch::kInt32},
+    {"int64", torch::kInt64},
+    {"uint8", torch::kUInt8},
+    {"bool", torch::kBool},
+    {"complex64", torch::kComplexFloat},
+    {"complex128", torch::kComplexDouble},
+    {"half", torch::kFloat16},
+    {"float", torch::kFloat32},
+    {"double", torch::kFloat64},
+    {"long", torch::kInt64},
+    {"int", torch::kInt32},
+    {"short", torch::kInt16},
+    {"byte", torch::kUInt8},
+    {"char", torch::kInt8},
+    {"qint8", torch::kQInt8},
+    {"quint8", torch::kQUInt8},
+    {"qint32", torch::kQInt32},
+    {"float8_e5m2", torch::kFloat8_e5m2},
+    {"float8_e4m3fn", torch::kFloat8_e4m3fn},
+    {"float8_e4m3fnuz", torch::kFloat8_e4m3fnuz},
+    {"float8_e5m2fnuz", torch::kFloat8_e5m2fnuz}
+  };
+
+  auto it = map.find(name);
+  if (it == map.end()) {
+    throw std::invalid_argument("Unsupported dtype string: " + name);
+  }
+  return it->second;
 }

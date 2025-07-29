@@ -49,10 +49,10 @@ int main()
     model.eval();
 
     // === Inputs ===
-    auto tokens = torch::randint(0, config.vocab_size, {1, config.max_seq_len}, torch::kLong); // [batch, seq_len]
+    auto tokens = torch::randint(0, config.vocab_size, {1, config.max_seq_len}, torch::kInt64); // [batch, seq_len]
     auto mask = torch::ones({config.max_seq_len, config.max_seq_len}, torch::kBool).tril();    // [seq_len, seq_len]
     mask = mask.unsqueeze(0);                                                                  // [1, seq_len, seq_len] — batch dim added
-    auto input_pos = torch::arange(0, config.max_seq_len, torch::kInt32).unsqueeze(0);         // [1, seq_len]
+    auto input_pos = torch::arange(0, config.max_seq_len, torch::kInt64).unsqueeze(0);         // [1, seq_len]
 
     std::cout << "Input tokens shape: " << tokens.sizes() << std::endl;
     std::cout << "Input mask shape: " << mask.sizes() << std::endl;
