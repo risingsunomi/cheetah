@@ -103,12 +103,15 @@ void handle_client(int client_fd) {
       input_id_shape,
       dtype_input_id
     );
+    
     torch::Tensor attention_mask = util_helper.recv_tensor_view(
       ptr,
       offset,
       mask_shape,
       dtype_mask
     );
+    attention_mask = attention_mask.to(torch::kBool);
+
     torch::Tensor input_pos = util_helper.recv_tensor_view(
       ptr,
       offset,

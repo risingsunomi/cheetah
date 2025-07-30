@@ -29,11 +29,31 @@ GeneralMHAModel::GeneralMHAModel(
         ".self_attn.q_proj" + model_postfix
     );
 
+    // permute to convert from hf fromat to torch format
+    q_proj->weight = q_proj->weight.view({
+      config.num_heads,
+      2,
+      config.head_dim / 2,
+      config.embed_dim
+    }).transpose(1, 2).reshape(
+      {config.head_dim * config.num_heads, config.embed_dim}
+    );
+
     torch::nn::Linear k_proj(config.embed_dim, config.embed_dim);
     k_proj->weight = st_loader.findWeight(
       model_layer_prefix +
         std::to_string(i) +
         ".self_attn.k_proj" + model_postfix
+    );
+
+    // permute to convert from hf fromat to torch format
+    k_proj->weight = k_proj->weight.view({
+      config.num_kv_heads,
+      2,
+      config.head_dim / 2,
+      config.embed_dim
+    }).transpose(1, 2).reshape(
+      {config.head_dim * config.num_kv_heads, config.embed_dim}
     );
 
     torch::nn::Linear v_proj(config.embed_dim, config.embed_dim);
