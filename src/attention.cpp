@@ -33,27 +33,7 @@ MultiHeadAttentionImpl::MultiHeadAttentionImpl(
   is_causal(is_causal_),
   attn_dropout(attn_dropout_),
   use_cache(use_cache_),
-  model_dtype(model_dtype_) {
-    register_module(
-      "model__layers__" +
-      std::to_string(layer_id) +
-      "__self_attn__q_proj", q_proj);
-
-    register_module(
-      "model__layers__" +
-      std::to_string(layer_id) +
-      "__self_attn__k_proj", k_proj);
-
-    register_module(
-      "model__layers__" +
-      std::to_string(layer_id) +
-      "__self_attn__v_proj", v_proj);
-
-    register_module(
-      "model__layers__" +
-      std::to_string(layer_id) +
-      "__self_attn__o_proj", out_proj);
-}
+  model_dtype(model_dtype_) {}
 
 void MultiHeadAttentionImpl::setup_cache(
   int batch_size_,

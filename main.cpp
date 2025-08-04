@@ -17,6 +17,7 @@
 #include "src/utils/shard.h"
 #include "src/utils/model_config.h"
 #include "src/utils/helpers.h"
+#include "src/utils/sessionmgmt.h"
 
 using json = nlohmann::json;
 
@@ -28,41 +29,28 @@ void cleanup(int) {
   std::exit(0);
 }
 
-void handle_client(int client_fd) {
-  std::cout << "handle_client" << std::endl;
+void handle_client(int client_fd, SessionManagement &session_mgmt) {
   try {
     uint32_t header_len_be;
     ssize_t recv_header_len = util_helper.recv_all(client_fd, &header_len_be, 4);
-    std::cout << std::to_string(recv_header_len) << std::endl;
     uint32_t header_len = ntohl(header_len_be);
-    std::cout << "header_len " << std::to_string(header_len) << std::endl;
 
     std::vector<char> header_buf(header_len);
     util_helper.recv_all(client_fd, header_buf.data(), header_len);
+    std::cout << "Recieved header" << std::endl;
     json header = json::parse(header_buf.begin(), header_buf.end());
 
     // to do - handle hidden state
+    std::string session_id = header["session_id"];
     std::string node_id = header["node_id"];
+    std::cout << "Session ID: " << session_id << std::endl;
+    std::cout << "Node ID: " << node_id << std::endl;
+
     std::string model_id = header["model"];
-    std::string model_path = header["model_path"];
     int layer_start = header["layer_start"];
     int layer_end = header["layer_end"];
     int layer_total = header["layer_total"];
-    torch::ScalarType dtype_input_id = util_helper.dtype_from_string(
-      header["dtype_input_ids"]
-    );
-    torch::ScalarType dtype_mask = util_helper.dtype_from_string(
-      header["dtype_mask"]
-    );
-    torch::ScalarType dtype_input_pos = util_helper.dtype_from_string(
-      header["dtype_input_pos"]
-    );
-    std::vector<int> input_id_shape = header["input_ids_shape"];
-    std::vector<int> mask_shape = header["mask_shape"];
-    std::vector<int> input_pos_shape = header["input_pos_shape"];
-
-    std::cout << "Received request from node: " << node_id << std::endl;
-    
+  
     Shard shard(
       model_id,
       layer_start,
@@ -70,75 +58,126 @@ void handle_client(int client_fd) {
       layer_total
     );
 
-    std::cout << "Loading model config @ " << model_path << std::endl;
+    std::cout << "Shard: " << shard.model_id << " from layer "
+      << shard.start_layer << " to " << shard.end_layer
+      << " / " << shard.n_layers << std::endl;
+    
+    std::string model_path = header["model_path"];
     ModelConfig config(model_path + "/config.json");
+    std::cout << "Model Config: " << config.config_path << std::endl;
+
+    // check if has a session model
+    auto smodel = std::shared_ptr<GeneralMHAModel>(nullptr);
+    if(session_mgmt.has_session(session_id, node_id)) {
+      std::cout << "Found session, reusing model" << std::endl;
+      auto smodel = session_mgmt.get_model(session_id, node_id);
+    } else {
+      std::cout << "No session found, creating new model" << std::endl;
+      auto smodel = std::make_shared<GeneralMHAModel>(
+        shard,
+        config,
+        model_path,
+        config.use_cache
+      );
+      session_mgmt.put(session_id, node_id, smodel);
+    }
     
-    std::cout << "Layer range: " << layer_start << " to " << layer_end << " / " << layer_total << std::endl;
+    torch::Tensor model_out;
 
-    // recieve tensors
-    size_t tensor_total_bytes =
-    torch::elementSize(dtype_input_id) *
-    torch::prod(torch::tensor(input_id_shape)).item<int>() +
-    torch::elementSize(dtype_mask) *
-    torch::prod(torch::tensor(mask_shape)).item<int>() +
-    torch::elementSize(dtype_input_pos) *
-    torch::prod(torch::tensor(input_pos_shape)).item<int>();
+    if(header["has_hidden_state"]) {
+      std::string hidden_state_dtype = header["hidden_state_dtype"];
+      std::vector<int> hidden_state_shape = header["hidde_state_shape"];
 
-    std::cout << "Total tensor size in bytes: " << tensor_total_bytes << std::endl;
+      size_t tensor_total_bytes =
+        torch::elementSize(util_helper.dtype_from_string(hidden_state_dtype)) *
+        torch::prod(torch::tensor(hidden_state_shape)).item<int>();
+      std::vector<char> buffer(tensor_total_bytes);
+      util_helper.recv_all(client_fd, buffer.data(), tensor_total_bytes);
+      size_t offset = 0;
+      const char *ptr = buffer.data();
+      torch::Tensor hidden_state = util_helper.recv_tensor_view(
+        ptr,
+        offset,
+        hidden_state_shape,
+        util_helper.dtype_from_string(hidden_state_dtype)
+      );
 
-    std::vector<char> buffer(tensor_total_bytes);
-    util_helper.recv_all(
-      client_fd,
-      buffer.data(),
-      tensor_total_bytes
-    );
+      std::cout << "Hidden state shape: " << hidden_state.sizes() << std::endl;
+      std::cout << "Hidden state dtype: " << hidden_state.dtype() << std::endl;
 
-    std::cout << "Received tensors of total size: " << tensor_total_bytes << " bytes" << std::endl;
+      // infer forward
+      std::cout << "Running model forward with hidden state..." << std::endl;
+      model_out = smodel->forward(
+        hidden_state,
+        c10::nullopt,
+        c10::nullopt,
+        c10::nullopt);
+    } else {
+      torch::ScalarType dtype_input_id = util_helper.dtype_from_string(
+        header["dtype_input_ids"]
+      );
+      torch::ScalarType dtype_mask = util_helper.dtype_from_string(
+        header["dtype_mask"]
+      );
+      torch::ScalarType dtype_input_pos = util_helper.dtype_from_string(
+        header["dtype_input_pos"]
+      );
+      std::vector<int> input_id_shape = header["input_ids_shape"];
+      std::vector<int> mask_shape = header["mask_shape"];
+      std::vector<int> input_pos_shape = header["input_pos_shape"];
 
-    size_t offset = 0;
-    const char *ptr = buffer.data();
-    torch::Tensor input_ids = util_helper.recv_tensor_view(
-      ptr,
-      offset,
-      input_id_shape,
-      dtype_input_id
-    );
-    
-    torch::Tensor attention_mask = util_helper.recv_tensor_view(
-      ptr,
-      offset,
-      mask_shape,
-      dtype_mask
-    );
-    attention_mask = attention_mask.to(torch::kBool);
+      // recieve tensors
+      size_t tensor_total_bytes =
+      torch::elementSize(dtype_input_id) *
+      torch::prod(torch::tensor(input_id_shape)).item<int>() +
+      torch::elementSize(dtype_mask) *
+      torch::prod(torch::tensor(mask_shape)).item<int>() +
+      torch::elementSize(dtype_input_pos) *
+      torch::prod(torch::tensor(input_pos_shape)).item<int>();
 
-    torch::Tensor input_pos = util_helper.recv_tensor_view(
-      ptr,
-      offset,
-      input_pos_shape,
-      dtype_input_pos
-    );
+      std::vector<char> buffer(tensor_total_bytes);
+      util_helper.recv_all(
+        client_fd,
+        buffer.data(),
+        tensor_total_bytes
+      );
 
-    std::cout << "Input IDs shape: " << input_ids.sizes() << std::endl;
-    std::cout << "Attention mask shape: " << attention_mask.sizes() << std::endl;
-    std::cout << "Input POS shape: " << input_pos.sizes() << std::endl;
+      size_t offset = 0;
+      const char *ptr = buffer.data();
+      torch::Tensor input_ids = util_helper.recv_tensor_view(
+        ptr,
+        offset,
+        input_id_shape,
+        dtype_input_id
+      );
+      
+      torch::Tensor attention_mask = util_helper.recv_tensor_view(
+        ptr,
+        offset,
+        mask_shape,
+        dtype_mask
+      );
+      attention_mask = attention_mask.to(torch::kBool);
 
-    std::cout << "Loading GeneralMHAModel" << std::endl;
-    auto model = GeneralMHAModel(
-      shard,
-      config,
-      model_path,
-      config.use_cache);
-    
-    model.eval();
+      torch::Tensor input_pos = util_helper.recv_tensor_view(
+        ptr,
+        offset,
+        input_pos_shape,
+        dtype_input_pos
+      );
 
-    // infer forward
-    std::cout << "Running model forward..." << std::endl;
-    torch::Tensor model_out = model.forward(
-      input_ids,
-      attention_mask,
-      input_pos,
-      c10::nullopt);
+      std::cout << "Input IDs shape: " << input_ids.sizes() << std::endl;
+      std::cout << "Attention mask shape: " << attention_mask.sizes() << std::endl;
+      std::cout << "Input POS shape: " << input_pos.sizes() << std::endl;
+
+      // infer forward
+      std::cout << "Running model forward..." << std::endl;
+      model_out = smodel->forward(
+        input_ids,
+        attention_mask,
+        input_pos,
+        c10::nullopt);
+    }
 
     // return tensor
     std::cout << "Returning model tensor output of shape: " << model_out.sizes() << std::endl;
@@ -193,6 +232,8 @@ int main() {
   }
 
   std::cout << "Socket started @ " << socket_path << std::endl;
+
+  SessionManagement session_mgmt = SessionManagement();
   std::cout << "Waiting for input data..." << std::endl;
 
   while (true) {
@@ -206,7 +247,8 @@ int main() {
       }
     }
 
-    std::thread(handle_client, client_fd).detach();
+    //std::thread(handle_client, client_fd, session_mgmt).detach();
+    handle_client(client_fd, session_mgmt);
   }
 
   close(server_fd);

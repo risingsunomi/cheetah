@@ -33,11 +33,12 @@ public:
   std::vector<TransformerSelfAttentionLayer> self_attn_layers;
   ShardTransformerDecoder shard_decoder = nullptr;
   const std::string model_path;
-
-private:
   Shard shard;
   ModelConfig config;
   bool use_cache;
+
+private:
+  
   std::string model_prefix = "model.";
   std::string model_layer_prefix = "model.layers.";
   std::string model_postfix = ".weight";

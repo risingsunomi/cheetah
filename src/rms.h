@@ -1,12 +1,12 @@
-#ifndef RMS_NORM_H
-#define RMS_NORM_H
+#ifndef RMS_H
+#define RMS_H
 
 #include <torch/torch.h>
 
 class RMSNormImpl : public torch::nn::Module {
     public:
-        RMSNormImpl(int hidden_size, float eps = 1e-5);
-        torch::Tensor forward(const torch::Tensor& input);
+        RMSNormImpl(int hidden_size_, float eps_ = 1e-5);
+        torch::Tensor forward(const torch::Tensor& input_);
         torch::Tensor weight;
 
     private:
@@ -14,4 +14,4 @@ class RMSNormImpl : public torch::nn::Module {
 };
 TORCH_MODULE(RMSNorm);
 
-#endif // RMS_NORM_H
+#endif // RMS_H

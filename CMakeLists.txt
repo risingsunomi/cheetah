@@ -24,6 +24,7 @@ add_executable(main
   src/utils/model_config.cpp
   src/utils/safetensors_loader.cpp
   src/utils/helpers.cpp
+  src/utils/sessionmgmt.cpp
 )
 
 
