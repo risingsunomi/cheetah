@@ -37,16 +37,17 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
 
     std::vector<char> header_buf(header_len);
     util_helper.recv_all(client_fd, header_buf.data(), header_len);
-    std::cout << "Recieved header" << std::endl;
     json header = json::parse(header_buf.begin(), header_buf.end());
 
     // to do - handle hidden state
     std::string session_id = header["session_id"];
     std::string node_id = header["node_id"];
-    std::cout << "Session ID: " << session_id << std::endl;
-    std::cout << "Node ID: " << node_id << std::endl;
+    std::cout << "Session Connected - [ID] " 
+      << session_id << " ~ [NodeID] " << node_id << std::endl;
 
     std::string model_id = header["model"];
+    std::cout << "Model ID: " << model_id << std::endl;
+
     int layer_start = header["layer_start"];
     int layer_end = header["layer_end"];
     int layer_total = header["layer_total"];
@@ -72,7 +73,10 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
     torch::Tensor input_pos;
     torch::Tensor hidden_state;
 
-    if(header["has_hidden_state"]) {
+    bool has_hidden_state = header.contains("has_hidden_state") &&
+      header["has_hidden_state"].get<bool>();
+
+    if(has_hidden_state) {
       std::string hidden_state_dtype = header["hidden_state_dtype"];
       std::vector<int> hidden_state_shape = header["hidde_state_shape"];
 
@@ -89,12 +93,6 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
         hidden_state_shape,
         util_helper.dtype_from_string(hidden_state_dtype)
       );
-
-      std::cout << "Hidden state shape: " << hidden_state.sizes() << std::endl;
-      std::cout << "Hidden state dtype: " << hidden_state.dtype() << std::endl;
-
-      // infer forward
-      std::cout << "Running model forward with hidden state..." << std::endl;
     } else {
       torch::ScalarType dtype_input_id = util_helper.dtype_from_string(
         header["dtype_input_ids"]
@@ -148,42 +146,30 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
         input_pos_shape,
         dtype_input_pos
       );
-
-      std::cout << "Input IDs shape: " << input_ids.sizes() << std::endl;
-      std::cout << "Attention mask shape: " << attention_mask.sizes() << std::endl;
-      std::cout << "Input POS shape: " << input_pos.sizes() << std::endl; 
     }
 
     // check if has a session model
-    if(session_mgmt.has_session(session_id, node_id)) {
-      std::cout << "Found session, reusing model" << std::endl;
-      auto smodel = session_mgmt.get_model(session_id, node_id);
-      
-      // infer forward
-      std::cout << "Running model forward..." << std::endl;
-      model_out = smodel->forward(
-        input_ids,
-        attention_mask,
-        input_pos,
-        c10::nullopt);
+    // Get or create model
+    std::shared_ptr<GeneralMHAModel> smodel;
+    if (session_mgmt.has_session(session_id, node_id)) {
+        std::cout << "Found session, reusing model" << std::endl;
+        smodel = session_mgmt.get_model(session_id, node_id);
     } else {
-      std::cout << "No session found, creating new model" << std::endl;
-      auto smodel = std::make_shared<GeneralMHAModel>(
-        shard,
-        config,
-        model_path,
-        config.use_cache
-      );
-      session_mgmt.put(session_id, node_id, smodel);
-
-      // infer forward
-      std::cout << "Running model forward..." << std::endl;
-      model_out = smodel->forward(
-        input_ids,
-        attention_mask,
-        input_pos,
-        c10::nullopt);
+        std::cout << "No session found, creating new model" << std::endl;
+        smodel = std::make_shared<GeneralMHAModel>(
+          shard,
+          config,
+          model_path,
+          config.use_cache
+        );
+        session_mgmt.put(session_id, node_id, smodel);
     }
+
+    // Run model forward
+    std::cout << "Running model forward..." << std::endl;
+    torch::Tensor model_out = has_hidden_state 
+        ? smodel->forward(hidden_state, c10::nullopt, c10::nullopt, c10::nullopt)
+        : smodel->forward(input_ids, attention_mask, input_pos, c10::nullopt);
       
     // return tensor
     std::cout << "Returning model tensor output of shape: " << model_out.sizes() << std::endl;

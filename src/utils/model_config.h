@@ -34,6 +34,7 @@ class ModelConfig {
         std::string hidden_act;
         torch::ScalarType torch_dtype;
         bool use_cache;
+        int original_max_seq_len = 1024;
 };
 
 #endif

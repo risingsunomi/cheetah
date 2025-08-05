@@ -126,13 +126,7 @@ ShardTransformerDecoderImpl::ShardTransformerDecoderImpl(
     norm(norm_),
     output(output_),
     model_dtype(dtype_)
-{
-    std::cout << "\nCreating ShardTransformerDecoderImpl with shard: "
-              << shard.start_layer << " to " << shard.end_layer << std::endl;
-    register_module("model__embed_tokens", tok_embeddings);
-    register_module("model__norm", norm);
-    register_module("model__lm_head", output);
-}
+{}
 
 void ShardTransformerDecoderImpl::setup_caches(
     int batch_size_,
