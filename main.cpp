@@ -65,24 +65,12 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
     std::string model_path = header["model_path"];
     ModelConfig config(model_path + "/config.json");
     std::cout << "Model Config: " << config.config_path << std::endl;
-
-    // check if has a session model
-    auto smodel = std::shared_ptr<GeneralMHAModel>(nullptr);
-    if(session_mgmt.has_session(session_id, node_id)) {
-      std::cout << "Found session, reusing model" << std::endl;
-      auto smodel = session_mgmt.get_model(session_id, node_id);
-    } else {
-      std::cout << "No session found, creating new model" << std::endl;
-      auto smodel = std::make_shared<GeneralMHAModel>(
-        shard,
-        config,
-        model_path,
-        config.use_cache
-      );
-      session_mgmt.put(session_id, node_id, smodel);
-    }
     
     torch::Tensor model_out;
+    torch::Tensor input_ids;
+    torch::Tensor attention_mask;
+    torch::Tensor input_pos;
+    torch::Tensor hidden_state;
 
     if(header["has_hidden_state"]) {
       std::string hidden_state_dtype = header["hidden_state_dtype"];
@@ -107,11 +95,6 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
 
       // infer forward
       std::cout << "Running model forward with hidden state..." << std::endl;
-      model_out = smodel->forward(
-        hidden_state,
-        c10::nullopt,
-        c10::nullopt,
-        c10::nullopt);
     } else {
       torch::ScalarType dtype_input_id = util_helper.dtype_from_string(
         header["dtype_input_ids"]
@@ -144,14 +127,14 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
 
       size_t offset = 0;
       const char *ptr = buffer.data();
-      torch::Tensor input_ids = util_helper.recv_tensor_view(
+      input_ids = util_helper.recv_tensor_view(
         ptr,
         offset,
         input_id_shape,
         dtype_input_id
       );
       
-      torch::Tensor attention_mask = util_helper.recv_tensor_view(
+      attention_mask = util_helper.recv_tensor_view(
         ptr,
         offset,
         mask_shape,
@@ -159,7 +142,7 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
       );
       attention_mask = attention_mask.to(torch::kBool);
 
-      torch::Tensor input_pos = util_helper.recv_tensor_view(
+      input_pos = util_helper.recv_tensor_view(
         ptr,
         offset,
         input_pos_shape,
@@ -168,7 +151,30 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
 
       std::cout << "Input IDs shape: " << input_ids.sizes() << std::endl;
       std::cout << "Attention mask shape: " << attention_mask.sizes() << std::endl;
-      std::cout << "Input POS shape: " << input_pos.sizes() << std::endl;
+      std::cout << "Input POS shape: " << input_pos.sizes() << std::endl; 
+    }
+
+    // check if has a session model
+    if(session_mgmt.has_session(session_id, node_id)) {
+      std::cout << "Found session, reusing model" << std::endl;
+      auto smodel = session_mgmt.get_model(session_id, node_id);
+      
+      // infer forward
+      std::cout << "Running model forward..." << std::endl;
+      model_out = smodel->forward(
+        input_ids,
+        attention_mask,
+        input_pos,
+        c10::nullopt);
+    } else {
+      std::cout << "No session found, creating new model" << std::endl;
+      auto smodel = std::make_shared<GeneralMHAModel>(
+        shard,
+        config,
+        model_path,
+        config.use_cache
+      );
+      session_mgmt.put(session_id, node_id, smodel);
 
       // infer forward
       std::cout << "Running model forward..." << std::endl;
@@ -178,7 +184,7 @@ void handle_client(int client_fd, SessionManagement &session_mgmt) {
         input_pos,
         c10::nullopt);
     }
-
+      
     // return tensor
     std::cout << "Returning model tensor output of shape: " << model_out.sizes() << std::endl;
     util_helper.send_tensor(client_fd, model_out.to(torch::kFloat32));
