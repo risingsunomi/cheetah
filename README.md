@@ -32,4 +32,3 @@
 ![settings screen](media/settings_03182026.png "settings screen 03182026")
 
 
-**Still work in progress**
