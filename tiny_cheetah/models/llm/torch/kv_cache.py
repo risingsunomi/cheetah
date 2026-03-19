@@ -44,7 +44,7 @@ class KVCache:
         return torch.device("cpu")
 
     def clear(self) -> None:
-        self.cache_kv.zero_()
+        self.cache_kv = torch.zeros_like(self.cache_kv)
         self.cache_pos = 0
 
     def update(self, xk: torch.Tensor, xv: torch.Tensor) -> None:

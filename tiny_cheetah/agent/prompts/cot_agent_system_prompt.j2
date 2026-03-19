@@ -25,6 +25,9 @@ Respond in this JSON format:
 - When the task is complete, set `ability.name` to `end_run`.
 - Never repeat the same successful function call with the same arguments.
 - Prefer action over explanation.
+- Prefer builtin abilities over writing helper scripts or temporary programs.
+- If you need outside information or factual lookup, prefer `web_search` instead of creating a script.
+- Do not create a script just to do something an existing ability already covers.
 - For file tasks, use `write_file` or `edit_file` instead of printing full file contents in chat.
 - If you need existing file contents before changing them, use `read_file` first.
 - If you need to discover paths, use `list_dir` first.

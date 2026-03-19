@@ -13,7 +13,6 @@ from textual.widgets import Footer, Header, Label, Static
 from tiny_cheetah.orchestration.peer_client import PeerClient
 from tiny_cheetah.tui.connect_peer_screen import ConnectPeerScreen
 from tiny_cheetah.tui.help_screen import HelpScreen
-from tiny_cheetah.tui.peer_directory_screen import PeerDirectoryScreen
 
 
 class OrchestrationScreen(Screen[None]):
@@ -26,7 +25,6 @@ class OrchestrationScreen(Screen[None]):
         ("b", "pop_screen", "Back"),
         ("r", "refresh_panels", "Refresh data"),
         ("a", "open_connect", "Add peer (IP)"),
-        ("p", "open_peers", "Peer directory"),
         ("h", "open_help", "Help"),
     ]
 
@@ -67,9 +65,6 @@ class OrchestrationScreen(Screen[None]):
 
     def action_open_connect(self) -> None:
         self.app.push_screen(ConnectPeerScreen())
-
-    def action_open_peers(self) -> None:
-        self.app.push_screen(PeerDirectoryScreen(self._peer_client))
 
     def action_open_help(self) -> None:
         self.app.push_screen(HelpScreen("Network Help", self._help_text()))

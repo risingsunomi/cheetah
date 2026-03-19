@@ -9,12 +9,30 @@ _configured = False
 _log_file: Path | None = None
 
 
-def _log_path() -> Path:
+def _log_dir() -> Path:
     base_env = os.getenv("TC_LOG_DIR", "").strip()
     base_dir = Path(base_env) if base_env else Path(__file__).resolve().parent.parent / "logs"
     base_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return base_dir / f"tiny_cheetah_{ts}.log"
+    return base_dir
+
+
+def _log_path() -> Path:
+    day_stamp = datetime.now().strftime("%Y%m%d")
+    return _log_dir() / f"tiny_cheetah_{day_stamp}.log"
+
+
+def _update_latest_log_indicator(log_file: Path) -> None:
+    latest_link = log_file.parent / "tiny_cheetah_latest.log"
+    marker_file = log_file.parent / "LATEST_LOG"
+
+    try:
+        if latest_link.exists() or latest_link.is_symlink():
+            latest_link.unlink()
+        latest_link.symlink_to(log_file.name)
+    except OSError:
+        marker_file.write_text(f"{log_file.name}\n", encoding="utf-8")
+    else:
+        marker_file.write_text(f"{latest_link.name} -> {log_file.name}\n", encoding="utf-8")
 
 
 def configure_logging() -> Path:
@@ -28,6 +46,7 @@ def configure_logging() -> Path:
     root = logging.getLogger()
     root.addHandler(handler)
     root.setLevel(logging.DEBUG)
+    _update_latest_log_indicator(_log_file)
     _configured = True
     return _log_file
 

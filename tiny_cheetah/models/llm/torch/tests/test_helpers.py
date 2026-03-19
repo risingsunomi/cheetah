@@ -5,6 +5,7 @@ import unittest
 
 import numpy as np
 from safetensors.numpy import save_file
+from safetensors.torch import save_file as save_torch_file
 
 try:
     import torch
@@ -44,11 +45,22 @@ if torch is not None:
             super().__init__()
             self.mlp = _DummyMlp()
 
+    class _DummyBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = torch.nn.Embedding(4, 4)
+
 
     class _DummyMoEModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.layers = torch.nn.ModuleList([_DummyLayer()])
+
+
+    class _DummyBackboneModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = _DummyBackbone()
 
 
     class _DummyGenerateModel(torch.nn.Module):
@@ -134,6 +146,66 @@ class TestHelpersLoader(unittest.TestCase):
 
             expected = torch.from_numpy(raw_weight).to(dtype=model.q_proj.weight.dtype)
             torch.testing.assert_close(model.q_proj.weight.detach().cpu(), expected)
+
+    def test_load_safetensors_loads_backbone_key_without_double_prefix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            weight_file = "model.safetensors"
+            key = "backbone.embeddings.weight"
+
+            raw_weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+            save_torch_file({key: raw_weight}, str(model_dir / weight_file))
+            _write_model_index(model_dir, {key: weight_file})
+
+            model = _DummyBackboneModel()
+            load_safetensors(
+                model,
+                model_dir,
+                model_config={"num_heads": 2, "num_kv_heads": 1, "model_type": "nemotron_h"},
+                weight_device="cpu",
+                use_tied=False,
+            )
+
+            torch.testing.assert_close(
+                model.backbone.embeddings.weight.detach().cpu(),
+                raw_weight.to(dtype=model.backbone.embeddings.weight.dtype),
+            )
+
+    def test_load_safetensors_dequantizes_fp8_weight_with_scale(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            weight_file = "model.safetensors"
+            key = "backbone.embeddings.weight"
+
+            fp32_values = torch.tensor(
+                [[1.0, -2.0, 3.5, -4.0], [0.5, 1.5, -1.0, 2.0], [3.0, -0.5, 0.25, -0.75], [1.25, -1.25, 2.5, -2.5]],
+                dtype=torch.float32,
+            )
+            scale = torch.tensor(0.5, dtype=torch.float32)
+            packed = (fp32_values / scale).to(torch.float8_e4m3fn)
+            expected = packed.to(torch.float32) * scale
+            save_torch_file(
+                {
+                    key: packed,
+                    f"{key}_scale": scale,
+                },
+                str(model_dir / weight_file),
+            )
+            _write_model_index(model_dir, {key: weight_file})
+
+            model = _DummyBackboneModel()
+            load_safetensors(
+                model,
+                model_dir,
+                model_config={"num_heads": 2, "num_kv_heads": 1, "model_type": "nemotron_h"},
+                weight_device="cpu",
+                use_tied=False,
+            )
+
+            torch.testing.assert_close(
+                model.backbone.embeddings.weight.detach().cpu(),
+                expected.to(dtype=model.backbone.embeddings.weight.dtype),
+            )
 
 
 @unittest.skipIf(torch is None, "torch is not installed")

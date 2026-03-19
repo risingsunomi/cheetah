@@ -195,19 +195,23 @@ class MultiHeadAttention(nn.Module):
 
         q, k = self.pos_embeddings(q, k, position_ids)
 
-        if self.kv_cache is None:
-            self.kv_cache = KVCache(
-                self.max_seq_len,
-                batch_size,
-                self.num_kv_heads,
-                self.max_seq_len,
-                self.head_dim,
-                dtype=x.dtype,
-                device=x.device,
-            )
+        if self.training:
+            if self.kv_cache is not None and self.kv_cache.cache_pos != 0:
+                self.kv_cache.clear()
+        else:
+            if self.kv_cache is None:
+                self.kv_cache = KVCache(
+                    self.max_seq_len,
+                    batch_size,
+                    self.num_kv_heads,
+                    self.max_seq_len,
+                    self.head_dim,
+                    dtype=x.dtype,
+                    device=x.device,
+                )
 
-        self.kv_cache.update(k, v)
-        k, v = self.kv_cache.get()
+            self.kv_cache.update(k, v)
+            k, v = self.kv_cache.get()
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)

@@ -2,67 +2,78 @@
     layout: vertical;
     height: 1fr;
     width: 100%;
+    padding: 1;
 }
 
 #agent-body {
     layout: horizontal;
     height: 1fr;
-    padding: 0 1 1 1;
+    padding: 0;
 }
 
 #agent-main {
     layout: vertical;
     width: 1fr;
     height: 1fr;
+    padding-right: 1;
 }
 
 #agent-log {
     width: 1fr;
     height: 1fr;
-    border: solid $accent;
+    border: round $accent;
     background: #050505;
     color: $text;
-}
-
-#agent-run-panel {
-    border: round $primary;
-    background: $surface-darken-1;
-    margin-top: 1;
-    padding: 0 1;
-    height: auto;
+    padding: 1 2;
 }
 
 #agent-side {
-    width: 38;
-    min-width: 34;
-    max-width: 42;
+    width: 56;
+    min-width: 40;
+    max-width: 46;
     layout: vertical;
     height: 1fr;
     padding: 0 0 0 1;
 }
 
 #agent-model-panel,
-#agent-config-panel,
+#agent-gen-panel,
+#agent-instructions-panel,
 #agent-status-panel {
     border: round $primary;
-    padding: 0 1;
+    padding: 1 2;
     background: $surface-darken-1;
-    margin-bottom: 0;
+    margin-bottom: 1;
 }
 
 .panel-title {
     text-style: bold;
-    margin-bottom: 0;
+    margin-bottom: 1;
 }
 
 .agent-field-label {
     margin-top: 0;
 }
 
+#agent-model-actions {
+    layout: vertical;
+    margin-top: 0;
+    width: 100%;
+    height: auto;
+    margin-bottom: 1;
+}
+
+#agent-model-actions Button {
+    width: 100%;
+    margin-bottom: 1;
+}
+
+#agent-model-actions Button:last-child {
+    margin-bottom: 0;
+}
+
 #agent-config-actions,
-#agent-run-actions,
-#agent-model-actions-top,
-#agent-model-actions-bottom {
+#agent-run-actions {
     layout: horizontal;
     margin-top: 0;
     width: 100%;
@@ -70,53 +81,67 @@
 }
 
 #agent-config-actions Button,
-#agent-run-actions Button,
-#agent-model-actions-top Button,
-#agent-model-actions-bottom Button {
+#agent-run-actions Button {
     width: 1fr;
     min-width: 0;
+    margin-right: 1;
+}
+
+#agent-config-actions Button:last-child,
+#agent-run-actions Button:last-child {
     margin-right: 0;
 }
 
-#agent-start {
-    margin-right: 1;
-}
-
-#agent-open-config {
-    margin-right: 1;
-}
-
-#agent-config-summary {
-    border: solid $accent;
-    background: #050505;
-    color: $text;
-    padding: 0 1;
-    margin-top: 0;
-    min-height: 5;
-}
-
-#agent-open-model-picker,
-#agent-load-model {
-    margin-right: 1;
-}
-
-#agent-functions-summary {
-    border: solid $accent;
-    background: #050505;
-    color: $text;
-    padding: 0 1;
-    margin-top: 0;
-    min-height: 8;
+.agent-gen-row {
+    layout: horizontal;
+    align: center middle;
     height: auto;
+    margin-top: 1;
+}
+
+.agent-gen-row:first-of-type {
+    margin-top: 0;
+}
+
+.agent-gen-label {
+    width: 12;
+    color: $text-muted;
+}
+
+.agent-gen-row Input {
+    width: 1fr;
+}
+
+#agent-gen-enable-thinking {
+    margin-top: 1;
+}
+
+#agent-gen-endless-mode {
+    margin-top: 1;
+}
+
+#agent-instructions {
+    border: solid $accent;
+    background: #050505;
+    color: $text;
+    padding: 1;
+    height: 10;
+}
+
+#agent-state-value,
+#agent-functions-value {
+    text-style: italic;
 }
 
 ModalScreen#agent-cli-modal,
-ModalScreen#agent-config-modal {
+ModalScreen#agent-config-modal,
+ModalScreen#agent-prompt-name-modal {
     align: center middle;
 }
 
 #agent-cli-modal-container,
-#agent-config-modal-container {
+#agent-config-modal-container,
+#agent-prompt-name-modal-container {
     background: $surface;
     border: round $primary;
     width: 80%;
@@ -125,37 +150,93 @@ ModalScreen#agent-config-modal {
     layout: vertical;
 }
 
-#agent-config-title {
-    text-align: center;
-    text-style: bold;
+#agent-prompt-name-modal-container {
+    width: 48;
+    max-width: 48;
+}
+
+#agent-config-header,
+#agent-prompt-name-header {
+    layout: horizontal;
+    align: left middle;
+    height: auto;
     margin-bottom: 1;
 }
 
-#agent-config-buttons {
-    layout: horizontal;
-    align: right middle;
+#agent-config-title {
+    width: 1fr;
+    text-style: bold;
+}
+
+#agent-prompt-name-title {
+    width: 1fr;
+    text-style: bold;
+}
+
+.modal-close {
+    width: 5;
+    min-width: 5;
+    dock: right;
+}
+
+#agent-config-prompt-select,
+#agent-config-name,
+#agent-prompt-name-field {
+    width: 100%;
+}
+
+#agent-config-name,
+#agent-config-prompt-select,
+#agent-config-prompt-editor {
+    margin-bottom: 1;
+}
+
+#agent-config-prompt-editor {
+    border: solid $accent;
+    background: #050505;
+    color: $text;
+    padding: 1;
     margin-top: 1;
 }
 
-#agent-config-buttons Button {
-    margin-left: 1;
+#agent-config-prompt-editor {
+    height: 18;
+}
+
+#agent-config-prompt-actions {
+    layout: horizontal;
+    align: right middle;
+    margin-top: 1;
+    height: auto;
+}
+
+#agent-config-prompt-actions Button {
+    width: 1fr;
+    margin-right: 1;
+}
+
+#agent-config-prompt-actions Button:last-child {
+    margin-right: 0;
 }
 
 #agent-config-status {
     color: $warning;
     margin-top: 1;
+    min-height: 1;
 }
 
-#agent-config-instructions {
-    border: solid $accent;
-    background: #050505;
-    color: $text;
-    padding: 1;
-    height: 16;
+#agent-prompt-name-status {
+    color: $warning;
+    min-height: 1;
     margin-top: 1;
 }
 
-#agent-state-value,
-#agent-functions-value {
-    text-style: italic;
+#agent-prompt-name-buttons {
+    layout: horizontal;
+    align: right middle;
+    margin-top: 1;
+}
+
+#agent-prompt-name-buttons Button {
+    margin-left: 1;
 }

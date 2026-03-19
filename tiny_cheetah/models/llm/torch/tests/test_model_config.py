@@ -89,6 +89,57 @@ class TestModelConfig(unittest.TestCase):
         self.assertTrue(c["attn_bias"])
         self.assertTrue(c["mlp_bias"])
 
+    def test_load_nemotron_h_mamba_fields(self):
+        payload = {
+            "model_type": "nemotron_h",
+            "architectures": ["NemotronHForCausalLM"],
+            "hidden_size": 3136,
+            "num_attention_heads": 40,
+            "num_key_value_heads": 8,
+            "attention_head_dim": 128,
+            "max_position_embeddings": 131072,
+            "intermediate_size": 12544,
+            "num_hidden_layers": 6,
+            "vocab_size": 256000,
+            "layer_norm_epsilon": 1e-5,
+            "hybrid_override_pattern": "M*-M*-",
+            "mamba_num_heads": 96,
+            "mamba_head_dim": 80,
+            "ssm_state_size": 128,
+            "n_groups": 8,
+            "conv_kernel": 4,
+            "expand": 2,
+            "mamba_hidden_act": "silu",
+            "mlp_hidden_act": "relu2",
+            "use_conv_bias": True,
+            "mamba_proj_bias": False,
+            "residual_in_fp32": False,
+            "use_bias": False,
+            "chunk_size": 256,
+            "torch_dtype": "bfloat16",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps(payload), encoding="utf-8")
+            model_config = ModelConfig()
+            model_config.load(cfg)
+
+        c = model_config.config
+        self.assertEqual(c["model_type"], "nemotron_h")
+        self.assertTrue(c["mamba"])
+        self.assertEqual(
+            c["layers_block_type"],
+            ["mamba", "attention", "mlp", "mamba", "attention", "mlp"],
+        )
+        self.assertEqual(c["attention_head_dim"], 128)
+        self.assertEqual(c["mamba_num_heads"], 96)
+        self.assertEqual(c["mamba_head_dim"], 80)
+        self.assertEqual(c["ssm_state_size"], 128)
+        self.assertEqual(c["conv_kernel"], 4)
+        self.assertEqual(c["chunk_size"], 256)
+        self.assertFalse(c["use_bias"])
+
     def test_load_generation_config_keeps_missing_sampling_fields_unset(self):
         payload = {
             "model_type": "gpt_oss",

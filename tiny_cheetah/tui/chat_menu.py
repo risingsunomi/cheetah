@@ -24,7 +24,13 @@ from tiny_cheetah.tui.chat_log_storage import ChatLogStorage, ChatLogSummary, Ch
 from tiny_cheetah.orchestration.peer_client import PeerClient
 from tiny_cheetah.tui.orchestration_screen import OrchestrationScreen
 from tiny_cheetah.tui.help_screen import HelpScreen
-from tiny_cheetah.tui.helpers import MemoryPressureError, memory_abort_reason
+from tiny_cheetah.tui.helpers import (
+    MemoryPressureError,
+    apply_chat_template_with_thinking,
+    default_enable_thinking,
+    memory_abort_reason,
+    split_thinking_response,
+)
 
 from textual.app import ComposeResult
 from textual.containers import Container
@@ -35,6 +41,7 @@ from textual.message_pump import MessagePump
 from textual.screen import Screen, ModalScreen
 from textual.widgets import ( 
     Button,
+    Checkbox,
     Footer,
     Header,
     Input,
@@ -97,7 +104,7 @@ class ChatScreen(Screen[None]):
         self._load_button: Optional[Button] = None
         self._peer_label: Optional[Label] = None
         self._torch_peer_notice_shown: bool = False
-        self._gen_overrides: Dict[str, float | int] = {}
+        self._gen_overrides: Dict[str, float | int | bool] = {}
         self._streaming_reply_open: bool = False
         self._streaming_reply_timestamp: Optional[str] = None
         self._streamed_chars: int = 0
@@ -217,10 +224,11 @@ class ChatScreen(Screen[None]):
             repetition_penalty=effective["repetition_penalty"],
             alpha_f=effective["alpha_f"],
             alpha_p=effective["alpha_p"],
+            enable_thinking=bool(effective["enable_thinking"]),
         )
         self.app.push_screen(modal, self._apply_gen_config)
 
-    def _apply_gen_config(self, result: Optional[dict[str, float | int]]) -> None:
+    def _apply_gen_config(self, result: Optional[dict[str, float | int | bool]]) -> None:
         if result is None:
             return
         self._gen_overrides.update(result)
@@ -231,7 +239,8 @@ class ChatScreen(Screen[None]):
             f"top_p={self._gen_overrides.get('top_p')}, "
             f"repetition_penalty={self._gen_overrides.get('repetition_penalty')}, "
             f"alpha_f={self._gen_overrides.get('alpha_f')}, "
-            f"alpha_p={self._gen_overrides.get('alpha_p')}",
+            f"alpha_p={self._gen_overrides.get('alpha_p')}, "
+            f"thinking={self._gen_overrides.get('enable_thinking')}",
             persist=False,
         )
 
@@ -264,6 +273,15 @@ class ChatScreen(Screen[None]):
             ),
             "alpha_f": _as_float(self._gen_overrides.get("alpha_f", 0.0), 0.0),
             "alpha_p": _as_float(self._gen_overrides.get("alpha_p", 0.0), 0.0),
+            "enable_thinking": bool(
+                self._gen_overrides.get(
+                    "enable_thinking",
+                    default_enable_thinking(
+                        model_path=self._model_cache_path,
+                        tokenizer=self._tokenizer,
+                    ),
+                )
+            ),
         }
 
     def _context_window_tokens(self) -> int:
@@ -282,15 +300,22 @@ class ChatScreen(Screen[None]):
 
     def _response_reserve_tokens(self, context_window: int) -> int:
         reserve = os.getenv("TC_MAX_RESP_LEN", MAX_RESP_LEN)
-        return max(1, min(reserve, context_window - 1))
+        try:
+            reserve_int = int(reserve)
+        except (TypeError, ValueError):
+            reserve_int = MAX_RESP_LEN
+        return max(1, min(reserve_int, context_window - 1))
 
     def _token_count_for_messages(self, messages: List[dict[str, str]]) -> int:
         if self._tokenizer is None:
             return 0
-        template = self._tokenizer.apply_chat_template(
+        template = apply_chat_template_with_thinking(
+            self._tokenizer,
             messages,
             add_generation_prompt=True,
             tokenize=False,
+            model_path=self._model_cache_path,
+            enable_thinking=bool(self._effective_gen_config()["enable_thinking"]),
         )
         enc = self._tokenizer(template, return_tensors="np")
         return int(enc["input_ids"].shape[1])
@@ -315,10 +340,13 @@ class ChatScreen(Screen[None]):
                 continue
             break
         logger.debug("Selected messages for prompt: %s", selected)
-        template = self._tokenizer.apply_chat_template(
+        template = apply_chat_template_with_thinking(
+            self._tokenizer,
             selected,
             add_generation_prompt=True,
             tokenize=False,
+            model_path=self._model_cache_path,
+            enable_thinking=bool(self._effective_gen_config()["enable_thinking"]),
         )
         enc = self._tokenizer(template, return_tensors="np")
         input_ids = enc["input_ids"]
@@ -487,9 +515,7 @@ class ChatScreen(Screen[None]):
                 display_rate = self._tok_stats if token_count else 0.0
                 self._stats_label.update(f"Tokens/sec: {display_rate:.1f}")
 
-            reply = ""
-            if self._tokenizer is not None:
-                reply = self._tokenizer.decode(out_tokens, skip_special_tokens=True).strip()
+            reply = self._decode_tokens(out_tokens, skip_special_tokens=False)
             self._finalize_model_stream(reply)
         finally:
             self._generating_resp = False
@@ -545,13 +571,34 @@ class ChatScreen(Screen[None]):
         if self._chat_log is None:
             return
         entry_time = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        label = escape(self._model_id or "Model")
-        text = escape(content)
+        markup, _, final_text = self._build_model_log_markup(
+            content,
+            timestamp=entry_time,
+            show_empty_placeholder=True,
+        )
+        self._write_to_chat_log(markup + "\n")
+        if persist:
+            self._record_message("assistant", final_text or "(empty response)", entry_time)
+        self._chat_log.scroll_end(animate=False, force=True)
+
+    def _append_model_thinking(
+        self,
+        content: str,
+        persist: bool = True,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        if self._chat_log is None:
+            return
+        thinking_text = content.strip()
+        if not thinking_text:
+            return
+        entry_time = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._write_to_chat_log(
-            f"({entry_time}) [bold][#ff0000]{label}[/][/bold]: {text}\n"
+            f"{self._model_log_prefix(entry_time)} [italic](thinking)[/italic]: "
+            f"[italic]{escape(thinking_text)}[/italic]\n"
         )
         if persist:
-            self._record_message("assistant", content, entry_time)
+            self._record_message("assistant_thinking", thinking_text, entry_time)
         self._chat_log.scroll_end(animate=False, force=True)
 
     def _write_to_chat_log(self, message: str) -> None:
@@ -574,12 +621,11 @@ class ChatScreen(Screen[None]):
         if self._chat_log is None:
             return
         entry_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        label = escape(self._model_id or "Model")
         self._streaming_reply_timestamp = entry_time
         self._streaming_reply_open = True
         self._streamed_chars = 0
         self._streaming_reply_text = ""
-        self._streaming_reply_prefix = f"({entry_time}) [bold][#ff0000]{label}[/][/bold]: "
+        self._streaming_reply_prefix = self._model_log_prefix(entry_time)
         self._streaming_rendered_lines = 0
         self._render_stream_line()
 
@@ -607,7 +653,13 @@ class ChatScreen(Screen[None]):
                 widest = int(getattr(log, "_widest_line_width", 0))
                 log.virtual_size = Size(widest, len(log.lines))
         before = len(log.lines)
-        log.write(self._streaming_reply_prefix + escape(self._streaming_reply_text))
+        entry_time = self._streaming_reply_timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        markup, _, _ = self._build_model_log_markup(
+            self._streaming_reply_text,
+            timestamp=entry_time,
+            show_empty_placeholder=False,
+        )
+        log.write(markup)
         self._streaming_rendered_lines = max(0, len(log.lines) - before)
         log.refresh()
         log.scroll_end(animate=False, force=True)
@@ -621,22 +673,22 @@ class ChatScreen(Screen[None]):
         self._streaming_rendered_lines = 0
 
     def _finalize_model_stream(self, reply: str) -> None:
-        final_reply = reply.strip()
-        if not final_reply:
-            final_reply = "(empty response)"
-
         # Replace the live streamed text with the final full decode so the
         # visible chat line always matches persisted chat history.
         if self._streaming_reply_open:
-            self._streaming_reply_text = final_reply
+            self._streaming_reply_text = reply
             self._render_stream_line()
 
         self._finish_model_stream_line()
         # Visual break between assistant messages.
         self._write_to_chat_log("\n")
         entry_time = self._streaming_reply_timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._record_message("assistant", final_reply, entry_time)
-        self._history.append({"role": "assistant", "content": final_reply})
+        thinking_text, final_reply = split_thinking_response(reply, tokenizer=self._tokenizer)
+        stored_reply = final_reply or "(empty response)"
+        if thinking_text:
+            self._record_message("assistant_thinking", thinking_text, entry_time)
+        self._record_message("assistant", stored_reply, entry_time)
+        self._history.append({"role": "assistant", "content": stored_reply})
         self._trim_history_for_context()
         self._streaming_reply_timestamp = None
         self._streamed_chars = 0
@@ -654,14 +706,46 @@ class ChatScreen(Screen[None]):
         if token == tokenizer.eos_token_id:
             self.refresh()
             return ""
+        return self._decode_tokens([token], skip_special_tokens=False)
+
+    def _decode_tokens(self, tokens: list[int], *, skip_special_tokens: bool) -> str:
+        tokenizer = self._tokenizer
+        if tokenizer is None or not tokens:
+            return ""
         try:
             return tokenizer.decode(
-                [token],
-                skip_special_tokens=True,
+                tokens,
+                skip_special_tokens=skip_special_tokens,
                 clean_up_tokenization_spaces=False,
             )
         except TypeError:
-            return tokenizer.decode([token], skip_special_tokens=True)
+            return tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+
+    def _model_log_prefix(self, timestamp: str) -> str:
+        label = escape(self._model_id or "Model")
+        return f"({timestamp}) [bold][#ff0000]{label}[/][/bold]"
+
+    def _build_model_log_markup(
+        self,
+        raw_content: str,
+        *,
+        timestamp: str,
+        show_empty_placeholder: bool,
+    ) -> tuple[str, str, str]:
+        thinking_text, final_text = split_thinking_response(raw_content, tokenizer=self._tokenizer)
+        prefix = self._model_log_prefix(timestamp)
+        lines: list[str] = []
+        if thinking_text:
+            lines.append(
+                f"{prefix} [italic](thinking)[/italic]: [italic]{escape(thinking_text)}[/italic]"
+            )
+        if final_text:
+            lines.append(f"{prefix}: {escape(final_text)}")
+        elif show_empty_placeholder and not thinking_text:
+            lines.append(f"{prefix}: {escape('(empty response)')}")
+        elif not lines:
+            lines.append(f"{prefix}: ")
+        return "\n".join(lines), thinking_text, final_text
 
     def _handle_peer_generate_token_request(self, message: dict) -> dict:
         payload = message.get("payload", {})
@@ -976,14 +1060,14 @@ class ChatScreen(Screen[None]):
         if log_id is None:
             return
         event.stop()
-        await self._handle_chat_log_load(log_id)
+        self._handle_chat_log_load(log_id)
 
     async def _load_selected_chat_log(self) -> None:
         log_id = self._get_selected_log_id()
         if log_id is None:
             self._log_sys_msg("Select a chat log to load.")
             return
-        await self._handle_chat_log_load(log_id)
+        self._handle_chat_log_load(log_id)
 
     def _handle_chat_log_load(self, log_id: int) -> None:
         summary = self._log_storage.get_log(log_id)
@@ -1014,6 +1098,8 @@ class ChatScreen(Screen[None]):
             if role == "user":
                 self._append_user(content, persist=persist, timestamp=timestamp)
                 self._history.append({"role": "user", "content": content})
+            elif role == "assistant_thinking":
+                self._append_model_thinking(content, persist=persist, timestamp=timestamp)
             elif role == "assistant":
                 self._append_model(content, persist=persist, timestamp=timestamp)
                 self._history.append({"role": "assistant", "content": content})
@@ -1277,7 +1363,7 @@ class ChatLogNameModal(ModalScreen[Optional[str]]):
             self.dismiss(value or None)
 
 
-class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int]]]):
+class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int | bool]]]):
     """Modal dialog to edit generation hyperparameters."""
 
     def __init__(
@@ -1289,6 +1375,7 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int]]]):
         repetition_penalty: float,
         alpha_f: float,
         alpha_p: float,
+        enable_thinking: bool,
     ) -> None:
         super().__init__(id="chat-gen-config-modal")
         self._defaults = {
@@ -1300,6 +1387,8 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int]]]):
             "alpha_p": alpha_p,
         }
         self._inputs: dict[str, Input] = {}
+        self._thinking_checkbox: Optional[Checkbox] = None
+        self._enable_thinking = enable_thinking
         self._status: Optional[Label] = None
 
     def compose(self) -> ComposeResult:
@@ -1338,6 +1427,10 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int]]]):
             self._inputs["alpha_p"] = alpha_p_input
             yield alpha_p_input
 
+            thinking_checkbox = Checkbox("Enable Thinking", id="chat-gen-config-enable-thinking")
+            self._thinking_checkbox = thinking_checkbox
+            yield thinking_checkbox
+
             status = Label("", id="chat-gen-config-status")
             self._status = status
             yield status
@@ -1349,6 +1442,8 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int]]]):
     def on_mount(self) -> None:
         for key, widget in self._inputs.items():
             widget.value = str(self._defaults[key])
+        if self._thinking_checkbox is not None:
+            self._thinking_checkbox.value = self._enable_thinking
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "chat-gen-config-cancel":
@@ -1392,6 +1487,7 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int]]]):
                 "repetition_penalty": repetition_penalty,
                 "alpha_f": alpha_f,
                 "alpha_p": alpha_p,
+                "enable_thinking": bool(self._thinking_checkbox.value) if self._thinking_checkbox is not None else False,
             }
         )
 

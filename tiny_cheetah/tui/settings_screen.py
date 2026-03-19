@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import List, Dict
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
+from textual.events import Key
 from textual.screen import Screen
 from textual.widgets import Button, Checkbox, Footer, Header, Label, Static
 
@@ -28,9 +30,9 @@ class SettingsScreen(Screen[None]):
 
     CSS_PATH = Path(__file__).with_name("settings_screen.tcss")
     BINDINGS = [
-        ("escape", "pop_screen", "Back"),
-        ("b", "pop_screen", "Back"),
-        ("h", "open_help", "Help"),
+        Binding("escape", "pop_screen", "Back", priority=True),
+        Binding("b", "pop_screen", "Back", priority=True),
+        Binding("h", "open_help", "Help"),
     ]
 
     def __init__(self) -> None:
@@ -48,11 +50,13 @@ class SettingsScreen(Screen[None]):
                 "Configure model backend and its device env.",
                 id="settings-help",
             )
-            with VerticalScroll(id="settings-scroll"):
+            with VerticalScroll(id="settings-device-scroll"):
                 yield Label("Device", id="settings-device-title")
                 device_container = Container(id="settings-devices")
                 self._device_container = device_container
                 yield device_container
+
+            with VerticalScroll(id="settings-backend-scroll"):
                 yield Label("LLM Backend", id="settings-backend-title")
                 yield Static(
                     "Select which backend the chat UI uses for model loading and generation.",
@@ -81,6 +85,11 @@ class SettingsScreen(Screen[None]):
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
+
+    def on_key(self, event: Key) -> None:
+        if event.key in {"escape", "b"}:
+            event.stop()
+            self.app.pop_screen()
 
     def action_open_help(self) -> None:
         self.app.push_screen(HelpScreen("Settings Help", self._help_text()))

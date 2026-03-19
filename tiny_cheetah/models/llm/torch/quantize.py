@@ -20,6 +20,17 @@ from .load_progress import WeightLoadProgress
 
 logger = get_logger(__name__)
 
+_FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
+
 
 def is_quantized_model_config(model_config: Mapping[str, Any]) -> bool:
     quantization_config = model_config.get("quantization_config")
@@ -77,11 +88,25 @@ def _load_weight_map(model_path: Path) -> dict[str, str]:
 
 
 def _infer_prefix(weight_map: Mapping[str, str]) -> str:
-    for candidate in ("model", "base_model", "transformer", "gpt_neox", "blk"):
+    for candidate in ("model", "base_model", "transformer", "gpt_neox", "blk", "backbone"):
         prefix = f"{candidate}."
         if any(key.startswith(prefix) for key in weight_map):
             return prefix
     return ""
+
+
+def _resolve_weight_key(key: str, weight_map: Mapping[str, str], prefix: str) -> str | None:
+    if key in weight_map:
+        return key
+    prefixed = f"{prefix}{key}" if prefix else key
+    if prefixed in weight_map:
+        return prefixed
+    return None
+
+
+def _needs_qk_permute(model_config: Mapping[str, Any]) -> bool:
+    model_type = str(model_config.get("model_type", "")).lower()
+    return model_type not in {"gpt_oss", "nemotron_h"}
 
 
 def _load_quant_state(raw_state: np.ndarray) -> dict[str, Any]:
@@ -217,7 +242,14 @@ def _load_weight_tensor(weight_file: Path, model_weight_key: str) -> torch.Tenso
     with safetensors.safe_open(str(weight_file), framework="pt", device="cpu") as weights:
         if model_weight_key not in weights.keys():
             raise KeyError(f"Missing tensor '{model_weight_key}' in {weight_file}")
-        return weights.get_tensor(model_weight_key)
+        weight = weights.get_tensor(model_weight_key)
+        if weight.dtype in _FLOAT8_DTYPES:
+            scale_key = f"{model_weight_key}_scale"
+            if scale_key in weights.keys():
+                scale = weights.get_tensor(scale_key).to(torch.float32)
+                return weight.to(torch.float32) * scale
+            return weight.to(torch.float32)
+        return weight
 
 
 def _apply_weight(
@@ -236,11 +268,9 @@ def _apply_weight(
     else:
         weight = torch.from_numpy(weight_np)
 
-    model_type = str(model_config.get("model_type", "")).lower()
-    needs_qk_permute = model_type not in {"gpt_oss"}
-    if needs_qk_permute and "q_proj" in key:
+    if _needs_qk_permute(model_config) and "q_proj" in key:
         weight = _permute(weight, model_config["num_heads"])
-    elif needs_qk_permute and "k_proj" in key:
+    elif _needs_qk_permute(model_config) and "k_proj" in key:
         weight = _permute(weight, model_config["num_kv_heads"])
 
     target = model_state_dict.get(key)
@@ -266,7 +296,7 @@ def load_quantized_safetensors(
     progress = WeightLoadProgress(total=len(model_state_dict), label="torch-qload")
 
     for idx, key in enumerate(model_state_dict.keys(), start=1):
-        model_weight_key = prefix + key
+        model_weight_key = _resolve_weight_key(key, weight_map, prefix)
         if model_weight_key not in weight_map:
             if use_tied and key == "output.weight":
                 embed_weight_key = "model.embed_tokens.weight"

@@ -32,10 +32,14 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
         self._path_list: Optional[ListView] = None
         self._graph_canvas: Optional[Container] = None
         self._feedback: Optional[Label] = None
+        self._mode_label: Optional[Label] = None
         self._selected_index = 0
         self._drag_index: Optional[int] = None
         self._rename_button: Optional[Button] = None
         self._delete_button: Optional[Button] = None
+        self._step_settings_button: Optional[Button] = None
+        self._scratch_button: Optional[Button] = None
+        self._finetune_button: Optional[Button] = None
 
     def compose(self) -> ComposeResult:
         items = [self._build_list_item(index, node) for index, node in enumerate(self._path_nodes)]
@@ -54,17 +58,33 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
                     feedback = Label("", id="path-feedback")
                     self._feedback = feedback
                     yield feedback
+                    mode_label = Label("", id="path-mode-label")
+                    self._mode_label = mode_label
+                    yield mode_label
                     with Container(id="path-actions"):
-                        yield Button("Add Step", id="path-add", variant="primary")
-                        rename_btn = Button("Rename Step", id="path-rename")
-                        self._rename_button = rename_btn
-                        yield rename_btn
-                        delete_btn = Button("Delete Step", id="path-delete", variant="error")
-                        self._delete_button = delete_btn
-                        yield delete_btn
-                        yield Button("Reset", id="path-reset", variant="warning")
-                        yield Button("Cancel", id="path-cancel")
-                        yield Button("Save & Return", id="path-save", variant="success")
+                        with Container(classes="path-action-row"):
+                            yield Button("Add Step", id="path-add", variant="primary")
+                            step_settings_btn = Button("Step Settings", id="path-step-settings")
+                            self._step_settings_button = step_settings_btn
+                            yield step_settings_btn
+                        with Container(classes="path-action-row"):
+                            rename_btn = Button("Rename Step", id="path-rename")
+                            self._rename_button = rename_btn
+                            yield rename_btn
+                            delete_btn = Button("Delete Step", id="path-delete", variant="error")
+                            self._delete_button = delete_btn
+                            yield delete_btn
+                        with Container(classes="path-action-row"):
+                            scratch_btn = Button("Set Scratch", id="path-mode-scratch")
+                            self._scratch_button = scratch_btn
+                            yield scratch_btn
+                            finetune_btn = Button("Set Fine-tune", id="path-mode-finetune")
+                            self._finetune_button = finetune_btn
+                            yield finetune_btn
+                        with Container(classes="path-action-row path-action-footer"):
+                            yield Button("Reset", id="path-reset", variant="warning")
+                            yield Button("Cancel", id="path-cancel")
+                            yield Button("Save & Return", id="path-save", variant="success")
         yield Footer()
 
     def action_cancel(self) -> None:
@@ -76,8 +96,11 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         handlers = {
             "path-add": self._handle_add,
+            "path-step-settings": lambda: self._handle_step_settings(self._selected_index),
             "path-rename": lambda: self._handle_rename(self._selected_index),
             "path-delete": lambda: self._handle_delete(self._selected_index),
+            "path-mode-scratch": lambda: self._set_selected_mode(True),
+            "path-mode-finetune": lambda: self._set_selected_mode(False),
             "path-reset": self._handle_reset,
             "path-cancel": lambda: self.dismiss(None),
             "path-save": self._handle_save,
@@ -145,6 +168,17 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
         )
         self.app.push_screen(modal, lambda confirmed: self._on_delete_result(index, confirmed))
 
+    def _handle_step_settings(self, index: int) -> None:
+        if not self._path_nodes:
+            self._set_feedback("No steps available.")
+            return
+        if index <= 0:
+            self._set_feedback("Base step uses the main Train Settings screen.")
+            return
+        current = self._path_nodes[index]
+        modal = PathStepSettingsModal(current.settings)
+        self.app.push_screen(modal, lambda result: self._on_step_settings_result(index, result))
+
     def _handle_reset(self) -> None:
         modal = PathConfirmModal(
             "Reset Training Path?",
@@ -170,6 +204,7 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
             self._set_feedback("Step name cannot be blank.")
             return
         base_settings = copy.deepcopy(self._path_nodes[0].settings)
+        base_settings["from-scratch"] = False
         self._path_nodes.append(TrainingNode(name, settings=base_settings))
         self._selected_index = len(self._path_nodes) - 1
         self._refresh_views()
@@ -194,6 +229,36 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
             self._selected_index = len(self._path_nodes) - 1
         self._refresh_views()
         self._set_feedback(f"Removed step '{removed.name}'.")
+
+    def _on_step_settings_result(self, index: int, result: Optional[dict[str, str]]) -> None:
+        if result is None:
+            return
+        node = self._path_nodes[index]
+        preserved_mode = bool(node.settings.get("from-scratch", False))
+        updated = dict(node.settings)
+        for key, value in result.items():
+            if key in {"dataset-id", "data-path"}:
+                continue
+            cleaned = value.strip()
+            if cleaned:
+                updated[key] = cleaned
+            else:
+                updated.pop(key, None)
+        dataset = result.get("dataset-id", "").strip()
+        data_path = result.get("data-path", "").strip()
+        if dataset:
+            updated["dataset-id"] = dataset
+            updated["data-path"] = ""
+        elif data_path:
+            updated["data-path"] = data_path
+            updated["dataset-id"] = ""
+        else:
+            updated.pop("dataset-id", None)
+            updated.pop("data-path", None)
+        updated["from-scratch"] = preserved_mode
+        node.settings = updated
+        self._refresh_views()
+        self._set_feedback(f"Updated settings for '{node.name}'.")
 
     def _on_reset_confirmed(self, confirmed: Optional[bool]) -> None:
         if not confirmed:
@@ -235,7 +300,7 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
             return
         for index, node in enumerate(self._path_nodes):
             node_box = Static(
-                self._format_node_label(node),
+                self._format_node_label(index, node),
                 classes=self._graph_classes(index, node),
                 markup=True,
                 id=f"graph-node-{index}",
@@ -255,13 +320,16 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
         symbol = NODE_STATUS_SYMBOLS.get(node.status, "•")
         color = NODE_STATUS_STYLES.get(node.status, "#bbbbbb")
         repeated = " (repeat)" if node.repeated else ""
-        return f"[{color}]{symbol}[/{color}] Step {index + 1}: {node.name}{repeated}"
+        return (
+            f"[{color}]{symbol}[/{color}] Step {index + 1}: "
+            f"{node.name}{repeated} [dim]· {self._mode_text(index, node)}[/]"
+        )
 
-    def _format_node_label(self, node: TrainingNode) -> str:
+    def _format_node_label(self, index: int, node: TrainingNode) -> str:
         symbol = NODE_STATUS_SYMBOLS.get(node.status, "•")
         status = node.status.capitalize()
         repeated = "Repeat" if node.repeated else "Sequential"
-        return f"[bold]{symbol} {node.name}[/]\n[dim]{status} · {repeated}[/]"
+        return f"[bold]{symbol} {node.name}[/]\n[dim]{status} · {repeated} · {self._mode_text(index, node)}[/]"
 
     def _graph_classes(self, index: int, node: TrainingNode) -> str:
         classes = ["graph-node", f"status-{node.status}"]
@@ -280,6 +348,40 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
             self._path_nodes[0].status if self._path_nodes[0].status in NODE_STATUS_STYLES else "pending"
         )
         self._path_nodes[0].repeated = False
+        self._path_nodes[0].settings.setdefault("from-scratch", False)
+
+    def _selected_node(self) -> Optional[TrainingNode]:
+        if 0 <= self._selected_index < len(self._path_nodes):
+            return self._path_nodes[self._selected_index]
+        return None
+
+    def _mode_text(self, index: int, node: TrainingNode) -> str:
+        if index == 0:
+            return "mode via Train Settings"
+        return "from scratch" if bool(node.settings.get("from-scratch", False)) else "fine-tune previous"
+
+    def _step_settings_text(self, index: int, node: TrainingNode) -> str:
+        if index == 0:
+            return "data and tuning come from the main Train Settings screen"
+        dataset = str(node.settings.get("dataset-id", "")).strip()
+        data_path = str(node.settings.get("data-path", "")).strip()
+        limit = str(node.settings.get("max-dataset-entries", "")).strip()
+        epochs = str(node.settings.get("epochs", "")).strip()
+        lr = str(node.settings.get("lr", "")).strip()
+        parts: List[str] = []
+        if dataset:
+            parts.append(f"dataset={dataset}")
+        elif data_path:
+            parts.append(f"data={data_path}")
+        else:
+            parts.append("data inherits main settings")
+        if limit:
+            parts.append(f"max_entries={limit}")
+        if epochs:
+            parts.append(f"epochs={epochs}")
+        if lr:
+            parts.append(f"lr={lr}")
+        return " | ".join(parts)
 
     def _index_from_item(self, item: Optional[ListItem]) -> Optional[int]:
         if item is None or item.id is None:
@@ -316,6 +418,21 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
         self._selected_index = target
         self._refresh_views()
         self._set_feedback(f"Moved step to position {target + 1}.")
+
+    def _set_selected_mode(self, from_scratch: bool) -> None:
+        node = self._selected_node()
+        if node is None:
+            self._set_feedback("No step selected.")
+            return
+        if self._selected_index == 0:
+            self._set_feedback("Base step mode is controlled from Train Settings.")
+            return
+        node.settings["from-scratch"] = from_scratch
+        self._refresh_views()
+        self._set_feedback(
+            f"Step '{node.name}' set to {'from scratch' if from_scratch else 'fine-tune previous'}."
+        )
+
     def _update_action_buttons(self) -> None:
         allow_rename = self._selected_index > 0
         allow_delete = self._selected_index > 0 and len(self._path_nodes) > 1
@@ -323,6 +440,21 @@ class TrainingPathScreen(Screen[Optional[List[TrainingNode]]]):
             self._rename_button.disabled = not allow_rename
         if self._delete_button is not None:
             self._delete_button.disabled = not allow_delete
+        if self._step_settings_button is not None:
+            self._step_settings_button.disabled = self._selected_index == 0
+        if self._scratch_button is not None:
+            self._scratch_button.disabled = self._selected_index == 0
+        if self._finetune_button is not None:
+            self._finetune_button.disabled = self._selected_index == 0
+        if self._mode_label is not None:
+            node = self._selected_node()
+            if node is None:
+                self._mode_label.update("Mode: --")
+            else:
+                self._mode_label.update(
+                    f"Mode: {self._mode_text(self._selected_index, node)}\n"
+                    f"Data: {self._step_settings_text(self._selected_index, node)}"
+                )
 
 class NodeStepModal(ModalScreen[Optional[str]]):
     """Modal dialog for capturing a training step name."""
@@ -364,6 +496,68 @@ class NodeStepModal(ModalScreen[Optional[str]]):
         elif event.button.id == "node-step-confirm":
             value = self._name_input.value.strip() if self._name_input else ""
             self.dismiss(value or None)
+
+
+class PathStepSettingsModal(ModalScreen[Optional[dict[str, str]]]):
+    """Modal for editing per-step data and tuning overrides."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    _FIELDS = [
+        ("dataset-id", "Dataset ID", "Optional HF dataset for this step"),
+        ("data-path", "Data Path", "Optional local UTF-8 corpus for this step"),
+        ("max-dataset-entries", "Max Entries", "Optional dataset entry cap"),
+        ("epochs", "Epochs", "Leave blank to inherit"),
+        ("lr", "Learning Rate", "Leave blank to inherit"),
+        ("seq-length", "Seq Length", "Leave blank to inherit"),
+        ("batch-size", "Batch Size", "Leave blank to inherit"),
+        ("gradient-accumulation", "Grad Accum", "Leave blank to inherit"),
+    ]
+
+    def __init__(self, values: dict[str, object]) -> None:
+        super().__init__(id="path-step-settings-modal")
+        self._initial = dict(values)
+        self._inputs: dict[str, Input] = {}
+
+    def compose(self) -> ComposeResult:
+        with Container(id="path-step-settings-modal-container"):
+            yield Label("Step Settings", id="path-step-settings-title")
+            yield Static(
+                "Leave fields blank to inherit Train Settings. "
+                "Set either Dataset ID or Data Path when this step should fine-tune on a different corpus.",
+                id="path-step-settings-help",
+            )
+            with VerticalScroll(id="path-step-settings-scroll"):
+                for name, label, placeholder in self._FIELDS:
+                    yield Label(label, classes="path-step-settings-label")
+                    widget = Input(id=f"path-step-settings-{name}", placeholder=placeholder)
+                    widget.add_class("path-step-settings-input")
+                    self._inputs[name] = widget
+                    yield widget
+            with Container(id="path-step-settings-buttons"):
+                yield Button("Cancel", id="path-step-settings-cancel")
+                yield Button("Apply", id="path-step-settings-apply", variant="primary")
+
+    def on_mount(self) -> None:
+        for name, widget in self._inputs.items():
+            value = self._initial.get(name)
+            if value is not None:
+                widget.value = str(value).strip()
+        first = self._inputs.get("dataset-id")
+        if first is not None:
+            self.call_after_refresh(first.focus)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "path-step-settings-cancel":
+            self.dismiss(None)
+        elif event.button.id == "path-step-settings-apply":
+            self.dismiss(self._gather_values())
+
+    def _gather_values(self) -> dict[str, str]:
+        return {
+            name: widget.value.strip()
+            for name, widget in self._inputs.items()
+        }
 
 
 class PathConfirmModal(ModalScreen[Optional[bool]]):

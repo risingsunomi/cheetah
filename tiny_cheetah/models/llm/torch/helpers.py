@@ -18,10 +18,22 @@ from tiny_cheetah.models.shard import Shard
 
 from .load_progress import WeightLoadProgress
 from .model import Model
+from .mamba_model import MambaModel
 from .model_config import ModelConfig
 from .quantize import is_quantized_model_config, load_quantized_safetensors
 
 logger = get_logger(__name__)
+
+_FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
 
 # From tinygrad helper loader, adapted for torch.
 def permute(v: torch.Tensor, n_heads: int) -> torch.Tensor:
@@ -31,19 +43,55 @@ def permute(v: torch.Tensor, n_heads: int) -> torch.Tensor:
         .reshape(*v.shape[:2])
     )
 
+def _is_float8_tensor(weight: torch.Tensor) -> bool:
+    return weight.dtype in _FLOAT8_DTYPES
+
+def _maybe_dequantize_fp8_weight(
+    weights: safetensors.safe_open,
+    model_weight_key: str,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    if not _is_float8_tensor(weight):
+        return weight
+
+    scale_key = f"{model_weight_key}_scale"
+    if scale_key not in weights.keys():
+        return weight.to(torch.float32)
+
+    scale = weights.get_tensor(scale_key).to(torch.float32)
+    return weight.to(torch.float32) * scale
+
 def _load_weight_tensor(weight_file: Path, model_weight_key: str) -> torch.Tensor | None:
     with safetensors.safe_open(str(weight_file), framework="pt", device="cpu") as weights:
         if model_weight_key not in weights.keys():
             return None
-        return weights.get_tensor(model_weight_key)
+        weight = weights.get_tensor(model_weight_key)
+        return _maybe_dequantize_fp8_weight(weights, model_weight_key, weight)
 
 
 def _infer_prefix(weight_map: dict[str, str]) -> str:
-    for candidate in ("model", "base_model", "transformer", "gpt_neox", "blk"):
+    for candidate in ("model", "base_model", "transformer", "gpt_neox", "blk", "backbone"):
         prefix = f"{candidate}."
         if any(key.startswith(prefix) for key in weight_map):
             return prefix
     return ""
+
+def _resolve_weight_key(key: str, weight_map: dict[str, str], prefix: str) -> str | None:
+    if key in weight_map:
+        return key
+    prefixed = f"{prefix}{key}" if prefix else key
+    if prefixed in weight_map:
+        return prefixed
+    return None
+
+def _needs_qk_permute(model_config: dict) -> bool:
+    model_type = str(model_config.get("model_type", "")).lower()
+    return model_type not in {"gpt_oss", "nemotron_h"}
+
+def build_model(config: dict, shard: Shard, use_tied: bool = False) -> Model | MambaModel:
+    if bool(config.get("mamba")) or str(config.get("model_type", "")).lower() == "nemotron_h":
+        return MambaModel(config, shard, use_tied=use_tied)
+    return Model(config, shard, use_tied=use_tied)
 
 def apply_weight(
     model_weight_key: str,
@@ -60,11 +108,9 @@ def apply_weight(
     if weight is None:
         return
 
-    model_type = str(model_config.get("model_type", "")).lower()
-    needs_qk_permute = model_type not in {"gpt_oss"}
-    if needs_qk_permute and "q_proj" in key:
+    if _needs_qk_permute(model_config) and "q_proj" in key:
         weight = permute(weight, model_config["num_heads"])
-    elif needs_qk_permute and "k_proj" in key:
+    elif _needs_qk_permute(model_config) and "k_proj" in key:
         weight = permute(weight, model_config["num_kv_heads"])
 
     target = model_state_dict.get(key)
@@ -76,7 +122,7 @@ def apply_weight(
     model_state_dict[key] = weight
 
 def load_safetensors(
-    model: Model,
+    model: Any,
     model_path: Path,
     model_config: dict,
     weight_device: str | torch.device = "cpu",
@@ -106,7 +152,7 @@ def load_safetensors(
     progress = WeightLoadProgress(total=len(model_state_dict), label="torch-load")
 
     for idx, key in enumerate(model_state_dict.keys(), start=1):
-        model_weight_key = prefix + key
+        model_weight_key = _resolve_weight_key(key, weight_map, prefix)
         if model_weight_key not in weight_map:
             if use_tied and key == "output.weight":
                 embed_weight_key = "model.embed_tokens.weight"
@@ -266,7 +312,7 @@ def sample(
     return output_token
 
 def generate(
-    model: Model,
+    model: Any,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     tokenizer: Any,
@@ -418,7 +464,7 @@ async def load_model(
     weight_device: str | torch.device | None = None,
     offline_mode: bool = False,
     progress_callback: Callable[[str], Awaitable[None] | None] | None = None,
-) -> tuple[Model, dict, AutoTokenizer, Path]:
+) -> tuple[Any, dict, AutoTokenizer, Path]:
     from tiny_cheetah.repos import RepoCustom
 
     sanitized = model_id.replace("/", "__")
@@ -459,7 +505,11 @@ async def load_model(
         weight_device = get_backend_device("torch", default="cpu")
         assert weight_device is not None
 
-    model = Model(model_config, shard)
+    model = build_model(
+        model_config,
+        shard,
+        use_tied=model_config.get("tie_word_embeddings", False),
+    )
     model.to(get_backend_device("torch", default="cpu"))
     if is_quantized_model_config(model_config):
         logger.info("Detected quantized model for %s, loading with torch NF4 loader.", model_id)

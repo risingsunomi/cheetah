@@ -13,14 +13,22 @@ from rich.markup import escape
 from transformers import AutoTokenizer
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
 from textual.events import Mount
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, RichLog, Static, TextArea
+from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, RichLog, Select, Static, TextArea
 
 from tiny_cheetah.logging_utils import get_logger
 from tiny_cheetah.agent.functions import AgentFunctions
-from tiny_cheetah.agent.prompt_loader import render_agent_system_prompt
+from tiny_cheetah.agent.prompt_loader import (
+    PROMPT_TEMPLATE_NAME,
+    list_agent_prompt_names,
+    load_agent_prompt_template,
+    normalize_prompt_name,
+    render_agent_system_prompt,
+    save_agent_prompt_template,
+)
 from tiny_cheetah.models.llm.backend import (
     detect_quantization_mode,
     get_backend_device,
@@ -28,10 +36,11 @@ from tiny_cheetah.models.llm.backend import (
     load_model_for_backend,
 )
 from tiny_cheetah.orchestration.peer_client import PeerClient
-from tiny_cheetah.tui.chat_menu import GenerationConfigModal
 from tiny_cheetah.tui.help_screen import HelpScreen
 from tiny_cheetah.tui.helpers import (
     MemoryPressureError,
+    apply_chat_template_with_thinking,
+    default_enable_thinking,
     memory_abort_reason,
     relieve_memory_pressure,
     streaming_generate_with_peers,
@@ -79,6 +88,11 @@ class AgentScreen(Screen[None]):
         self._agent_name: str = (os.getenv("TC_AGENT_NAME") or "cot-agent").strip() or "cot-agent"
         self._agent_instructions: str = (os.getenv("TC_AGENT_INSTRUCTIONS") or "").strip()
         self._endless_mode: bool = self._env_flag("TC_AGENT_ENDLESS_MODE", False)
+        prompt_name = os.getenv("TC_AGENT_SYSTEM_PROMPT") or PROMPT_TEMPLATE_NAME
+        try:
+            self._agent_prompt_name: str = normalize_prompt_name(prompt_name)
+        except ValueError:
+            self._agent_prompt_name = PROMPT_TEMPLATE_NAME
         self._last_agent_response: str = ""
 
         self._model_label: Optional[Label] = None
@@ -93,9 +107,14 @@ class AgentScreen(Screen[None]):
         self._cli_button: Optional[Button] = None
         self._agent_log: Optional[RichLog] = None
 
-        self._gen_overrides: Dict[str, float | int] = {}
+        self._gen_overrides: Dict[str, float | int | bool] = {}
+        self._gen_inputs: dict[str, Input] = {}
+        self._thinking_checkbox: Optional[Checkbox] = None
+        self._endless_checkbox: Optional[Checkbox] = None
+        self._instructions_area: Optional[TextArea] = None
 
     def compose(self) -> ComposeResult:
+        effective = self._resolved_gen_config()
         yield Header(show_clock=True)
         with Container(id="agent-root"):
             with Container(id="agent-body"):
@@ -103,8 +122,17 @@ class AgentScreen(Screen[None]):
                     agent_log = RichLog(id="agent-log", markup=True, auto_scroll=True, wrap=True, highlight=True)
                     self._agent_log = agent_log
                     yield agent_log
-                    
+
                 with VerticalScroll(id="agent-side"):
+                    with Container(id="agent-run-actions"):
+                        start_button = Button("Start", id="agent-start", variant="primary")
+                        self._start_button = start_button
+                        yield start_button
+                        stop_button = Button("Stop", id="agent-stop", variant="error")
+                        stop_button.disabled = True
+                        self._stop_button = stop_button
+                        yield stop_button
+
                     with Static(id="agent-model-panel"):
                         yield Label("Model", classes="panel-title")
                         model_value = Label(self._model_id or "None selected", id="agent-model-value")
@@ -113,18 +141,58 @@ class AgentScreen(Screen[None]):
                         backend_value = Label(self._llm_backend, id="agent-backend-value")
                         self._backend_label = backend_value
                         yield backend_value
-                        with Container(id="agent-model-actions-top"):
-                            yield Button("Select Model", id="agent-open-model-picker")
-                            yield Button("Gen Config", id="agent-open-gen-config")
-                        with Container(id="agent-model-actions-bottom"):
-                            load_button = Button("Load Model", id="agent-load-model")
-                            self._load_button = load_button
-                            yield load_button
-                            yield Button("Clear Model", id="agent-clear-model", variant="error")
+
+                    with Container(id="agent-model-actions"):
+                        yield Button("Select Model", id="agent-open-model-picker")
+
                     with Container(id="agent-config-actions"):
                         config_button = Button("Agent Config", id="agent-open-config", variant="primary")
                         self._config_button = config_button
                         yield config_button
+
+                    with Static(id="agent-instructions-panel"):
+                        yield Label("Instructions", classes="panel-title")
+                        instructions_area = TextArea(
+                            self._agent_instructions,
+                            id="agent-instructions",
+                            soft_wrap=True,
+                            show_line_numbers=False,
+                            placeholder="Describe goals, constraints, and desired output for the agent.",
+                        )
+                        self._instructions_area = instructions_area
+                        yield instructions_area
+
+                    with Static(id="agent-gen-panel"):
+                        yield Label("Generation", classes="panel-title")
+                        with Container(classes="agent-gen-row"):
+                            yield Label("Temp", classes="agent-gen-label")
+                            yield self._make_gen_input("temperature", effective["temperature"])
+                        with Container(classes="agent-gen-row"):
+                            yield Label("Top K", classes="agent-gen-label")
+                            yield self._make_gen_input("top_k", effective["top_k"])
+                        with Container(classes="agent-gen-row"):
+                            yield Label("Top P", classes="agent-gen-label")
+                            yield self._make_gen_input("top_p", effective["top_p"])
+                        with Container(classes="agent-gen-row"):
+                            yield Label("Repeat", classes="agent-gen-label")
+                            yield self._make_gen_input("repetition_penalty", effective["repetition_penalty"])
+                        with Container(classes="agent-gen-row"):
+                            yield Label("Alpha F", classes="agent-gen-label")
+                            yield self._make_gen_input("alpha_f", effective["alpha_f"])
+                        with Container(classes="agent-gen-row"):
+                            yield Label("Alpha P", classes="agent-gen-label")
+                            yield self._make_gen_input("alpha_p", effective["alpha_p"])
+                        thinking_checkbox = Checkbox("Enable Thinking", id="agent-gen-enable-thinking")
+                        thinking_checkbox.value = bool(effective["enable_thinking"])
+                        self._thinking_checkbox = thinking_checkbox
+                        yield thinking_checkbox
+                        endless_checkbox = Checkbox("Endless Mode", id="agent-gen-endless-mode")
+                        endless_checkbox.value = bool(self._endless_mode)
+                        self._endless_checkbox = endless_checkbox
+                        yield endless_checkbox
+
+                    
+                    
                     with Static(id="agent-status-panel"):
                         yield Label("Status", classes="panel-title")
                         state_value = Label("Idle", id="agent-state-value")
@@ -134,15 +202,7 @@ class AgentScreen(Screen[None]):
                         functions_summary = Label("0", id="agent-functions-value")
                         self._functions_summary = functions_summary
                         yield functions_summary
-                    with Static(id="agent-run-panel"):
-                        with Container(id="agent-run-actions"):
-                            start_button = Button("Start", id="agent-start", variant="primary")
-                            self._start_button = start_button
-                            yield start_button
-                            stop_button = Button("Stop", id="agent-stop", variant="error")
-                            stop_button.disabled = True
-                            self._stop_button = stop_button
-                            yield stop_button
+                    
         yield Footer()
 
     async def on_mount(self, _: Mount) -> None:
@@ -165,12 +225,8 @@ class AgentScreen(Screen[None]):
             self._open_model_picker()
         elif button_id == "agent-open-config":
             self._open_agent_config()
-        elif button_id == "agent-open-gen-config":
-            self._open_gen_config()
         elif button_id == "agent-load-model":
             await self._start_model_load()
-        elif button_id == "agent-clear-model":
-            self._clear_model()
         elif button_id == "agent-open-cli":
             self._open_cli_menu()
         elif button_id == "agent-start":
@@ -187,7 +243,7 @@ class AgentScreen(Screen[None]):
             [
                 "Agent Screen",
                 "- Start/Stop controls run looping agent execution.",
-                "- Agent Config opens the name and instructions editor.",
+                "- Agent Config opens the name and system prompt editor.",
                 "- Builtin tools are loaded from agent/functions.json and code handlers.",
                 "- CLI Access runs one-off shell commands.",
                 "- Endless Mode ignores end_run and loops until manual Stop.",
@@ -209,26 +265,12 @@ class AgentScreen(Screen[None]):
             self._model_label.update(selected)
         self._log(f"Model set to '{selected}'.")
 
-    def _open_gen_config(self) -> None:
-        effective = self._effective_gen_config()
-        self.app.push_screen(
-            GenerationConfigModal(
-                temperature=effective["temperature"],
-                top_k=int(effective["top_k"]),
-                top_p=effective["top_p"],
-                repetition_penalty=effective["repetition_penalty"],
-                alpha_f=effective["alpha_f"],
-                alpha_p=effective["alpha_p"],
-            ),
-            self._apply_gen_config,
-        )
-
     def _open_agent_config(self) -> None:
         self.app.push_screen(
             AgentConfigModal(
                 name=self._agent_name,
-                instructions=self._agent_instructions,
-                endless_mode=self._endless_mode,
+                prompt_name=self._agent_prompt_name,
+                prompt_names=self._available_prompt_names(),
             ),
             self._apply_agent_config,
         )
@@ -237,11 +279,30 @@ class AgentScreen(Screen[None]):
         if not result:
             return
         self._agent_name = str(result.get("name", self._agent_name)).strip() or "cot-agent"
-        self._agent_instructions = str(result.get("instructions", self._agent_instructions)).strip()
-        self._endless_mode = bool(result.get("endless_mode", self._endless_mode))
+        prompt_name = str(result.get("prompt_name", self._agent_prompt_name)).strip() or self._agent_prompt_name
+        try:
+            self._agent_prompt_name = normalize_prompt_name(prompt_name)
+        except ValueError:
+            self._log(f"Invalid prompt selection '{prompt_name}', keeping '{self._agent_prompt_name}'.")
         self._refresh_agent_config_summary()
         self._refresh_state_label()
         self._log("Agent config updated.")
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        checkbox_id = getattr(event.checkbox, "id", None)
+        if checkbox_id == "agent-gen-enable-thinking":
+            self._gen_overrides["enable_thinking"] = bool(event.value)
+            return
+        if checkbox_id == "agent-gen-endless-mode":
+            self._endless_mode = bool(event.value)
+            self._refresh_agent_config_summary()
+            return
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id != "agent-instructions":
+            return
+        self._agent_instructions = event.text_area.text.strip()
+        self._refresh_agent_config_summary()
 
     def _open_cli_menu(self) -> None:
         self.app.push_screen(AgentCLIModal(), self._handle_cli_command)
@@ -277,21 +338,7 @@ class AgentScreen(Screen[None]):
             self._log(f"[CLI][stderr] {err_text[:3000]}")
         self._log(f"[CLI] Exit code: {rc}")
 
-    def _apply_gen_config(self, result: Optional[dict[str, float | int]]) -> None:
-        if result is None:
-            return
-        self._gen_overrides.update(result)
-        self._log(
-            "Generation config updated: "
-            f"temp={self._gen_overrides.get('temperature')}, "
-            f"top_k={self._gen_overrides.get('top_k')}, "
-            f"top_p={self._gen_overrides.get('top_p')}, "
-            f"repetition_penalty={self._gen_overrides.get('repetition_penalty')}, "
-            f"alpha_f={self._gen_overrides.get('alpha_f')}, "
-            f"alpha_p={self._gen_overrides.get('alpha_p')}"
-        )
-
-    def _effective_gen_config(self) -> dict[str, float | int]:
+    def _resolved_gen_config(self) -> dict[str, float | int]:
         config = self._model_config if isinstance(self._model_config, dict) else {}
 
         def _as_float(value: Any, default: float) -> float:
@@ -316,7 +363,41 @@ class AgentScreen(Screen[None]):
             ),
             "alpha_f": _as_float(self._gen_overrides.get("alpha_f", 0.0), 0.0),
             "alpha_p": _as_float(self._gen_overrides.get("alpha_p", 0.0), 0.0),
+            "enable_thinking": bool(
+                self._gen_overrides.get(
+                    "enable_thinking",
+                    default_enable_thinking(
+                        model_path=self._model_cache_path,
+                        tokenizer=self._tokenizer,
+                    ),
+                )
+            ),
         }
+
+    def _effective_gen_config(self) -> dict[str, float | int]:
+        effective = self._resolved_gen_config()
+        parsers = {
+            "temperature": float,
+            "top_k": int,
+            "top_p": float,
+            "repetition_penalty": float,
+            "alpha_f": float,
+            "alpha_p": float,
+        }
+        for key, parser in parsers.items():
+            widget = self._gen_inputs.get(key)
+            if widget is None:
+                continue
+            raw = widget.value.strip()
+            if not raw:
+                continue
+            try:
+                effective[key] = parser(raw)
+            except ValueError:
+                continue
+        if self._thinking_checkbox is not None:
+            effective["enable_thinking"] = bool(self._thinking_checkbox.value)
+        return effective
 
     async def _start_model_load(self) -> None:
         if not self._model_id:
@@ -341,6 +422,11 @@ class AgentScreen(Screen[None]):
             )
             mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
             self._model_loaded = True
+            if self._thinking_checkbox is not None and "enable_thinking" not in self._gen_overrides:
+                self._thinking_checkbox.value = default_enable_thinking(
+                    model_path=self._model_cache_path,
+                    tokenizer=self._tokenizer,
+                )
             self._log(f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}.")
         finally:
             self._set_load_button_enabled(True)
@@ -368,10 +454,11 @@ class AgentScreen(Screen[None]):
                 return
 
         name = self._agent_name or "cot-agent"
-        instructions = self._agent_instructions.strip()
+        instructions = self._current_agent_instructions()
         if not instructions:
             self._log("Add agent instructions before starting.")
             return
+        self._agent_instructions = instructions
 
         self._agent_running = True
         self._set_agent_controls_running(True)
@@ -385,6 +472,7 @@ class AgentScreen(Screen[None]):
             f"temp={gen_cfg['temperature']}, "
             f"top_k={gen_cfg['top_k']}, "
             f"top_p={gen_cfg['top_p']}, "
+            f"thinking={gen_cfg['enable_thinking']}, "
             f"alpha_f={gen_cfg['alpha_f']}, "
             f"alpha_p={gen_cfg['alpha_p']}"
         )
@@ -411,16 +499,39 @@ class AgentScreen(Screen[None]):
         self._refresh_state_label()
         self._log("Agent stopped.")
 
+    def _make_gen_input(self, key: str, value: float | int) -> Input:
+        input_widget = Input(id=f"agent-gen-{key}", placeholder=str(value))
+        input_widget.value = str(value)
+        self._gen_inputs[key] = input_widget
+        return input_widget
+
     def _build_initial_messages(self, *, name: str, instructions: str) -> list[dict[str, str]]:
         enabled_functions = sorted(self._enabled_function_names())
-        system_prompt = render_agent_system_prompt(
-            name=name,
-            agent_prompt=instructions,
-            endless_mode=self._endless_mode,
-            enabled_functions=enabled_functions,
-            function_format=self._function_format,
-            tool_summary=self._tool_prompt_summary(),
-        )
+        try:
+            system_prompt = render_agent_system_prompt(
+                prompt_name=self._agent_prompt_name,
+                name=name,
+                agent_prompt=instructions,
+                endless_mode=self._endless_mode,
+                enabled_functions=enabled_functions,
+                function_format=self._function_format,
+                tool_summary=self._tool_prompt_summary(),
+            )
+        except Exception as exc:
+            logger.exception("Failed to render agent prompt '%s'", self._agent_prompt_name)
+            self._log(
+                f"Prompt '{self._agent_prompt_name}' failed to render ({exc}); "
+                f"falling back to '{PROMPT_TEMPLATE_NAME}'."
+            )
+            system_prompt = render_agent_system_prompt(
+                prompt_name=PROMPT_TEMPLATE_NAME,
+                name=name,
+                agent_prompt=instructions,
+                endless_mode=self._endless_mode,
+                enabled_functions=enabled_functions,
+                function_format=self._function_format,
+                tool_summary=self._tool_prompt_summary(),
+            )
 
         self._log(f"Initial system prompt:\n{system_prompt}")
         return [
@@ -598,10 +709,13 @@ class AgentScreen(Screen[None]):
     def _token_count_for_messages(self, messages: list[dict[str, str]]) -> int:
         if self._tokenizer is None:
             return 0
-        template = self._tokenizer.apply_chat_template(
+        template = apply_chat_template_with_thinking(
+            self._tokenizer,
             messages,
             add_generation_prompt=True,
             tokenize=False,
+            model_path=self._model_cache_path,
+            enable_thinking=bool(self._effective_gen_config()["enable_thinking"]),
         )
         enc = self._tokenizer(template, return_tensors="np")
         return int(enc["input_ids"].shape[1])
@@ -622,10 +736,13 @@ class AgentScreen(Screen[None]):
             else:
                 break
 
-        template = self._tokenizer.apply_chat_template(
+        template = apply_chat_template_with_thinking(
+            self._tokenizer,
             selected,
             add_generation_prompt=True,
             tokenize=False,
+            model_path=self._model_cache_path,
+            enable_thinking=bool(self._effective_gen_config()["enable_thinking"]),
         )
         enc = self._tokenizer(template, return_tensors="np")
         input_ids = enc["input_ids"]
@@ -963,10 +1080,27 @@ class AgentScreen(Screen[None]):
     def _sync_functions_with_runtime(self) -> None:
         self._agent_functions = self._agent_runtime.get_agent_functions(format_mode=self._function_format)
 
+    def _available_prompt_names(self) -> list[str]:
+        try:
+            prompts = list_agent_prompt_names()
+        except Exception:
+            logger.exception("Failed to list agent prompts")
+            prompts = []
+        if self._agent_prompt_name not in prompts:
+            prompts.append(self._agent_prompt_name)
+        if PROMPT_TEMPLATE_NAME not in prompts:
+            prompts.insert(0, PROMPT_TEMPLATE_NAME)
+        return sorted(dict.fromkeys(prompts), key=lambda name: (name != PROMPT_TEMPLATE_NAME, name))
+
+    def _current_agent_instructions(self) -> str:
+        if self._instructions_area is not None:
+            return self._instructions_area.text.strip()
+        return self._agent_instructions.strip()
+
     def _refresh_agent_config_summary(self) -> None:
         if self._config_summary is None:
             return
-        preview = " ".join(self._agent_instructions.split())
+        preview = " ".join(self._current_agent_instructions().split())
         if len(preview) > 180:
             preview = preview[:177] + "..."
         if not preview:
@@ -975,6 +1109,7 @@ class AgentScreen(Screen[None]):
             "\n".join(
                 [
                     f"Name: {self._agent_name}",
+                    f"Prompt: {self._agent_prompt_name}",
                     f"Endless Mode: {'On' if self._endless_mode else 'Off'}",
                     "Instructions:",
                     preview,
@@ -1029,77 +1164,226 @@ class AgentScreen(Screen[None]):
 
 
 class AgentConfigModal(ModalScreen[Optional[dict[str, Any]]]):
-    def __init__(self, *, name: str, instructions: str, endless_mode: bool) -> None:
+    BINDINGS = [
+        Binding("escape", "dismiss_modal", "Close", show=False, priority=True),
+        Binding("b", "dismiss_modal", "Close", show=False, priority=True),
+    ]
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        prompt_name: str,
+        prompt_names: list[str],
+    ) -> None:
         super().__init__(id="agent-config-modal")
         self._initial_name = name
-        self._initial_instructions = instructions
-        self._initial_endless_mode = endless_mode
+        self._initial_prompt_name = prompt_name
+        self._prompt_names = prompt_names
         self._name_input: Optional[Input] = None
-        self._instructions_area: Optional[TextArea] = None
-        self._endless_checkbox: Optional[Checkbox] = None
+        self._prompt_select: Optional[Select[str]] = None
+        self._prompt_editor: Optional[TextArea] = None
         self._status: Optional[Label] = None
+        try:
+            self._current_prompt_name = normalize_prompt_name(prompt_name)
+        except ValueError:
+            self._current_prompt_name = PROMPT_TEMPLATE_NAME
 
     def compose(self) -> ComposeResult:
         with Container(id="agent-config-modal-container"):
-            yield Label("Agent Config", id="agent-config-title")
-            yield Label("Agent Name", classes="agent-field-label")
+            with Container(id="agent-config-header"):
+                yield Button("X", id="agent-config-close", classes="modal-close")
+            yield Label("Name", classes="agent-field-label")
             name_input = Input(id="agent-config-name", placeholder="e.g. research-assistant")
             self._name_input = name_input
             yield name_input
 
-            yield Label("Instructions", classes="agent-field-label")
-            instructions_area = TextArea(
-                self._initial_instructions,
-                id="agent-config-instructions",
+            yield Label("System Prompt", classes="agent-field-label")
+            prompt_select = Select(
+                [(prompt_name, prompt_name) for prompt_name in self._prompt_names],
+                value=self._current_prompt_name,
+                allow_blank=False,
+                id="agent-config-prompt-select",
+            )
+            self._prompt_select = prompt_select
+            yield prompt_select
+
+            yield Label("Prompt Template", classes="agent-field-label")
+            prompt_editor = TextArea(
+                "",
+                id="agent-config-prompt-editor",
                 soft_wrap=True,
                 show_line_numbers=False,
-                placeholder="Describe goals, reasoning style, constraints, and desired output.",
+                placeholder="Edit the Jinja system prompt template here.",
             )
-            self._instructions_area = instructions_area
-            yield instructions_area
+            self._prompt_editor = prompt_editor
+            yield prompt_editor
 
-            endless_checkbox = Checkbox("Endless Mode (ignore end_run)", id="agent-config-endless-mode")
-            self._endless_checkbox = endless_checkbox
-            yield endless_checkbox
+            with Container(id="agent-config-prompt-actions"):
+                yield Button("Save Prompt", id="agent-config-save-prompt")
+                yield Button("Save As", id="agent-config-save-prompt-as", variant="primary")
 
             status = Label("", id="agent-config-status")
             self._status = status
             yield status
 
-            with Container(id="agent-config-buttons"):
-                yield Button("Cancel", id="agent-config-cancel")
-                yield Button("Save", id="agent-config-save", variant="primary")
-
     def on_mount(self, _: Mount) -> None:
         if self._name_input is not None:
             self._name_input.value = self._initial_name
             self.call_after_refresh(self._name_input.focus)
-        if self._endless_checkbox is not None:
-            self._endless_checkbox.value = self._initial_endless_mode
+        self._load_prompt_into_editor(self._current_prompt_name)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "agent-config-prompt-select":
+            return
+        value = event.value
+        if not isinstance(value, str) or not value.strip():
+            return
+        self._load_prompt_into_editor(value)
+
+    def action_dismiss_modal(self) -> None:
+        self._dismiss_with_current_config()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "agent-config-cancel":
-            self.dismiss(None)
+        if event.button.id == "agent-config-close":
+            self._dismiss_with_current_config()
             return
-        if event.button.id != "agent-config-save":
+        if event.button.id == "agent-config-save-prompt":
+            self._save_prompt()
+            return
+        if event.button.id == "agent-config-save-prompt-as":
+            self.app.push_screen(
+                PromptNameModal(
+                    title="Save Prompt As",
+                    initial=self._current_prompt_name,
+                ),
+                self._handle_save_prompt_as,
+            )
             return
 
+    def _dismiss_with_current_config(self) -> None:
         name = self._name_input.value.strip() if self._name_input is not None else ""
-        instructions = self._instructions_area.text.strip() if self._instructions_area is not None else ""
-        endless_mode = bool(self._endless_checkbox.value) if self._endless_checkbox is not None else False
-
-        if not name:
-            name = "cot-agent"
-        if not instructions:
-            self._set_status("Instructions are empty. The agent will refuse to start until you add them.")
-
         self.dismiss(
             {
-                "name": name,
-                "instructions": instructions,
-                "endless_mode": endless_mode,
+                "name": name or "cot-agent",
+                "prompt_name": self._current_prompt_name,
             }
         )
+
+    def _load_prompt_into_editor(self, prompt_name: str) -> None:
+        try:
+            resolved_name = normalize_prompt_name(prompt_name)
+            content = load_agent_prompt_template(resolved_name)
+        except Exception as exc:
+            self._set_status(f"Failed to load prompt '{prompt_name}': {exc}")
+            return
+
+        self._current_prompt_name = resolved_name
+        if self._prompt_select is not None and self._prompt_select.value != resolved_name:
+            self._prompt_select.value = resolved_name
+        if self._prompt_editor is not None:
+            self._prompt_editor.load_text(content)
+        self._set_status("")
+
+    def _save_prompt(self) -> str | None:
+        content = self._prompt_editor.text if self._prompt_editor is not None else ""
+        try:
+            saved_name = save_agent_prompt_template(self._current_prompt_name, content)
+        except Exception as exc:
+            self._set_status(f"Failed to save prompt '{self._current_prompt_name}': {exc}")
+            return None
+        self._refresh_prompt_options(saved_name)
+        self._set_status("")
+        return saved_name
+
+    def _handle_save_prompt_as(self, result: Optional[str]) -> None:
+        if result is None:
+            return
+        self._save_prompt_as(result)
+
+    def _save_prompt_as(self, target_name: str) -> str | None:
+        target_name = target_name.strip()
+        if not target_name:
+            self._set_status("Enter a prompt name for Save As.")
+            return None
+        content = self._prompt_editor.text if self._prompt_editor is not None else ""
+        try:
+            saved_name = save_agent_prompt_template(target_name, content)
+        except Exception as exc:
+            self._set_status(f"Failed to save prompt as '{target_name}': {exc}")
+            return None
+        self._current_prompt_name = saved_name
+        self._refresh_prompt_options(saved_name)
+        self._set_status("")
+        return saved_name
+
+    def _refresh_prompt_options(self, selected_name: str) -> None:
+        if self._prompt_select is None:
+            return
+        prompt_names = list_agent_prompt_names()
+        if selected_name not in prompt_names:
+            prompt_names.append(selected_name)
+        self._prompt_names = sorted(dict.fromkeys(prompt_names), key=lambda name: (name != PROMPT_TEMPLATE_NAME, name))
+        self._prompt_select.set_options([(prompt_name, prompt_name) for prompt_name in self._prompt_names])
+        self._prompt_select.value = selected_name
+
+    def _set_status(self, message: str) -> None:
+        if self._status is not None:
+            self._status.update(message)
+
+
+class PromptNameModal(ModalScreen[Optional[str]]):
+    BINDINGS = [
+        Binding("escape", "dismiss_modal", "Close", show=False, priority=True),
+        Binding("b", "dismiss_modal", "Close", show=False, priority=True),
+    ]
+
+    def __init__(self, *, title: str, initial: str = "") -> None:
+        super().__init__(id="agent-prompt-name-modal")
+        self._title = title
+        self._initial = initial
+        self._name_input: Optional[Input] = None
+        self._status: Optional[Label] = None
+
+    def compose(self) -> ComposeResult:
+        with Container(id="agent-prompt-name-modal-container"):
+            with Container(id="agent-prompt-name-header"):
+                yield Label(self._title, id="agent-prompt-name-title")
+                yield Button("X", id="agent-prompt-name-close", classes="modal-close")
+            name_input = Input(id="agent-prompt-name-field", placeholder="prompt_name.j2")
+            self._name_input = name_input
+            yield name_input
+            status = Label("", id="agent-prompt-name-status")
+            self._status = status
+            yield status
+            with Container(id="agent-prompt-name-buttons"):
+                yield Button("Cancel", id="agent-prompt-name-cancel")
+                yield Button("Save", id="agent-prompt-name-save", variant="primary")
+
+    def on_mount(self, _: Mount) -> None:
+        if self._name_input is not None:
+            self._name_input.value = self._initial
+            self.call_after_refresh(self._name_input.focus)
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in {"agent-prompt-name-cancel", "agent-prompt-name-close"}:
+            self.dismiss(None)
+            return
+        if event.button.id != "agent-prompt-name-save":
+            return
+        value = self._name_input.value.strip() if self._name_input is not None else ""
+        if not value:
+            self._set_status("Enter a prompt name.")
+            return
+        try:
+            value = normalize_prompt_name(value)
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        self.dismiss(value)
 
     def _set_status(self, message: str) -> None:
         if self._status is not None:

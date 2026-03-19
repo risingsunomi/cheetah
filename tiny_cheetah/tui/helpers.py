@@ -1,7 +1,11 @@
 from __future__ import annotations
 import gc
+import inspect
+import json
 import os
+import re
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 import tinygrad as tg
@@ -28,6 +32,8 @@ from tiny_cheetah.logging_utils import get_logger
 logger = get_logger(__name__)
 TokenCallback = Callable[[int], None]
 AbortCheck = Callable[[], str | None]
+THINK_OPEN_TOKEN = "<think>"
+THINK_CLOSE_TOKEN = "</think>"
 
 
 class MemoryPressureError(RuntimeError):
@@ -126,6 +132,171 @@ def _raise_if_abort(abort_check: AbortCheck | None) -> None:
 
 def detect_quantization_mode(model_config: Any) -> tuple[bool, str]:
     return detect_quantization_mode_backend(model_config)
+
+
+def _env_flag(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def model_supports_thinking(
+    *,
+    model_path: str | Path | None = None,
+    tokenizer: Any = None,
+) -> bool:
+    config_path: Path | None = None
+    if model_path is not None:
+        candidate = Path(model_path) / "tokenizer_config.json"
+        if candidate.exists():
+            config_path = candidate
+
+    if config_path is None and tokenizer is not None:
+        name_or_path = getattr(tokenizer, "name_or_path", None)
+        if isinstance(name_or_path, str) and name_or_path.strip():
+            candidate = Path(name_or_path).expanduser() / "tokenizer_config.json"
+            if candidate.exists():
+                config_path = candidate
+
+    if config_path is None:
+        return False
+
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    decoder = payload.get("added_tokens_decoder")
+    if not isinstance(decoder, dict):
+        return False
+
+    found_open = False
+    found_close = False
+    for value in decoder.values():
+        content = value.get("content") if isinstance(value, dict) else None
+        if content == "<think>":
+            found_open = True
+        elif content == "</think>":
+            found_close = True
+        if found_open and found_close:
+            return True
+    return False
+
+
+def default_enable_thinking(
+    *,
+    model_path: str | Path | None = None,
+    tokenizer: Any = None,
+) -> bool:
+    env_value = _env_flag("TC_ENABLE_THINKING")
+    if env_value is not None:
+        return env_value
+    return model_supports_thinking(model_path=model_path, tokenizer=tokenizer)
+
+
+def apply_chat_template_with_thinking(
+    tokenizer: AutoTokenizer,
+    messages: list[dict[str, str]],
+    *,
+    add_generation_prompt: bool,
+    tokenize: bool,
+    model_path: str | Path | None = None,
+    enable_thinking: bool | None = None,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "add_generation_prompt": add_generation_prompt,
+        "tokenize": tokenize,
+    }
+    supports_thinking = model_supports_thinking(
+        model_path=model_path,
+        tokenizer=tokenizer,
+    )
+    if supports_thinking:
+        thinking_value = default_enable_thinking(
+            model_path=model_path,
+            tokenizer=tokenizer,
+        ) if enable_thinking is None else bool(enable_thinking)
+
+        try:
+            signature = inspect.signature(tokenizer.apply_chat_template)
+        except (TypeError, ValueError):
+            signature = None
+
+        accepts_thinking = signature is None or "enable_thinking" in signature.parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        )
+        if accepts_thinking:
+            kwargs["enable_thinking"] = thinking_value
+
+    return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+def _cleanup_special_tokens(text: str, tokenizer: Any = None) -> str:
+    cleaned = text
+    special_tokens = getattr(tokenizer, "all_special_tokens", []) or []
+    for token in special_tokens:
+        if not isinstance(token, str):
+            continue
+        if token in {THINK_OPEN_TOKEN, THINK_CLOSE_TOKEN}:
+            continue
+        if token:
+            cleaned = cleaned.replace(token, "")
+
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+
+    lines: list[str] = []
+    blank_pending = False
+    for raw_line in cleaned.split("\n"):
+        line = re.sub(r"[ \t]{2,}", " ", raw_line).strip()
+        if not line:
+            if lines:
+                blank_pending = True
+            continue
+        if blank_pending:
+            lines.append("")
+            blank_pending = False
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def split_thinking_response(raw_text: str, tokenizer: Any = None) -> tuple[str, str]:
+    if not raw_text:
+        return "", ""
+
+    thinking_parts: list[str] = []
+    final_parts: list[str] = []
+    cursor = 0
+    text_len = len(raw_text)
+
+    while cursor < text_len:
+        open_idx = raw_text.find(THINK_OPEN_TOKEN, cursor)
+        if open_idx == -1:
+            final_parts.append(raw_text[cursor:])
+            break
+
+        final_parts.append(raw_text[cursor:open_idx])
+        think_start = open_idx + len(THINK_OPEN_TOKEN)
+        close_idx = raw_text.find(THINK_CLOSE_TOKEN, think_start)
+        if close_idx == -1:
+            thinking_parts.append(raw_text[think_start:])
+            cursor = text_len
+            break
+
+        thinking_parts.append(raw_text[think_start:close_idx])
+        cursor = close_idx + len(THINK_CLOSE_TOKEN)
+
+    thinking_text = _cleanup_special_tokens("".join(thinking_parts), tokenizer=tokenizer)
+    final_text = _cleanup_special_tokens("".join(final_parts), tokenizer=tokenizer)
+    if thinking_text or final_text:
+        return thinking_text, final_text
+
+    return "", _cleanup_special_tokens(
+        raw_text.replace(THINK_OPEN_TOKEN, "").replace(THINK_CLOSE_TOKEN, ""),
+        tokenizer=tokenizer,
+    )
 
 
 def _sample_with_backend(*args: Any, **kwargs: Any):

@@ -161,6 +161,10 @@ ModalScreen#chat-gen-config-modal {
     margin-top: 1;
 }
 
+#chat-gen-config-enable-thinking {
+    margin-top: 1;
+}
+
 #chat-gen-config-status {
     color: $warning;
     margin-top: 1;

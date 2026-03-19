@@ -53,6 +53,26 @@ class TestMultiHeadAttention(unittest.TestCase):
         decode_out = mha(x_step, attention_mask=mask_step, position_ids=pos_step)
         self.assertEqual(tuple(decode_out.shape), (2, 1, self.config["embed_dim"]))
 
+    def test_training_mode_bypasses_and_clears_kv_cache(self):
+        mha = MultiHeadAttention(config=self.config, is_causal=True)
+        mha.eval()
+
+        x = torch.randn(2, 4, self.config["embed_dim"])
+        mask = torch.ones((2, 4), dtype=torch.long)
+        pos = torch.arange(4).unsqueeze(0).expand(2, 4)
+        _ = mha(x, attention_mask=mask, position_ids=pos)
+
+        self.assertIsNotNone(mha.kv_cache)
+        assert mha.kv_cache is not None
+        self.assertGreater(mha.kv_cache.cache_pos, 0)
+
+        mha.train(True)
+        train_out = mha(x, attention_mask=mask, position_ids=pos)
+
+        self.assertEqual(tuple(train_out.shape), (2, 4, self.config["embed_dim"]))
+        assert mha.kv_cache is not None
+        self.assertEqual(mha.kv_cache.cache_pos, 0)
+
     def test_qwen_style_bias_flags_create_qkv_bias_without_output_bias(self):
         config = dict(self.config)
         config["qkv_bias"] = True
