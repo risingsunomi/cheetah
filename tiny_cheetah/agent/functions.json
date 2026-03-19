@@ -1,0 +1,169 @@
+[
+  {
+    "name": "list_dir",
+    "description": "List directory entries for a path.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Directory path"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "read_file",
+    "description": "Read UTF-8 text from a file.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path"
+        },
+        "max_chars": {
+          "type": "integer",
+          "description": "Maximum number of characters to return"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "write_file",
+    "description": "Write UTF-8 text to a file. Creates parent directories when requested.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path to create or overwrite"
+        },
+        "content": {
+          "type": "string",
+          "description": "Text content to write"
+        },
+        "overwrite": {
+          "type": "boolean",
+          "description": "Whether to overwrite an existing file"
+        },
+        "make_dirs": {
+          "type": "boolean",
+          "description": "Whether to create parent directories if needed"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    }
+  },
+  {
+    "name": "edit_file",
+    "description": "Edit an existing UTF-8 file by replacing matching text.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path to edit"
+        },
+        "old_text": {
+          "type": "string",
+          "description": "Existing text to replace"
+        },
+        "new_text": {
+          "type": "string",
+          "description": "Replacement text"
+        },
+        "replace_all": {
+          "type": "boolean",
+          "description": "Replace every match instead of only the first"
+        }
+      },
+      "required": [
+        "path",
+        "old_text",
+        "new_text"
+      ]
+    }
+  },
+  {
+    "name": "run_shell",
+    "description": "Run a local shell command and return stdout, stderr, and exit code.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "Shell command to execute"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "description": "Command timeout in seconds"
+        }
+      },
+      "required": [
+        "command"
+      ]
+    }
+  },
+  {
+    "name": "get_env",
+    "description": "Read one environment variable.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Environment variable name"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  },
+  {
+    "name": "end_run",
+    "description": "Signal that the current agent loop should stop.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "description": "Optional short summary for why the run is ending"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "web_search",
+    "description": "Search the web using Bing and return top results.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query"
+        },
+        "max_results": {
+          "type": "integer",
+          "description": "Maximum number of results (1-10)"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "description": "Page load timeout in seconds"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  }
+]

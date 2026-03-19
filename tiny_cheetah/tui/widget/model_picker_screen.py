@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +14,44 @@ except Exception:
     huggingface_hub = None
 
 
+CUSTOM_MODEL_CACHE = Path.home() / ".cache" / "tiny_cheetah_models"
+
+
+def _looks_like_cached_model(model_dir: Path) -> bool:
+    if not model_dir.is_dir():
+        return False
+    if not (model_dir / "config.json").exists():
+        return False
+    return any(model_dir.glob("*.safetensors"))
+
+
+def discover_cached_models(
+    *,
+    hf_cache_dir: Path | None = None,
+    custom_cache_dir: Path | None = None,
+) -> list[str]:
+    options: set[str] = set()
+
+    if hf_cache_dir is None and huggingface_hub is not None:
+        hf_cache_dir = Path(huggingface_hub.constants.HF_HUB_CACHE).expanduser()
+    if hf_cache_dir is not None and hf_cache_dir.exists():
+        for repo_dir in hf_cache_dir.glob("models--*"):
+            snapshots_dir = repo_dir / "snapshots"
+            if not snapshots_dir.exists():
+                continue
+            if any(_looks_like_cached_model(snapshot_dir) for snapshot_dir in snapshots_dir.iterdir()):
+                options.add(repo_dir.name.replace("models--", "").replace("--", "/"))
+
+    if custom_cache_dir is None:
+        custom_cache_dir = CUSTOM_MODEL_CACHE
+    if custom_cache_dir.exists():
+        for repo_dir in custom_cache_dir.iterdir():
+            if _looks_like_cached_model(repo_dir):
+                options.add(repo_dir.name.replace("__", "/"))
+
+    return sorted(options, key=str.lower)
+
+
 class ModelPickerScreen(ModalScreen[str | None]):
     """Modal popup allowing the user to enter a model identifier or path."""
 
@@ -28,12 +65,12 @@ class ModelPickerScreen(ModalScreen[str | None]):
         super().__init__(id="model-picker")
         self._initial = initial_value
         self._input: Optional[Input] = None
-        self._cache_options = self._discover_cached_models()
+        self._cache_options = discover_cached_models()
 
     def compose(self) -> ComposeResult:
         with Container(id="model-picker-container"):
             yield Static("Select Model", id="model-picker-title")
-            yield Label("Enter a Hugging Face repo or choose a cached model:", id="model-picker-help")
+            yield Label("Enter a HuggingFace repo name or choose a cached model:", id="model-picker-help")
             if self._cache_options:
                 with Container(id="model-picker-cache"):
                     yield Label("Cached Models", id="model-picker-cache-title")
@@ -58,15 +95,3 @@ class ModelPickerScreen(ModalScreen[str | None]):
             self.dismiss(self._input.value.strip() if self._input else None)
         elif "model-cache-option" in event.button.classes:
             self.dismiss(event.button.label.plain)
-
-    def _discover_cached_models(self) -> list[str]:
-        if huggingface_hub is None:
-            return []
-        cache_dir = Path(huggingface_hub.constants.HF_HUB_CACHE).expanduser()
-        if not cache_dir.exists():
-            return []
-        options: set[str] = set()
-        for repo_dir in cache_dir.glob("models--*"):
-            resolved = repo_dir.name.replace("models--", "").replace("--", "/")
-            options.add(resolved)
-        return sorted(options)

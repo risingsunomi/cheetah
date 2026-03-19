@@ -1,0 +1,46 @@
+#orch-root {
+    layout: horizontal;
+    height: 1fr;
+    padding: 1;
+    border: round $primary;
+}
+
+#orch-left,
+#orch-right {
+    height: 1fr;
+}
+
+#orch-left {
+    width: 30%;
+    min-width: 28%;
+    layout: vertical;
+    padding: 1;
+    border: round $primary;
+}
+
+#orch-right {
+    width: 70%;
+    layout: vertical;
+    padding: 1;
+}
+
+#orch-left > *,
+#orch-right > * {
+    margin-bottom: 1;
+}
+
+#orch-left > *:last-child,
+#orch-right > *:last-child {
+    margin-bottom: 0;
+}
+
+#orch-hostmap,
+#orch-network,
+#orch-help {
+    border: round $primary;
+    padding: 1;
+}
+
+#orch-hostmap {
+    height: 60%;
+}

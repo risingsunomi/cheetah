@@ -3,12 +3,7 @@ Screen {
     align: center middle;
 }
 
-#main-menu{
-    layout: horizontal;
-    align: center middle;
-}
-
-#menu-btns{
+#main-menu, #menu-btn-ctnr {
     layout: horizontal;
     align: center middle;
 }

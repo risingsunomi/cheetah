@@ -1,0 +1,49 @@
+#settings-root {
+    layout: vertical;
+    padding: 1 2;
+    height: 100%;
+    width: 100%;
+}
+
+#settings-title {
+    padding: 1 0;
+    text-style: bold;
+}
+
+#settings-help {
+    color: $text-muted;
+    padding-bottom: 1;
+}
+
+#settings-device-title,
+#settings-backend-title {
+    padding: 0 0 1 0;
+    text-style: bold;
+}
+
+#settings-backend-help {
+    color: $text-muted;
+    padding: 0 0 1 0;
+}
+
+#settings-scroll {
+    height: 1fr;
+    border: solid $surface-darken-2;
+    padding: 1;
+    margin-bottom: 1;
+}
+
+#settings-devices,
+#settings-backends {
+    layout: vertical;
+    padding-bottom: 1;
+}
+
+#settings-actions {
+    layout: horizontal;
+    padding: 0 0 1 0;
+}
+
+#settings-status {
+    color: $text-muted;
+}

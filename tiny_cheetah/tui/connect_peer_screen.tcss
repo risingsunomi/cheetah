@@ -1,0 +1,34 @@
+#connect-root {
+    layout: vertical;
+    padding: 2;
+}
+
+#connect-root > * {
+    margin-bottom: 1;
+}
+
+#connect-root > *:last-child {
+    margin-bottom: 0;
+}
+
+#connect-actions {
+    layout: horizontal;
+}
+
+#connect-actions Button {
+    margin-right: 1;
+}
+
+#connect-actions Button:last-child {
+    margin-right: 0;
+}
+
+#connect-info {
+    border: round $primary;
+    padding: 1;
+    min-height: 4;
+}
+
+#connect-pass {
+    width: 40%;
+}

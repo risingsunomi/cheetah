@@ -1,5 +1,7 @@
-Screen {
-    background: $surface;
+#peer-counter {
+    text-align: right;
+    padding: 0 2;
+    color: $text-muted;
 }
 
 #train-root {
@@ -97,14 +99,19 @@ Screen {
     margin-top: 1;
 }
 
+#training-path-summary {
+    margin-top: 1;
+    color: $text-muted;
+    text-wrap: wrap;
+}
+
 #settings-title {
     text-style: bold;
 }
 
-#active-args {
+#training-runtime {
     color: $text-muted;
     padding-top: 1;
-    min-height: 2;
     text-wrap: wrap;
 }
 
@@ -135,17 +142,10 @@ ModalScreen#train-settings {
     padding-right: 1;
 }
 
-#settings-columns {
-    layout: horizontal;
+#settings-form {
+    layout: vertical;
     padding-right: 3;
     padding-left: 3;
-}
-
-.settings-column {
-    layout: vertical;
-    width: 1fr;
-    padding-right: 1;
-    padding-left: 1;
     padding-bottom: 1;
 }
 

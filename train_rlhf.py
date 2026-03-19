@@ -27,7 +27,7 @@ from transformers import AutoTokenizer
 from tiny_cheetah.models.llm.helpers import load_safetensors, generate
 from tiny_cheetah.models.llm.model import Model
 from tiny_cheetah.models.llm.model_config import ModelConfig
-from tiny_cheetah.models.llm.shard import Shard
+from tiny_cheetah.models.shard import Shard
 from tiny_cheetah.repos import RepoHuggingFace
 
 
@@ -109,10 +109,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on the number of prompts extracted from the dataset."
     )
     parser.add_argument(
-        "--device",
+        "--torch-device",
         type=str,
-        default=os.environ.get("TC_DEVICE", "CPU"),
-        help="Tinygrad device string (e.g. CPU, CUDA, METAL)."
+        default=os.environ.get("TC_TORCH_DEVICE", "cpu"),
+        help="pytorch device string (e.g. CPU, CUDA, METAL)."
+    )
+    parser.add_argument(
+        "--tinygrad-device",
+        type=str,
+        default=os.getenv("TC_TINYGRAD_DEVICE", "CPU"),
+        help="tinygrad device string (e.g. CPU, CUDA, METAL)."
     )
     parser.add_argument(
         "--epochs",

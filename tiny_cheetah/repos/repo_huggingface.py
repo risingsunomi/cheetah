@@ -3,17 +3,18 @@ HuggingFace repo for downloading models
 """
 from glob import glob
 from pathlib import Path
+from typing import Any
 
 import huggingface_hub
 
-from tiny_cheetah.models.llm.model_config import ModelConfig
+from tiny_cheetah.models.llm.backend import backend_model_config_class
 
 class RepoHuggingFace:
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, backend: str | None = None):
         self.model_name = model_name
-        self.model_config = ModelConfig()
+        self.model_config = backend_model_config_class(backend=backend)()
 
-    def download(self) -> tuple[Path, ModelConfig]:
+    def download(self) -> tuple[Path, Any]:
         # TO DO: for now download whole model, later make it only download safetensors
         # and other model information it needs
         # use tqdm to display on textual frontend

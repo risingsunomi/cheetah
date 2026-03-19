@@ -1,0 +1,198 @@
+
+
+#path-root {
+    layout: vertical;
+    height: 1fr;
+    padding: 1;
+}
+
+#path-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#path-body {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#path-graph-scroll {
+    width: 1fr;
+    height: 1fr;
+    margin-right: 1;
+}
+
+#path-graph {
+    layout: vertical;
+    border: round $primary;
+    padding: 1;
+    background: #0b1e33;
+    width: 1fr;
+    overflow-y: auto;
+}
+
+#path-sidebar {
+    width: 32%;
+    min-width: 28%;
+    layout: vertical;
+    padding: 0 0 1 0;
+}
+
+.graph-node {
+    width: 1fr;
+    padding: 1;
+    min-height: 3;
+    text-align: center;
+    border: round #1e3a5c;
+    background: #112845;
+    text-wrap: wrap;
+    margin-bottom: 1;
+    color: $text;
+}
+
+.graph-node.selected {
+    border: round $accent;
+    background: #1e3a5c;
+}
+
+.graph-node.repeat {
+    background: #2a1b3d;
+}
+
+.graph-node.status-running {
+    border: round #3bd6ee;
+}
+
+.graph-node.status-complete {
+    border: round #00ff00;
+}
+
+.graph-node.status-stopped {
+    border: round #ffaa00;
+}
+
+.graph-connector {
+    height: auto;
+    color: #3bd6ee;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+.graph-empty {
+    color: $text-muted;
+}
+
+#path-sidebar #path-list {
+    height: 40%;
+    border: round $primary;
+    background: $surface-darken-1;
+    overflow-y: auto;
+}
+
+#path-feedback {
+    min-height: 1;
+    color: $text-muted;
+    margin: 1 0 0 0;
+}
+
+#path-mode-label {
+    min-height: 1;
+    color: $accent;
+    margin: 0 0 1 0;
+}
+
+#path-actions {
+    height: auto;
+    layout: vertical;
+    align: left top;
+}
+
+.path-action-row {
+    layout: horizontal;
+    align: left middle;
+    height: auto;
+    margin-bottom: 1;
+}
+
+.path-action-row Button {
+    width: 1fr;
+    min-width: 12;
+    margin-right: 1;
+}
+
+.path-action-row Button:last-child {
+    margin-right: 0;
+}
+
+.path-action-footer Button#path-save {
+    width: 2fr;
+}
+
+ModalScreen#node-step-modal,
+ModalScreen#path-step-settings-modal,
+ModalScreen#path-confirm-modal {
+    align: center middle;
+}
+
+#node-step-modal-container,
+#path-step-settings-modal-container,
+#path-confirm-modal-container {
+    background: $surface;
+    border: round $primary;
+    width: 70%;
+    max-width: 80;
+    padding: 1 2;
+    layout: vertical;
+}
+
+#node-step-title,
+#path-step-settings-title,
+#path-confirm-title {
+    text-align: center;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#node-step-name,
+.path-step-settings-input {
+    width: 100%;
+}
+
+#node-step-buttons,
+#path-step-settings-buttons,
+#path-confirm-buttons {
+    layout: horizontal;
+    align: right middle;
+    margin-top: 1;
+}
+
+#path-step-settings-modal-container {
+    max-width: 96;
+    height: auto;
+    max-height: 85%;
+}
+
+#path-step-settings-help {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+#path-step-settings-scroll {
+    height: auto;
+    max-height: 20;
+}
+
+.path-step-settings-label {
+    margin-top: 1;
+}
+
+.path-step-settings-label:first-child {
+    margin-top: 0;
+}
+
+
+#node-step-buttons Button#node-step-confirm,
+#path-step-settings-buttons Button#path-step-settings-apply,
+#path-confirm-buttons Button#path-confirm-accept {
+    margin-left: 1;
+}
