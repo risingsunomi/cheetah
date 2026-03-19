@@ -8,6 +8,7 @@
 ```
 [tinygrad](https://tinygrad.org/) and [pytorch](https://pytorch.org/) based distributed and local machine learning model training, agent orchestration and chat inference
 
+
 ## main screen
 ![main interface](media/main_03162026.png "main 03162026")
 
