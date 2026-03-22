@@ -87,7 +87,7 @@ EXTRAS = {
 }
 
 setup(
-    name="tiny_cheetah",
+    name="cheetah",
     version="0.1",
     description="Distributed inference and training with tinygrad or torch backends",
     packages=find_packages(),
