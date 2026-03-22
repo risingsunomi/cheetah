@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal RLHF-style training loop for the Tiny Cheetah LLM stack.
+Minimal RLHF-style training loop for the Cheetah LLM stack.
 
 This script illustrates how you could wire a policy model, optional reference
 model, a simple reward function, and KL-regularised policy optimisation using
@@ -24,11 +24,11 @@ import tinygrad as tg
 from tinygrad.nn.state import get_parameters, get_state_dict, safe_save
 from transformers import AutoTokenizer
 
-from tiny_cheetah.models.llm.helpers import load_safetensors, generate
-from tiny_cheetah.models.llm.model import Model
-from tiny_cheetah.models.llm.model_config import ModelConfig
-from tiny_cheetah.models.shard import Shard
-from tiny_cheetah.repos import RepoHuggingFace
+from cheetah.models.llm.helpers import load_safetensors, generate
+from cheetah.models.llm.model import Model
+from cheetah.models.llm.model_config import ModelConfig
+from cheetah.models.shard import Shard
+from cheetah.repos import RepoHuggingFace
 
 
 RewardFn = Callable[[str, str], float]

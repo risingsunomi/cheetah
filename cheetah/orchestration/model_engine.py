@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import json
+import base64
+import struct
+from typing import Any, Dict, List, Sequence
+
+import numpy as np
+import tinygrad as tg
+try:
+    import torch
+except Exception:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore[assignment]
+
+from cheetah.models.llm.backend import backend_helpers_module, get_backend_device
+from cheetah.models.shard import Shard
+
+
+class ModelEngine:
+    """Lightweight token generation and shard planning."""
+    def __init__(
+        self,
+        shard: Shard | None = None,
+    ) -> None:
+        self.shard = shard or Shard("local", 0, 0, 0)
+
+    def get_tokens(
+        self,
+        model: Any,
+        input_ids: Any,
+        attention_mask: Any,
+        tokenizer: Any,
+        hidden_state: Any | None = None,
+        *,
+        temp: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.8,
+        alpha_f: float = 0.0,
+        alpha_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        seen_tokens: Sequence[int] | None = None,
+    ) -> Dict[str, Any]:
+        """Generate the next token and return a JSON-serializable payload."""
+        curr_pos = int(attention_mask.shape[1] - 1)
+
+        if hidden_state is not None:
+            position_ids = _position_ids_tensor(curr_pos, input_ids)
+            model_output = model(
+                None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                hidden_state=hidden_state,
+            )
+        else:
+            prev_token = _scalar_int(input_ids[:, -1], default=0)
+            next_tok = _next_token_tensor(prev_token, input_ids)
+            attention_mask = _append_attention_mask(attention_mask)
+            position_ids = _position_ids_tensor(curr_pos, input_ids)
+            model_output = model(next_tok, attention_mask=attention_mask, position_ids=position_ids)
+
+        is_final = self.shard.end_layer == self.shard.total_layers - 1
+        if not is_final:
+            return {
+                "hidden_state": _encode_tensor(model_output),
+                "attention_mask": _encode_tensor(attention_mask),
+                "position_ids": _encode_tensor(position_ids),
+                "shard": _shard_payload(self.shard),
+                "end_token": False,
+            }
+
+        next_logit = model_output[:, -1, :].flatten()
+        tok = _sample_with_backend(
+            next_logit,
+            temp=temp,
+            k=top_k,
+            p=top_p,
+            af=alpha_f,
+            ap=alpha_p,
+            repetition_penalty=repetition_penalty,
+            seen_tokens=list(seen_tokens or []),
+        ).item()
+        tok = int(tok)
+        end_token = bool(getattr(tokenizer, "eos_token_id", None) == tok)
+
+        return {
+            "token": _encode_token_tensor(tok),
+            "tensor": _encode_token_tensor(tok),
+            "attention_mask": _encode_tensor(attention_mask),
+            "position_ids": _encode_tensor(position_ids),
+            "shard": _shard_payload(self.shard),
+            "end_token": end_token,
+        }
+
+    def recv_tokens(
+        self,
+        payload: Any,
+        tokenizer: Any | None = None,
+        backend: str | None = None,
+    ) -> Dict[str, Any]:
+        """Normalize a token payload for chat/training consumers."""
+        if isinstance(payload, (bytes, bytearray)):
+            try:
+                payload = json.loads(payload.decode("utf-8"))
+            except Exception:
+                return {}
+        elif isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return {}
+
+        if not isinstance(payload, dict):
+            return {}
+
+        msg = payload.get("payload", payload)
+        if not isinstance(msg, dict):
+            return {}
+
+        token = msg.get("token")
+        if isinstance(token, dict):
+            token = _decode_tensor(token, backend=backend)
+        if token is None:
+            token = _decode_tensor(msg.get("tensor"), backend=backend)
+        token_int = _scalar_int(token)
+        if token_int is not None:
+            msg["token"] = token_int
+
+        hidden_state = _decode_tensor(msg.get("hidden_state"), backend=backend)
+        if hidden_state is not None:
+            msg["hidden_state"] = hidden_state
+
+        attention_mask = _decode_tensor(msg.get("attention_mask"), backend=backend)
+        if attention_mask is not None:
+            msg["attention_mask"] = attention_mask
+
+        position_ids = _decode_tensor(msg.get("position_ids"), backend=backend)
+        if position_ids is not None:
+            msg["position_ids"] = position_ids
+
+        if "shard" not in msg:
+            msg["shard"] = _shard_payload(self.shard)
+
+        if tokenizer is not None and token_int is not None:
+            eos_id = getattr(tokenizer, "eos_token_id", None)
+            msg["end_token"] = bool(msg.get("end_token", False) or token_int == eos_id)
+        else:
+            msg.setdefault("end_token", False)
+
+        return msg
+
+    @staticmethod
+    def plan_shards(peers: Sequence[Any], model_name: str, total_layers: int) -> List[Shard]:
+        capacities = []
+        for peer in peers:
+            vram = _to_float(getattr(peer, "gpu_vram", 0.0))
+            ram = _to_float(getattr(peer, "cpu_ram", 0.0))
+            flops = getattr(peer, "gpu_flops", 0.0) if hasattr(peer, "gpu_flops") else 0.0
+            capacity = max(vram, ram, flops, 1.0)
+            capacities.append((peer, capacity))
+
+        total_cap = sum(cap for _, cap in capacities) or 1.0
+        shards: List[Shard] = []
+        start = 0
+        for peer, cap in capacities:
+            fraction = cap / total_cap
+            span = max(int(total_layers * fraction), 1)
+            end = min(start + span, total_layers)
+            shards.append(Shard(model_name=model_name, start_layer=start, end_layer=end, total_layers=total_layers))
+            try:
+                peer.shard = shards[-1]
+            except Exception:
+                pass
+            start = end
+        if shards:
+            shards[-1].end_layer = total_layers
+        return shards
+
+
+def _to_float(val: Any) -> float:
+    try:
+        if isinstance(val, str):
+            return float(val.lower().replace("gb", "").strip() or 0.0)
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def _sample_with_backend(*args: Any, **kwargs: Any):
+    # Distributed generation is tinygrad-based today, but resolve through backend utility
+    # so we don't hardcode tinygrad module paths in callers.
+    if args:
+        logits = args[0]
+        if torch is not None and isinstance(logits, torch.Tensor):
+            return backend_helpers_module("torch").sample(*args, **kwargs)
+        if isinstance(logits, tg.Tensor):
+            return backend_helpers_module("tinygrad").sample(*args, **kwargs)
+    try:
+        return backend_helpers_module().sample(*args, **kwargs)
+    except Exception:
+        return backend_helpers_module("tinygrad").sample(*args, **kwargs)
+
+
+def _encode_token_tensor(token: int) -> Dict[str, Any]:
+    buf = struct.pack("<i", int(token))
+    return {
+        "buffer": base64.b64encode(buf).decode("ascii"),
+        "shape": [1, 1],
+        "dtype": "int32",
+    }
+
+def _encode_tensor(tensor: Any) -> Dict[str, Any]:
+    if torch is not None and isinstance(tensor, torch.Tensor):
+        arr = tensor.detach().cpu().numpy()
+    elif hasattr(tensor, "numpy"):
+        arr = tensor.numpy()
+    else:
+        arr = np.asarray(tensor)
+    return {
+        "buffer": base64.b64encode(arr.tobytes()).decode("ascii"),
+        "shape": list(arr.shape),
+        "dtype": str(arr.dtype),
+    }
+
+
+def _decode_tensor(tensor_payload: Any, backend: str | None = None) -> Any | None:
+    if not isinstance(tensor_payload, dict):
+        return None
+    buf = tensor_payload.get("buffer")
+    if not buf:
+        return None
+    try:
+        raw = base64.b64decode(buf)
+    
+        dtype = _normalize_dtype(str(tensor_payload.get("dtype", "float32")))
+        arr = np.frombuffer(raw, dtype=np.dtype(dtype))
+        shape = tensor_payload.get("shape")
+
+        if shape:
+            arr = arr.reshape(shape)
+
+        arr = np.array(arr, copy=True)
+        selected_backend = str(backend or "").strip().lower()
+        if selected_backend == "torch" and torch is not None:
+            try:
+                tensor = torch.from_numpy(arr)
+            except Exception:
+                tensor = torch.from_numpy(arr.astype(np.float32))
+            target_device = _torch_target_device()
+            try:
+                tensor = tensor.to(device=target_device)
+            except Exception:
+                pass
+            return tensor
+        return tg.Tensor(arr)
+    except Exception:
+        return None
+
+
+def _scalar_int(value: Any, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if torch is not None and isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return default
+        return int(value.detach().cpu().reshape(-1)[0].item())
+    if isinstance(value, tg.Tensor):
+        try:
+            return int(value.item())
+        except Exception:
+            return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _next_token_tensor(token: int, like: Any) -> Any:
+    if torch is not None and isinstance(like, torch.Tensor):
+        return torch.tensor([[int(token)]], device=like.device, dtype=torch.long)
+    return tg.Tensor([[int(token)]], device=getattr(like, "device", None))
+
+
+def _append_attention_mask(attention_mask: Any) -> Any:
+    if torch is not None and isinstance(attention_mask, torch.Tensor):
+        return torch.cat(
+            (
+                attention_mask,
+                torch.ones(
+                    (attention_mask.shape[0], 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                ),
+            ),
+            dim=1,
+        )
+    return attention_mask.cat(
+        tg.Tensor.ones((attention_mask.shape[0], 1), device=attention_mask.device),
+        dim=1,
+    )
+
+
+def _position_ids_tensor(position: int, like: Any) -> Any:
+    if torch is not None and isinstance(like, torch.Tensor):
+        return torch.tensor([int(position)], device=like.device, dtype=torch.long)
+    return tg.Tensor([int(position)], device=getattr(like, "device", None))
+
+
+def _torch_target_device() -> str:
+    configured = str(get_backend_device("torch", default="cpu") or "cpu").strip().lower()
+    if configured in {"metal", "mps"}:
+        return "mps"
+    if configured.startswith("cuda"):
+        return configured
+    return "cpu"
+
+
+def _normalize_dtype(dtype: str) -> str:
+    lower = dtype.lower()
+    for candidate in (
+        "float16",
+        "bfloat16",
+        "float32",
+        "float64",
+        "int64",
+        "int32",
+        "int16",
+        "int8",
+        "uint8",
+    ):
+        if candidate in lower:
+            return candidate
+    return "float32"
+
+
+def _shard_payload(shard: Shard) -> Dict[str, Any]:
+    return {
+        "model_name": shard.model_name,
+        "start_layer": shard.start_layer,
+        "end_layer": shard.end_layer,
+        "total_layers": shard.total_layers,
+    }
