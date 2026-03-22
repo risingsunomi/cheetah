@@ -1,13 +1,13 @@
-# tiny-cheetah distributed AI
+# cheetah distributed AI
 from __future__ import annotations
 
 import argparse
 import atexit
 import os
 import sys
-from typing import Dict, Optional
+from typing import Optional
 
-from tiny_cheetah.tui import main_menu
+from cheetah.tui import main_menu
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -40,7 +40,7 @@ else:
     atexit.register(_cleanup_tinygrad_devices)
 
 
-class TinyCheetahApp(main_menu.MainMenu):
+class CheetahApp(main_menu.MainMenu):
     """Main menu app with optional training and chat defaults."""
 
     def __init__(
@@ -54,9 +54,9 @@ class TinyCheetahApp(main_menu.MainMenu):
         )
 
 
-def parse_cli_args(argv: list[str]) -> tuple[Dict[str, object], Optional[str], bool]:
+def parse_cli_args(argv: list[str]) -> tuple[Optional[str], bool]:
     parser = argparse.ArgumentParser(
-        description="Tiny Cheetah TUI launcher",
+        description="Cheetah TUI launcher",
         add_help=True
     )
     parser.add_argument(
@@ -91,7 +91,7 @@ def main():
     if not offline_mode:
         offline_mode = os.getenv("TC_OFFLINE_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
-    app = TinyCheetahApp(
+    app = CheetahApp(
         chat_default=chat_default,
         offline_mode=offline_mode,
     )
