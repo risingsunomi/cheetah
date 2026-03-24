@@ -25,28 +25,33 @@ class KVCache:
         self.cache_pos = 0
 
     def clear(self) -> None:
-        """Reset cached keys/values without dropping allocated tensor."""
-        self.cache_kv = tg.Tensor.zeros_like(self.cache_kv).contiguous().realize()
+        """Reset logical cache length without reallocating the buffer."""
         self.cache_pos = 0
+
+    def update_at(self, start_pos: int | tg.UOp, xk: tg.Tensor, xv: tg.Tensor) -> None:
+        """
+        Write into the cache at an explicit start position. TinyJit decode needs
+        the position to stay a runtime input instead of captured Python state.
+        """
+        _, S, Kv, D = xk.shape
+        assert Kv == self.num_kv_heads and D == self.head_dim, "KV shapes mismatch cache settings"
+        assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"dtype mismatch: {xk.dtype=}, {xv.dtype=}, cache={self.cache_kv.dtype}"
+
+        xk = xk.to(self.cache_kv.device).cast(self.cache_kv.dtype)
+        xv = xv.to(self.cache_kv.device).cast(self.cache_kv.dtype)
+        kv_stack = tg.Tensor.stack(xk, xv)
+        self.cache_kv[:, :, start_pos:start_pos + S, :, :].assign(kv_stack).realize()  # type: ignore[index]
+        if not isinstance(start_pos, tg.UOp):
+            self.cache_pos = max(self.cache_pos, int(start_pos) + S)
 
     def update(self, xk: tg.Tensor, xv: tg.Tensor) -> None:
         """
         xk, xv: [B, S, Kv, D]
         Appends to cache_kv along time dimension using shrink+assign.
         """
-        B, S, Kv, D = xk.shape
-        assert Kv == self.num_kv_heads and D == self.head_dim, "KV shapes mismatch cache settings"
+        S = xk.shape[1]
         assert (self.cache_pos + S) <= self.max_cache_len, f"seq len {S} exceeds max cache len {self.max_cache_len}"
-
-        # Ensure dtype matches
-        assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"dtype mismatch: {xk.dtype=}, {xv.dtype=}, cache={self.cache_kv.dtype}"
-
-        # stack K,V -> [2, B, S, Kv, D] and write into time slice
-        xk = xk.to(self.cache_kv.device).cast(self.cache_kv.dtype)
-        xv = xv.to(self.cache_kv.device).cast(self.cache_kv.dtype)
-        kv_stack = tg.Tensor.stack(xk, xv)
-        self.cache_kv.shrink((None, None, (self.cache_pos, self.cache_pos + S), None, None)).assign(kv_stack).realize()
-        self.cache_pos += S
+        self.update_at(self.cache_pos, xk, xv)
 
     def get(self) -> Tuple[tg.Tensor, tg.Tensor]:
         """
@@ -60,8 +65,15 @@ class KVCache:
                 tg.Tensor.zeros((B, 0, self.num_kv_heads, self.head_dim), device=self.cache_kv.device, dtype=self.cache_kv.dtype),
                 tg.Tensor.zeros((B, 0, self.num_kv_heads, self.head_dim), device=self.cache_kv.device, dtype=self.cache_kv.dtype),
             )
-        keys = self.cache_kv[0].shrink((None, (0, self.cache_pos), None, None))
-        values = self.cache_kv[1].shrink((None, (0, self.cache_pos), None, None))
+        return self.get_upto(self.cache_pos)
+
+    def get_upto(self, end_pos: int | tg.UOp) -> Tuple[tg.Tensor, tg.Tensor]:
+        """
+        Return cache contents up to an explicit end position. This keeps the
+        decode length symbolic under TinyJit.
+        """
+        keys = self.cache_kv[0, :, 0:end_pos, :, :]
+        values = self.cache_kv[1, :, 0:end_pos, :, :]
         return keys, values
 
     def serialize(self) -> dict:

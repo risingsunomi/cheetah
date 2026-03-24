@@ -45,18 +45,26 @@ class ModelEngine:
 
         if hidden_state is not None:
             position_ids = _position_ids_tensor(curr_pos, input_ids)
-            model_output = model(
-                None,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                hidden_state=hidden_state,
-            )
+            decode_hidden = getattr(model, "decode_hidden", None)
+            if callable(decode_hidden):
+                model_output = decode_hidden(hidden_state, start_pos=curr_pos)
+            else:
+                model_output = model(
+                    None,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    hidden_state=hidden_state,
+                )
         else:
             prev_token = _scalar_int(input_ids[:, -1], default=0)
             next_tok = _next_token_tensor(prev_token, input_ids)
             attention_mask = _append_attention_mask(attention_mask)
             position_ids = _position_ids_tensor(curr_pos, input_ids)
-            model_output = model(next_tok, attention_mask=attention_mask, position_ids=position_ids)
+            decode_token = getattr(model, "decode_token", None)
+            if callable(decode_token):
+                model_output = decode_token(next_tok, start_pos=curr_pos)
+            else:
+                model_output = model(next_tok, attention_mask=attention_mask, position_ids=position_ids)
 
         is_final = self.shard.end_layer == self.shard.total_layers - 1
         if not is_final:
@@ -304,7 +312,7 @@ def _append_attention_mask(attention_mask: Any) -> Any:
 def _position_ids_tensor(position: int, like: Any) -> Any:
     if torch is not None and isinstance(like, torch.Tensor):
         return torch.tensor([int(position)], device=like.device, dtype=torch.long)
-    return tg.Tensor([int(position)], device=getattr(like, "device", None))
+    return tg.Tensor([int(position)], device=getattr(like, "device", None), dtype=tg.dtypes.int32)
 
 
 def _torch_target_device() -> str:

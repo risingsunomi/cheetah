@@ -246,6 +246,9 @@ def generate(
     curr_pos: int = 0,
     verbose: bool = False
 ) -> list:
+    decode_token = getattr(model, "decode_token", None)
+    use_decode_fast_path = callable(decode_token)
+
     if hasattr(model, "reset_kv_cache"):
         model.reset_kv_cache()
     if hasattr(sample, "alpha_counter"):
@@ -323,22 +326,26 @@ def generate(
             break
 
         next_tok = tg.Tensor([[tok]], device=device)  # [B, 1]
-        # grow attention mask and use absolute position for the new token
-        attention_mask = attention_mask.cat(
-            tg.Tensor.ones((attention_mask.shape[0], 1), device=device), dim=1
-        )
-        position_ids = tg.Tensor([curr_pos], device=device)
 
         if verbose:
+            next_mask_len = curr_pos + 1
             print(
-                f"next_tok: {[next_tok.item()]}\n position_ids: {position_ids.tolist()}\n attention_mask_len: {attention_mask.shape[1]}"
+                f"next_tok: {[next_tok.item()]}\n start_pos: {curr_pos}\n attention_mask_len: {next_mask_len}"
             )
 
-        logits = model(
-            next_tok,
-            attention_mask=attention_mask,
-            position_ids=position_ids
-        )
+        if use_decode_fast_path:
+            logits = decode_token(next_tok, start_pos=curr_pos)
+        else:
+            # Non-JIT fallback keeps the original dynamic attention-mask path.
+            attention_mask = attention_mask.cat(
+                tg.Tensor.ones((attention_mask.shape[0], 1), device=device), dim=1
+            )
+            position_ids = tg.Tensor([curr_pos], device=device, dtype=tg.dtypes.int32)
+            logits = model(
+                next_tok,
+                attention_mask=attention_mask,
+                position_ids=position_ids
+            )
         next_logit = logits[:, -1, :].flatten()  # [B, V]
         tok_sample = sample(
             next_logit,

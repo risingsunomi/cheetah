@@ -349,9 +349,13 @@ def streaming_generate(
         )
 
     _raise_if_abort(abort_check)
+    if hasattr(model, "reset_kv_cache"):
+        model.reset_kv_cache()
     device = input_ids.device
     input_ids = input_ids.to(device)
     attention_mask = attention_mask.to(device)
+    decode_token = getattr(model, "decode_token", None)
+    use_decode_fast_path = callable(decode_token)
 
     out_tokens: list[int] = []
     curr_pos = attention_mask.shape[1] - 1
@@ -388,16 +392,19 @@ def streaming_generate(
             break
 
         next_tok = tg.Tensor([[tok]], device=device)
-        attention_mask = attention_mask.cat(
-            tg.Tensor.ones((attention_mask.shape[0], 1), device=device), dim=1
-        )
-        position_ids = tg.Tensor([curr_pos], device=device)
 
-        logits = model(
-            next_tok,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
+        if use_decode_fast_path:
+            logits = decode_token(next_tok, start_pos=curr_pos)
+        else:
+            attention_mask = attention_mask.cat(
+                tg.Tensor.ones((attention_mask.shape[0], 1), device=device), dim=1
+            )
+            position_ids = tg.Tensor([curr_pos], device=device, dtype=tg.dtypes.int32)
+            logits = model(
+                next_tok,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
         next_logit = logits[:, -1, :].flatten()
         tok = _sample_with_backend(
             next_logit,
@@ -448,6 +455,8 @@ def _streaming_generate_torch(
         raise RuntimeError("Torch tensor generation requested but torch is unavailable")
 
     _raise_if_abort(abort_check)
+    if hasattr(model, "reset_kv_cache"):
+        model.reset_kv_cache()
     device = get_backend_device("torch", default="cpu")
     assert device is not None
     input_ids = input_ids.to(device=device, dtype=torch.long)

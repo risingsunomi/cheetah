@@ -10,10 +10,22 @@ from unittest.mock import patch
 
 from textual.widgets import Label
 
+try:
+    import tinygrad as tg
+except Exception:
+    tg = None
+
+try:
+    import torch
+except Exception:
+    torch = None
+
 from cheetah.tui.train_menu import (
+    Batch,
     TrainingCancelled,
     TrainingProcess,
     TrainScreen,
+    _train_epoch,
     _build_training_namespace,
     _ensure_required_keys,
     _prepare_dataset_corpus,
@@ -39,6 +51,39 @@ class _TokenizerStub:
     def encode(self, text: str, add_special_tokens: bool = False):
         del add_special_tokens
         return [1, 2, 3, 4, 5] if text.strip() else []
+
+
+if torch is not None:
+    class _TorchTrainModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4))
+            self.decode_calls = 0
+
+        def forward(self, x, attention_mask=None, position_ids=None):
+            del attention_mask, position_ids
+            return self.weight.view(1, 1, -1).expand(x.shape[0], x.shape[1], -1)
+
+        def decode_token(self, *args, **kwargs):
+            del args, kwargs
+            self.decode_calls += 1
+            raise AssertionError("torch training should not use decode_token")
+
+
+if tg is not None:
+    class _TinygradTrainModel:
+        def __init__(self) -> None:
+            self.weight = tg.Tensor.zeros(4, requires_grad=True)
+            self.decode_calls = 0
+
+        def __call__(self, x, attention_mask=None, position_ids=None):
+            del attention_mask, position_ids
+            return self.weight.reshape(1, 1, -1).expand((x.shape[0], x.shape[1], self.weight.shape[0]))
+
+        def decode_token(self, *args, **kwargs):
+            del args, kwargs
+            self.decode_calls += 1
+            raise AssertionError("tinygrad training should not use decode_token")
 
 
 class TestTrainScreen(unittest.TestCase):
@@ -335,6 +380,42 @@ class TestTrainScreen(unittest.TestCase):
         self.assertEqual(node.settings["max-dataset-entries"], "100")
         self.assertEqual(node.settings["epochs"], "2")
         self.assertNotIn("lr", node.settings)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_train_epoch_torch_uses_forward_path_and_restores_mode(self) -> None:
+        model = _TorchTrainModel()
+        model.eval()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+        batch = Batch(
+            input_ids=torch.tensor([[0, 1]], dtype=torch.long),
+            labels=torch.tensor([[1, 2]], dtype=torch.long),
+            attention_mask=torch.ones((1, 2), dtype=torch.long),
+            position_ids=torch.tensor([[0, 1]], dtype=torch.long),
+        )
+
+        loss = _train_epoch(model, optimizer, [batch], grad_accum=1, backend="torch")
+
+        self.assertTrue(loss >= 0.0)
+        self.assertFalse(model.training)
+        self.assertEqual(model.decode_calls, 0)
+
+    @unittest.skipIf(tg is None, "tinygrad is not installed")
+    def test_train_epoch_tinygrad_uses_forward_path_and_restores_training_flag(self) -> None:
+        model = _TinygradTrainModel()
+        optimizer = tg.nn.optim.Adam([model.weight], lr=0.1)
+        batch = Batch(
+            input_ids=tg.Tensor([[0, 1]], dtype=tg.dtypes.int32),
+            labels=tg.Tensor([[1, 2]], dtype=tg.dtypes.int32),
+            attention_mask=tg.Tensor([[1, 1]], dtype=tg.dtypes.int32),
+            position_ids=tg.Tensor([[0, 1]], dtype=tg.dtypes.int32),
+        )
+        original_training = tg.Tensor.training
+
+        loss = _train_epoch(model, optimizer, [batch], grad_accum=1, backend="tinygrad")
+
+        self.assertTrue(loss >= 0.0)
+        self.assertEqual(model.decode_calls, 0)
+        self.assertEqual(tg.Tensor.training, original_training)
 
 
 if __name__ == "__main__":

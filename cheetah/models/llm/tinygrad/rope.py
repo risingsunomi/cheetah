@@ -105,7 +105,8 @@ class RotaryPositionalEmbedding:
         self,
         q: tg.Tensor, # [B, S, Hq, D]
         k: tg.Tensor, # [B, S, Hk, D]
-        position_ids: Optional[tg.Tensor] = None
+        position_ids: Optional[tg.Tensor] = None,
+        start_pos: int | tg.UOp | None = None,
     ) -> Tuple[tg.Tensor, tg.Tensor]:
         if not self.cache_built:
             self.build_rope_cache(q.device)
@@ -121,8 +122,14 @@ class RotaryPositionalEmbedding:
         q_pairs = q.reshape(*q.shape[0:-1], -1, 2).float()
         k_pairs = k.reshape(*k.shape[0:-1], -1, 2).float()
 
-        # select cos/sin for the provided positions from cache
-        cs = self.cache[:, position_ids.cast(tg.dtypes.default_int), :, :, :]
+        if start_pos is not None:
+            cs = self.cache[:, start_pos:start_pos + q.shape[1], :, :, :]  # type: ignore[index]
+        else:
+            if position_ids is None:
+                position_ids = tg.Tensor.arange(q.shape[1], device=q.device)
+            elif position_ids.ndim == 2:
+                position_ids = position_ids[0]
+            cs = self.cache[:, position_ids.cast(tg.dtypes.default_int), :, :, :]
 
         # split into cos/sin and apply rotation via complex multiply
         C, D_ = cs[..., 0:1], cs[..., 1:2]                      # [1, S, 1, D/2, 1]

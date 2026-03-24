@@ -58,6 +58,29 @@ class TestMultiHeadAttention(unittest.TestCase):
         out = mha(x, attention_mask=mask, position_ids=pos).realize().numpy()
         np.testing.assert_allclose(out[0, 0], np.array([1.0, 0.0], dtype=np.float32), atol=1e-5, rtol=1e-5)
 
+    def test_training_mode_bypasses_and_clears_kv_cache(self):
+        mha = MultiHeadAttention(config=self.config, is_causal=True)
+        original_training = tg.Tensor.training
+        try:
+            tg.Tensor.training = False
+            x = tg.Tensor.randn(2, 4, self.config["embed_dim"])
+            mask = tg.Tensor.ones((2, 4))
+            pos = tg.Tensor.arange(4).reshape(1, 4).expand((2, 4))
+            _ = mha(x, attention_mask=mask, position_ids=pos).realize()
+
+            self.assertIsNotNone(mha.kv_cache)
+            assert mha.kv_cache is not None
+            self.assertGreater(mha.kv_cache.cache_pos, 0)
+
+            tg.Tensor.training = True
+            train_out = mha(x, attention_mask=mask, position_ids=pos).realize()
+
+            self.assertEqual(tuple(train_out.shape), (2, 4, self.config["embed_dim"]))
+            assert mha.kv_cache is not None
+            self.assertEqual(mha.kv_cache.cache_pos, 0)
+        finally:
+            tg.Tensor.training = original_training
+
 
 if __name__ == "__main__":
     unittest.main()
