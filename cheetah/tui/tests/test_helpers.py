@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import tinygrad as tg
+
 from cheetah.tui import helpers
 
 
@@ -31,6 +33,7 @@ class _DummyTokenizer:
         self.chat_template = chat_template
         self.calls: list[dict[str, object]] = []
         self.all_special_tokens = ["<s>", "</s>", "<think>", "</think>"]
+        self.eos_token_id = 1
 
     def apply_chat_template(self, messages, *, add_generation_prompt: bool, tokenize: bool, **kwargs):
         self.calls.append(
@@ -42,6 +45,50 @@ class _DummyTokenizer:
             }
         )
         return "template"
+
+
+class _StreamingDummyModel:
+    def __init__(self) -> None:
+        self.prefill_calls = 0
+        self.decode_calls = 0
+        self.reset_calls = 0
+        self.start_positions: list[int] = []
+
+    def reset_kv_cache(self) -> None:
+        self.reset_calls += 1
+
+    def __call__(
+        self,
+        x: tg.Tensor,
+        attention_mask: tg.Tensor | None = None,
+        position_ids: tg.Tensor | None = None,
+        hidden_state: tg.Tensor | None = None,
+    ) -> tg.Tensor:
+        del hidden_state
+        if attention_mask is None or position_ids is None:
+            raise AssertionError("prefill should include attention_mask and position_ids")
+        self.prefill_calls += 1
+        batch_size, seq_len = x.shape
+        logits = tg.Tensor.zeros((batch_size, seq_len, 4), device=x.device)
+        logits = logits + tg.Tensor([[[0.0, 0.0, 1.0, 0.0]]], device=x.device)
+        return logits
+
+    def decode_token(
+        self,
+        x: tg.Tensor,
+        position_ids: tg.Tensor | None = None,
+        *,
+        start_pos: int | tg.UOp | None = None,
+    ) -> tg.Tensor:
+        del position_ids
+        if isinstance(start_pos, tg.UOp):
+            raise AssertionError("streaming_generate should pass a concrete start_pos to the model wrapper")
+        self.decode_calls += 1
+        self.start_positions.append(int(start_pos))
+        batch_size, seq_len = x.shape
+        logits = tg.Tensor.zeros((batch_size, seq_len, 4), device=x.device)
+        logits = logits + tg.Tensor([[[0.0, 1.0, 0.0, 0.0]]], device=x.device)
+        return logits
 
 
 class TestMemoryAbortReason(unittest.TestCase):
@@ -174,6 +221,30 @@ class TestThinkingHelpers(unittest.TestCase):
 
         self.assertEqual(thinking, "")
         self.assertEqual(final, "Just the answer")
+
+
+class TestStreamingGenerateTinygrad(unittest.TestCase):
+    def test_streaming_generate_uses_decode_token_fast_path(self) -> None:
+        model = _StreamingDummyModel()
+        tokenizer = _DummyTokenizer(chat_template="")
+
+        out, elapsed = helpers.streaming_generate(
+            model,
+            input_ids=tg.Tensor([[10, 11]]),
+            attention_mask=tg.Tensor([[1, 1]]),
+            tokenizer=tokenizer,
+            max_new_tokens=4,
+            temp=0.0,
+            top_k=0,
+            top_p=1.0,
+        )
+
+        self.assertEqual(out, [2, 1])
+        self.assertGreaterEqual(elapsed, 0.0)
+        self.assertEqual(model.reset_calls, 1)
+        self.assertEqual(model.prefill_calls, 1)
+        self.assertEqual(model.decode_calls, 1)
+        self.assertEqual(model.start_positions, [2])
 
 
 if __name__ == "__main__":

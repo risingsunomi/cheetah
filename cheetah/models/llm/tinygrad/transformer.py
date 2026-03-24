@@ -10,7 +10,8 @@ class TransformerBlock:
         config: dict,
         layer_idx: int | None = None,
     ):
-        self.input_layernorm = tg.nn.RMSNorm(config["embed_dim"])
+        norm_eps = config.get("norm_eps", 1e-6)
+        self.input_layernorm = tg.nn.RMSNorm(config["embed_dim"], eps=norm_eps)
         if bool(config.get("moe")):
             self.mlp = MOEMLP(config)
         else:
@@ -24,14 +25,14 @@ class TransformerBlock:
             config=config,
             is_causal=any("CausalLM" in arch for arch in config.get("architectures", []))
         )
-        self.post_attention_layernorm = tg.nn.RMSNorm(config.get("embed_dim"))
+        self.post_attention_layernorm = tg.nn.RMSNorm(config.get("embed_dim"), eps=norm_eps)
 
         self.attn_scale = config.get("attn_scale")
         self.mlp_scale = config.get("mlp_scale")
 
-    def __call__(self, x, attention_mask, position_ids):
+    def __call__(self, x, attention_mask, position_ids, start_pos=None):
         h = self.input_layernorm(x)
-        attn_out = self.self_attn(h, attention_mask, position_ids)
+        attn_out = self.self_attn(h, attention_mask, position_ids, start_pos=start_pos)
 
         if self.attn_scale:
             x = x + self.attn_scale(attn_out)

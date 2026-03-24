@@ -3,6 +3,24 @@ import tinygrad as tg
 from ...shard import Shard
 from .transformer import TransformerBlock
 
+
+def _resolve_start_pos(
+    start_pos: int | tg.UOp | None,
+    position_ids: tg.Tensor | None,
+) -> int | tg.UOp:
+    if start_pos is not None:
+        return start_pos
+    if position_ids is None:
+        raise ValueError("decode path requires start_pos or scalar position_ids")
+    if len(position_ids.shape) == 2:
+        if position_ids.shape != (1, 1):
+            raise ValueError("decode path requires scalar position_ids")
+        return int(position_ids[0, 0].item())
+    if len(position_ids.shape) == 1 and position_ids.shape[0] == 1:
+        return int(position_ids[0].item())
+    raise ValueError("decode path requires scalar position_ids")
+
+
 class Model:
     def __init__(
         self,
@@ -21,7 +39,7 @@ class Model:
             embed_size=self.config["embed_dim"]
         )
 
-        self.norm = tg.nn.LayerNorm(self.config["embed_dim"], eps=self.config["norm_eps"])
+        self.norm = tg.nn.RMSNorm(self.config["embed_dim"], eps=self.config["norm_eps"])
 
         self.layers = [
             TransformerBlock(self.config, layer_idx=layer_idx)
@@ -37,6 +55,16 @@ class Model:
         if use_tied:
             self.output.weight = self.embed_tokens.weight
 
+        # TinyJit only supports fixed input signatures, so keep it on the
+        # single-token decode path instead of the full variable-length forward.
+        self._decode_start_pos = tg.UOp.variable(
+            "start_pos",
+            0,
+            max(int(self.config["max_seq_len"]) - 1, 0),
+        )
+        self._decode_token_jit = tg.TinyJit(self._decode_token_impl)
+        self._decode_hidden_jit = tg.TinyJit(self._decode_hidden_impl)
+
     def reset_kv_cache(self) -> None:
         for layer in self.layers:
             if layer is None:
@@ -44,13 +72,23 @@ class Model:
             attn = getattr(layer, "self_attn", None)
             if attn is not None and getattr(attn, "kv_cache", None) is not None:
                 attn.kv_cache.clear()
-    
-    def __call__(
+
+    def reset_decode_jit(self) -> None:
+        # Keep TinyJit captures alive across generations. Clearing the KV cache
+        # is enough for a fresh decode; recapturing every turn adds avoidable
+        # warmup cost.
+        for jit_runner in (self._decode_token_jit, self._decode_hidden_jit):
+            reset = getattr(jit_runner, "reset", None)
+            if callable(reset):
+                reset()
+
+    def _forward_impl(
         self,
         x,
         position_ids: tg.Tensor | None=None,
         attention_mask: tg.Tensor | None=None,
         hidden_state: tg.Tensor | None = None,
+        start_pos: int | tg.UOp | None = None,
     ):
         if hidden_state is None:
             x = self.embed_tokens(x)
@@ -58,10 +96,65 @@ class Model:
             x = hidden_state
             
         for layer in self.layers:
-            x = layer(x, attention_mask, position_ids)
+            x = layer(x, attention_mask, position_ids, start_pos=start_pos)
 
         if self.shard.end_layer == self.shard.total_layers-1:
             x = self.norm(x)
             x = self.output(x)
         
         return x
+
+    def _decode_token_impl(self, x: tg.Tensor, start_pos: int | tg.UOp) -> tg.Tensor:
+        return self._forward_impl(x, attention_mask=None, start_pos=start_pos).realize()
+
+    def decode_token(
+        self,
+        x: tg.Tensor,
+        position_ids: tg.Tensor | None = None,
+        *,
+        start_pos: int | tg.UOp | None = None,
+    ) -> tg.Tensor:
+        resolved_start_pos = _resolve_start_pos(start_pos, position_ids)
+        if len(x.shape) == 2 and x.shape[1] == 1:
+            if not isinstance(resolved_start_pos, tg.UOp):
+                resolved_start_pos = self._decode_start_pos.bind(int(resolved_start_pos))
+            return self._decode_token_jit(x, resolved_start_pos)
+        return self._decode_token_impl(x, resolved_start_pos)
+
+    def _decode_hidden_impl(self, hidden_state: tg.Tensor, start_pos: int | tg.UOp) -> tg.Tensor:
+        return self._forward_impl(
+            None,
+            attention_mask=None,
+            hidden_state=hidden_state,
+            start_pos=start_pos,
+        ).realize()
+
+    def decode_hidden(
+        self,
+        hidden_state: tg.Tensor,
+        position_ids: tg.Tensor | None = None,
+        *,
+        start_pos: int | tg.UOp | None = None,
+    ) -> tg.Tensor:
+        resolved_start_pos = _resolve_start_pos(start_pos, position_ids)
+        if len(hidden_state.shape) == 3 and hidden_state.shape[1] == 1:
+            if not isinstance(resolved_start_pos, tg.UOp):
+                resolved_start_pos = self._decode_start_pos.bind(int(resolved_start_pos))
+            return self._decode_hidden_jit(hidden_state, resolved_start_pos)
+        return self._decode_hidden_impl(hidden_state, resolved_start_pos)
+
+    def __call__(
+        self,
+        x,
+        position_ids: tg.Tensor | None=None,
+        attention_mask: tg.Tensor | None=None,
+        hidden_state: tg.Tensor | None = None,
+        start_pos: int | tg.UOp | None = None,
+    ):
+        return self._forward_impl(
+            x,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            hidden_state=hidden_state,
+            start_pos=start_pos,
+        )

@@ -1,6 +1,7 @@
 import unittest
 
 import tinygrad as tg
+import numpy as np
 
 from cheetah.models.llm.tinygrad.kv_cache import KVCache
 
@@ -60,7 +61,28 @@ class TestKVCache(unittest.TestCase):
         keys_rep = keys.transpose(1, 2).reshape(B, Kv, 1, T, D).expand((B, Kv, q_per_kv, T, D)).flatten(1, 2)
         self.assertEqual(keys_rep.shape, (B, Kv * q_per_kv, T, D))
 
+    def test_clear_resets_logical_length_without_reallocating(self):
+        k = tg.Tensor.randn(self.B, 2, self.Kv, self.D)
+        v = tg.Tensor.randn(self.B, 2, self.Kv, self.D)
+        self.cache.update(k, v)
+
+        original_tensor = self.cache.cache_kv
+        self.cache.clear()
+
+        self.assertIs(self.cache.cache_kv, original_tensor)
+        self.assertEqual(self.cache.cache_pos, 0)
+        empty_k, empty_v = self.cache.get()
+        self.assertEqual(empty_k.shape, (self.B, 0, self.Kv, self.D))
+        self.assertEqual(empty_v.shape, (self.B, 0, self.Kv, self.D))
+
+        fresh_k = tg.Tensor.ones((self.B, 1, self.Kv, self.D))
+        fresh_v = tg.Tensor.zeros((self.B, 1, self.Kv, self.D))
+        self.cache.update(fresh_k, fresh_v)
+        keys, values = self.cache.get()
+
+        np.testing.assert_allclose(keys.numpy(), fresh_k.numpy())
+        np.testing.assert_allclose(values.numpy(), fresh_v.numpy())
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -90,8 +90,9 @@ class MultiHeadAttention:
                 config["rope_theta"]
             )
 
-        self.k_norm = tg.nn.RMSNorm(self.head_dim) if config["qk_norm"] else None
-        self.q_norm = tg.nn.RMSNorm(self.head_dim) if config["qk_norm"] else None
+        norm_eps = config.get("norm_eps", 1e-6)
+        self.k_norm = tg.nn.RMSNorm(self.head_dim, eps=norm_eps) if config["qk_norm"] else None
+        self.q_norm = tg.nn.RMSNorm(self.head_dim, eps=norm_eps) if config["qk_norm"] else None
 
         self.q_proj = tg.nn.Linear(
             self.embed_dim,
@@ -119,6 +120,7 @@ class MultiHeadAttention:
         x: tg.Tensor,
         attention_mask: Optional[tg.Tensor] = None,
         position_ids: Optional[tg.Tensor] = None,
+        start_pos: int | tg.UOp | None = None,
     ) -> tg.Tensor:
         """
         Written for purely self attention so missing cross attention
@@ -136,9 +138,9 @@ class MultiHeadAttention:
         k = k.reshape(batch_size, x_seq_len, self.num_kv_heads, self.head_dim)
         v = v.reshape(batch_size, x_seq_len, self.num_kv_heads, self.head_dim)
 
-        if position_ids is None:
+        if position_ids is None and start_pos is None:
             position_ids = tg.Tensor.arange(x_seq_len, device=x.device)
-        elif position_ids.ndim == 2:
+        elif position_ids is not None and position_ids.ndim == 2:
             position_ids = position_ids[0]
 
         if self.q_norm:
@@ -147,7 +149,7 @@ class MultiHeadAttention:
         if self.k_norm:
             k = self.k_norm(k)
 
-        q, k = self.pos_embeddings(q, k, position_ids)
+        q, k = self.pos_embeddings(q, k, position_ids=position_ids, start_pos=start_pos)
 
         # initialize cache with correct dtype/device lazily
         if self.kv_cache is None:
@@ -161,9 +163,17 @@ class MultiHeadAttention:
                 device=x.device,
             )
 
-        # Update KV cache using pre-transpose K/V: [B, S, Kv, D]
-        self.kv_cache.update(k, v)
-        k, v = self.kv_cache.get()  # [B, T, Kv, D]
+        if tg.Tensor.training:
+            if self.kv_cache is not None and self.kv_cache.cache_pos != 0:
+                self.kv_cache.clear()
+        else:
+            # Update KV cache using pre-transpose K/V: [B, S, Kv, D]
+            if start_pos is not None:
+                self.kv_cache.update_at(start_pos, k, v)
+                k, v = self.kv_cache.get_upto(start_pos + x_seq_len)
+            else:
+                self.kv_cache.update(k, v)
+                k, v = self.kv_cache.get()  # [B, T, Kv, D]
 
         # transpose for SDPA
         # q: [B, H, S, D], k/v: [B, Kv, T, D]
@@ -187,13 +197,17 @@ class MultiHeadAttention:
                 k = (k.reshape(B, Kv, 1, T, D) + zeros_k).flatten(1, 2)
                 v = (v.reshape(B, Kv, 1, T, D) + zeros_v).flatten(1, 2)
 
-        attn_mask = _prepare_attention_mask(
-            attention_mask,
-            q,
-            key_len=k.shape[-2],
-            is_causal=self.is_causal,
-        )
-        use_causal = self.is_causal if attn_mask is None else False
+        if start_pos is not None and attention_mask is None and x_seq_len == 1:
+            attn_mask = None
+            use_causal = False
+        else:
+            attn_mask = _prepare_attention_mask(
+                attention_mask,
+                q,
+                key_len=k.shape[-2],
+                is_causal=self.is_causal,
+            )
+            use_causal = self.is_causal if attn_mask is None else False
         attn_out = tg.Tensor.scaled_dot_product_attention(
             q,
             k,
