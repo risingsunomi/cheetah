@@ -170,12 +170,13 @@ class TestModelConfig(unittest.TestCase):
 
         c = model_config.config
         self.assertIsNone(c["temperature"])
+        self.assertIsNone(c["max_new_tokens"])
         self.assertIsNone(c["top_k"])
         self.assertIsNone(c["top_p"])
         self.assertIsNone(c["repetition_penalty"])
         self.assertEqual(c["eos_token_id"], [200002, 199999, 200012])
 
-    def test_load_generation_config_reads_repetition_penalty(self):
+    def test_load_generation_config_reads_generation_limits(self):
         payload = {
             "model_type": "qwen2",
             "hidden_size": 128,
@@ -188,6 +189,7 @@ class TestModelConfig(unittest.TestCase):
         }
         gen_payload = {
             "temperature": 0.7,
+            "max_new_tokens": 512,
             "top_k": 20,
             "top_p": 0.8,
             "repetition_penalty": 1.05,
@@ -203,6 +205,7 @@ class TestModelConfig(unittest.TestCase):
             model_config.load(cfg)
             model_config.load_generation_config(gen_cfg)
 
+        self.assertEqual(model_config.config["max_new_tokens"], 512)
         self.assertEqual(model_config.config["repetition_penalty"], 1.05)
 
 

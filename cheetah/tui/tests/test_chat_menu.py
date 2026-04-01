@@ -1,5 +1,5 @@
-import unittest
 from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 
 from cheetah.tui.chat_menu import ChatScreen
@@ -30,17 +30,78 @@ class TestChatScreenThinkingRender(unittest.TestCase):
 
 
 class TestChatScreenGenerationLimits(unittest.TestCase):
-    def test_response_reserve_tokens_accepts_string_env(self) -> None:
+    def test_response_reserve_tokens_defaults_to_400(self) -> None:
         screen = ChatScreen(peer_client=object())
 
-        with patch.dict("os.environ", {"TC_MAX_RESP_LEN": "192"}, clear=False):
-            self.assertEqual(screen._response_reserve_tokens(512), 192)
+        self.assertEqual(screen._response_reserve_tokens(512), 400)
 
-    def test_response_reserve_tokens_falls_back_on_invalid_env(self) -> None:
+    def test_response_reserve_tokens_uses_model_generation_limit(self) -> None:
         screen = ChatScreen(peer_client=object())
+        screen._model_config = {"max_new_tokens": 640, "max_seq_len": 2048}
 
-        with patch.dict("os.environ", {"TC_MAX_RESP_LEN": "not-an-int"}, clear=False):
-            self.assertEqual(screen._response_reserve_tokens(512), 192)
+        self.assertEqual(screen._response_reserve_tokens(1024), 640)
+
+    def test_response_reserve_tokens_falls_back_on_invalid_model_config(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._model_config = {"max_new_tokens": "not-an-int", "max_seq_len": 2048}
+
+        self.assertEqual(screen._response_reserve_tokens(512), 400)
+
+    def test_effective_gen_config_exposes_max_new_tokens(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._model_config = {"max_new_tokens": 320, "max_seq_len": 2048}
+
+        self.assertEqual(screen._effective_gen_config()["max_new_tokens"], 320)
+
+    def test_response_reserve_tokens_prefers_chat_gen_override(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._model_config = {"max_new_tokens": 192, "max_seq_len": 2048}
+        screen._gen_overrides["max_new_tokens"] = 384
+
+        self.assertEqual(screen._response_reserve_tokens(512), 384)
+
+    def test_response_reserve_tokens_clamps_to_context_window(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._gen_overrides["max_new_tokens"] = 2048
+
+        self.assertEqual(screen._response_reserve_tokens(128), 127)
+
+    def test_model_change_resets_max_new_tokens_override(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._model_id = "old-model"
+        screen._gen_overrides["max_new_tokens"] = 768
+        screen._gen_overrides["temperature"] = 0.2
+
+        with patch("asyncio.create_task", side_effect=lambda coro: coro.close()):
+            screen._handle_model_selected("new-model")
+
+        self.assertNotIn("max_new_tokens", screen._gen_overrides)
+        self.assertEqual(screen._gen_overrides["temperature"], 0.2)
+
+
+class TestChatScreenModelLoad(unittest.IsolatedAsyncioTestCase):
+    async def test_start_model_load_resets_max_new_tokens_override_and_logs_effective_config(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._gen_overrides["max_new_tokens"] = 128
+        screen._gen_overrides["temperature"] = 0.3
+        screen._gen_overrides["enable_thinking"] = False
+        screen._set_load_button_enabled = lambda enabled: None
+        log_messages: list[str] = []
+        screen._log_sys_msg = lambda message, **kwargs: log_messages.append(message)
+
+        async def fake_load_model():
+            return object(), {"max_seq_len": 640}, object(), "/tmp/model", 0.5
+
+        screen._load_model = fake_load_model
+
+        with patch("cheetah.tui.chat_menu.detect_quantization_mode", return_value=(False, "standard")):
+            await screen._start_model_load()
+
+        self.assertNotIn("max_new_tokens", screen._gen_overrides)
+        self.assertEqual(screen._gen_overrides["temperature"], 0.3)
+        self.assertEqual(screen._effective_gen_config()["max_new_tokens"], 400)
+        self.assertIn("Model ready in 0.5s. Backend: tinygrad. Mode: standard.", log_messages)
+        self.assertIn("Gen config updated: context_window=640, max_new_tokens=400, temp=0.3", log_messages[1])
 
 
 class TestChatScreenLogSelection(unittest.IsolatedAsyncioTestCase):

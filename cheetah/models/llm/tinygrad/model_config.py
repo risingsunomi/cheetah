@@ -86,6 +86,7 @@ class ModelConfig:
             "swiglu_limit": float(base_config.get("swiglu_limit", 7.0)),
             "quantization_config": base_config.get("quantization_config"),
             "temperature": None,
+            "max_new_tokens": None,
             "top_k": None,
             "top_p": None,
             "repetition_penalty": None,
@@ -147,6 +148,10 @@ class ModelConfig:
         elif "temperature" in gen_config:
             temp = gen_config["temperature"]
             self.config["temperature"] = None if temp is None else float(temp)
+
+        if "max_new_tokens" in gen_config:
+            max_new_tokens = gen_config["max_new_tokens"]
+            self.config["max_new_tokens"] = None if max_new_tokens is None else int(max_new_tokens)
 
         if os.getenv("TC_TOP_K") is not None:
             self.config["top_k"] = int(os.getenv("TC_TOP_K"))
