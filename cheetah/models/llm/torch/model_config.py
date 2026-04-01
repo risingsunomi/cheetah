@@ -143,6 +143,7 @@ class ModelConfig:
             "mamba_proj_bias": bool(base_config.get("mamba_proj_bias", False)),
             "chunk_size": int(base_config.get("chunk_size", 256) or 256),
             "temperature": None,
+            "max_new_tokens": None,
             "top_k": None,
             "top_p": None,
             "repetition_penalty": None,
@@ -208,6 +209,10 @@ class ModelConfig:
         elif "temperature" in gen_config:
             temp = gen_config["temperature"]
             self.config["temperature"] = None if temp is None else float(temp)
+
+        if "max_new_tokens" in gen_config:
+            max_new_tokens = gen_config["max_new_tokens"]
+            self.config["max_new_tokens"] = None if max_new_tokens is None else int(max_new_tokens)
 
         if os.getenv("TC_TOP_K") is not None:
             self.config["top_k"] = int(os.getenv("TC_TOP_K"))

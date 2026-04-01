@@ -58,7 +58,7 @@ from cheetah.logging_utils import get_logger
 logger = get_logger(__name__)
 MAX_RESTORED_MESSAGES = 20
 MAX_SEQ_LEN = 2048
-MAX_RESP_LEN = 192
+MAX_RESP_LEN = 400
 
 class ChatModelSelected(Message):
     def __init__(self, sender: MessagePump, model_id: str) -> None:
@@ -218,6 +218,7 @@ class ChatScreen(Screen[None]):
     def _open_gen_config(self) -> None:
         effective = self._effective_gen_config()
         modal = GenerationConfigModal(
+            max_new_tokens=int(effective["max_new_tokens"]),
             temperature=effective["temperature"],
             top_k=int(effective["top_k"]),
             top_p=effective["top_p"],
@@ -232,15 +233,22 @@ class ChatScreen(Screen[None]):
         if result is None:
             return
         self._gen_overrides.update(result)
+        self._log_effective_gen_config()
+
+    def _log_effective_gen_config(self) -> None:
+        effective = self._effective_gen_config()
+        context_window = self._context_window_tokens()
         self._log_sys_msg(
             "Gen config updated: "
-            f"temp={self._gen_overrides.get('temperature')}, "
-            f"top_k={self._gen_overrides.get('top_k')}, "
-            f"top_p={self._gen_overrides.get('top_p')}, "
-            f"repetition_penalty={self._gen_overrides.get('repetition_penalty')}, "
-            f"alpha_f={self._gen_overrides.get('alpha_f')}, "
-            f"alpha_p={self._gen_overrides.get('alpha_p')}, "
-            f"thinking={self._gen_overrides.get('enable_thinking')}",
+            f"context_window={context_window}, "
+            f"max_new_tokens={int(effective['max_new_tokens'])}, "
+            f"temp={float(effective['temperature'])}, "
+            f"top_k={int(effective['top_k'])}, "
+            f"top_p={float(effective['top_p'])}, "
+            f"repetition_penalty={float(effective['repetition_penalty'])}, "
+            f"alpha_f={float(effective['alpha_f'])}, "
+            f"alpha_p={float(effective['alpha_p'])}, "
+            f"thinking={bool(effective['enable_thinking'])}",
             persist=False,
         )
 
@@ -263,7 +271,17 @@ class ChatScreen(Screen[None]):
             except (TypeError, ValueError):
                 return default
 
+        thinking_override = self._gen_overrides.get("enable_thinking")
+        if thinking_override is None:
+            thinking_enabled = default_enable_thinking(
+                model_path=self._model_cache_path,
+                tokenizer=self._tokenizer,
+            )
+        else:
+            thinking_enabled = bool(thinking_override)
+
         return {
+            "max_new_tokens": _as_int(self._gen_overrides.get("max_new_tokens"), self._default_max_new_tokens()),
             "temperature": _as_float(self._gen_overrides.get("temperature", config.get("temperature")), 1.0),
             "top_k": _as_int(self._gen_overrides.get("top_k", config.get("top_k")), 0),
             "top_p": _as_float(self._gen_overrides.get("top_p", config.get("top_p")), 0.8),
@@ -273,15 +291,7 @@ class ChatScreen(Screen[None]):
             ),
             "alpha_f": _as_float(self._gen_overrides.get("alpha_f", 0.0), 0.0),
             "alpha_p": _as_float(self._gen_overrides.get("alpha_p", 0.0), 0.0),
-            "enable_thinking": bool(
-                self._gen_overrides.get(
-                    "enable_thinking",
-                    default_enable_thinking(
-                        model_path=self._model_cache_path,
-                        tokenizer=self._tokenizer,
-                    ),
-                )
-            ),
+            "enable_thinking": thinking_enabled,
         }
 
     def _context_window_tokens(self) -> int:
@@ -298,12 +308,16 @@ class ChatScreen(Screen[None]):
 
         return context_window
 
-    def _response_reserve_tokens(self, context_window: int) -> int:
-        reserve = os.getenv("TC_MAX_RESP_LEN", MAX_RESP_LEN)
+    def _default_max_new_tokens(self) -> int:
+        config = self._model_config if isinstance(self._model_config, dict) else {}
         try:
-            reserve_int = int(reserve)
+            reserve_int = int(config.get("max_new_tokens", MAX_RESP_LEN))
         except (TypeError, ValueError):
             reserve_int = MAX_RESP_LEN
+        return max(1, reserve_int)
+
+    def _response_reserve_tokens(self, context_window: int) -> int:
+        reserve_int = int(self._effective_gen_config()["max_new_tokens"])
         return max(1, min(reserve_int, context_window - 1))
 
     def _token_count_for_messages(self, messages: List[dict[str, str]]) -> int:
@@ -390,6 +404,7 @@ class ChatScreen(Screen[None]):
         if not result:
             return
         if result != self._model_id:
+            self._gen_overrides.pop("max_new_tokens", None)
             self._model = None
             self._model_config = None
             self._tokenizer = None
@@ -1142,6 +1157,7 @@ class ChatScreen(Screen[None]):
             if self._chat_input is not None:
                 self._chat_input.focus()
         else:
+            self._gen_overrides.pop("max_new_tokens", None)
             self._model_is_quantized, quant_mode = detect_quantization_mode(
                 self._model_config,
                 backend=self._llm_backend,
@@ -1151,6 +1167,7 @@ class ChatScreen(Screen[None]):
                 f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}."
             )
             self._log_sys_msg(ready_msg)
+            self._log_effective_gen_config()
             self._model_loaded = True
             self._set_load_button_enabled(True)
 
@@ -1312,6 +1329,7 @@ class ChatScreen(Screen[None]):
         self._model_loaded = False
         self._model_is_quantized = False
         self._torch_peer_notice_shown = False
+        self._gen_overrides.pop("max_new_tokens", None)
         self._history.clear()
         self._generating_resp = False
         self._streaming_reply_open = False
@@ -1369,6 +1387,7 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int | bool]]]
     def __init__(
         self,
         *,
+        max_new_tokens: int,
         temperature: float,
         top_k: int,
         top_p: float,
@@ -1379,6 +1398,7 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int | bool]]]
     ) -> None:
         super().__init__(id="chat-gen-config-modal")
         self._defaults = {
+            "max_new_tokens": max_new_tokens,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,
@@ -1394,6 +1414,11 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int | bool]]]
     def compose(self) -> ComposeResult:
         with Container(id="chat-gen-config-modal-container"):
             yield Label("Generation Config", id="chat-gen-config-title")
+            yield Label("max_new_tokens", classes="chat-gen-config-label")
+            max_new_tokens_input = Input(id="chat-gen-config-max-new-tokens", placeholder="e.g. 512")
+            self._inputs["max_new_tokens"] = max_new_tokens_input
+            yield max_new_tokens_input
+
             yield Label("temperature", classes="chat-gen-config-label")
             temp_input = Input(id="chat-gen-config-temperature", placeholder="e.g. 0.7")
             self._inputs["temperature"] = temp_input
@@ -1453,6 +1478,7 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int | bool]]]
             return
 
         try:
+            max_new_tokens = int(self._inputs["max_new_tokens"].value.strip())
             temperature = float(self._inputs["temperature"].value.strip())
             top_k = int(self._inputs["top_k"].value.strip())
             top_p = float(self._inputs["top_p"].value.strip())
@@ -1463,6 +1489,9 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int | bool]]]
             self._set_status("Invalid number format.")
             return
 
+        if max_new_tokens < 1:
+            self._set_status("max_new_tokens must be >= 1.")
+            return
         if temperature < 0:
             self._set_status("temperature must be >= 0.")
             return
@@ -1481,6 +1510,7 @@ class GenerationConfigModal(ModalScreen[Optional[dict[str, float | int | bool]]]
 
         self.dismiss(
             {
+                "max_new_tokens": max_new_tokens,
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,

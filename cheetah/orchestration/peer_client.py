@@ -21,12 +21,66 @@ from cheetah.orchestration.cdevice import CDevice
 logger = get_logger(__name__)
 
 
+def _is_unspecified_address(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return text in {"", "0.0.0.0", "::", "::0"}
+
+
+def _is_loopback_address(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("127.") or text == "::1"
+
+
+def _resolve_advertise_address(bind_address: str) -> str:
+    override = os.getenv("TC_ADVERTISE_ADDRESS", "").strip()
+    if override:
+        return override
+
+    bind_address = bind_address.strip() or "0.0.0.0"
+    if not _is_unspecified_address(bind_address):
+        return bind_address
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            candidate = str(sock.getsockname()[0]).strip()
+            if candidate and not _is_unspecified_address(candidate) and not _is_loopback_address(candidate):
+                return candidate
+    except OSError:
+        pass
+
+    try:
+        candidate = str(socket.gethostbyname(socket.gethostname())).strip()
+        if candidate and not _is_unspecified_address(candidate) and not _is_loopback_address(candidate):
+            return candidate
+    except OSError:
+        pass
+
+    return bind_address
+
+
+def _peer_host_from_payload(peer_data: dict[str, Any], source_address: str | None = None) -> str:
+    peer_device = peer_data.get("peer_device") if isinstance(peer_data.get("peer_device"), dict) else {}
+    advertised = str(
+        peer_device.get(
+            "ip_address",
+            peer_data.get("ip_address", peer_data.get("address", "")),
+        )
+    ).strip()
+    if _is_unspecified_address(advertised) and source_address:
+        return source_address
+    if advertised:
+        return advertised
+    return str(source_address or "0.0.0.0")
+
+
 class PeerClient:
     """Network client for peer discovery and tensor exchange."""
 
     def __init__(self) -> None:
         self.peer_client_id = os.getenv("TC_PEER_ID") or f"cheetah-{uuid.uuid4().hex[:6]}"
-        self.address = "0.0.0.0"
+        self.bind_address = os.getenv("TC_BIND_ADDRESS", "0.0.0.0").strip() or "0.0.0.0"
+        self.address = _resolve_advertise_address(self.bind_address)
         self.port = int(os.getenv("TC_PORT", "8765"))
         peer_device = get_backend_device(get_llm_backend(), default="CPU") or "CPU"
         self.peer_device = CDevice(
@@ -76,7 +130,7 @@ class PeerClient:
         self.in_use = True
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.bind(bind_address or ("0.0.0.0", 1045))
+                sock.bind(bind_address or (self.bind_address, 1045))
                 sock.settimeout(timeout)
                 data, _ = sock.recvfrom(65536)
                 msg = json.loads(data.decode("utf-8"))
@@ -89,7 +143,7 @@ class PeerClient:
             self.in_use = False
 
     def _tensor_recv_loop(self) -> None:
-        bind = ("0.0.0.0", self.port)
+        bind = (self.bind_address, self.port)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -355,7 +409,7 @@ class PeerClient:
                                     logger.info(f"Current peer list: {self._peers}")
                                     logger.info(f"New peer discovered @ {addr}.")
                                     logger.info(f"Adding peer {udp_client_id}")
-                                    self.add_peer(udp_peer_info)
+                                    self.add_peer(udp_peer_info, source_address=addr[0])
                     except Exception as err:
                         logger.error(f"Error processing UDP discovery response: {err}")
 
@@ -369,7 +423,7 @@ class PeerClient:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", self.port))
+            sock.bind((self.bind_address, self.port))
             sock.settimeout(1.0)
         except Exception as err:
             logger.error(f"Failed UDP response: {err}")
@@ -399,24 +453,24 @@ class PeerClient:
         self._thread_udp_brodcast = threading.Thread(target=self._udp_response, name="udp-responder", daemon=True)
         self._thread_udp_brodcast.start()
 
-    def add_peer(self, peer_data: dict) -> None:
+    def add_peer(self, peer_data: dict, source_address: str | None = None) -> CDevice | None:
         try:
             peer_device = peer_data.get("peer_device")
             peer_client_id = str(peer_data.get("peer_client_id", "") or "")
             if not peer_client_id:
                 logger.warning("Skipped peer with missing peer_client_id: %s", peer_data)
-                return
+                return None
 
             if peer_device is None:
                 cdevice = CDevice(
                     peer_client_id,
-                    peer_data.get("address", "0.0.0.0"),
+                    _peer_host_from_payload(peer_data, source_address=source_address),
                     peer_data.get("port", self.port)
                 )
             else:
                 cdevice = CDevice(
                     peer_device.get("peer_client_id", peer_client_id),
-                    peer_device.get("ip_address", peer_data.get("address", "0.0.0.0")),
+                    _peer_host_from_payload(peer_data, source_address=source_address),
                     peer_device.get("port", peer_data.get("port", self.port)),
                     peer_device.get("tg_device", "CPU"),
                 )
@@ -436,13 +490,15 @@ class PeerClient:
                 shard_data.get("end_layer", 0),
                 shard_data.get("total_layers", shard_data.get("end_layer", 0)),
             )
-            cdevice.ip_address = peer_data.get("address", cdevice.ip_address)
+            cdevice.ip_address = _peer_host_from_payload(peer_data, source_address=source_address)
             cdevice.port = peer_data.get("port", cdevice.port)
 
             self._peers[peer_client_id] = cdevice
             logger.info("Added peer %s to peer list", peer_client_id)
+            return cdevice
         except Exception as err:
             logger.error(f"Failed to add peer to list: {err}")
+            return None
 
     def as_dict(self) -> dict:
         return {

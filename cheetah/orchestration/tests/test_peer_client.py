@@ -3,9 +3,14 @@ import base64
 import json
 import unittest
 import os
+from unittest import mock
 
 import tinygrad as tg
-from cheetah.orchestration.peer_client import PeerClient
+from cheetah.orchestration.peer_client import (
+    PeerClient,
+    _peer_host_from_payload,
+    _resolve_advertise_address,
+)
 
 TEST_RECEIVER_BIND_HOST = "0.0.0.0"
 TEST_RECEIVER_CONNECT_HOST = "127.0.0.1"
@@ -99,3 +104,60 @@ class TestPeerClientReceiver(unittest.IsolatedAsyncioTestCase):
             await server.wait_closed()
 
         self.assertEqual(payload, expected)
+
+
+class TestPeerDiscoveryHelpers(unittest.TestCase):
+    def test_resolve_advertise_address_prefers_explicit_override(self):
+        with mock.patch.dict(os.environ, {"TC_ADVERTISE_ADDRESS": "192.168.50.12"}):
+            self.assertEqual(_resolve_advertise_address("0.0.0.0"), "192.168.50.12")
+
+    def test_peer_host_from_payload_prefers_response_source_for_unspecified_address(self):
+        payload = {
+            "peer_client_id": "peer-1",
+            "address": "0.0.0.0",
+            "port": TEST_PORT,
+            "peer_device": {
+                "peer_client_id": "peer-1",
+                "ip_address": "0.0.0.0",
+                "port": TEST_PORT,
+                "tg_device": "CPU",
+            },
+        }
+        self.assertEqual(
+            _peer_host_from_payload(payload, source_address="192.168.0.42"),
+            "192.168.0.42",
+        )
+
+    def test_add_peer_uses_response_source_when_payload_is_unspecified(self):
+        client = PeerClient.__new__(PeerClient)
+        client.port = TEST_PORT
+        client._peers = {}
+
+        peer = PeerClient.add_peer(
+            client,
+            {
+                "peer_client_id": "peer-1",
+                "address": "0.0.0.0",
+                "port": TEST_PORT,
+                "peer_device": {
+                    "peer_client_id": "peer-1",
+                    "ip_address": "0.0.0.0",
+                    "port": TEST_PORT,
+                    "tg_device": "CPU",
+                    "cpu_model": "",
+                    "cpu_proc_speed": "",
+                    "cpu_cores": 0,
+                    "cpu_ram": "",
+                    "gpu_model": "",
+                    "gpu_vram": "",
+                    "gpu_flops": 0.0,
+                },
+                "shard": {},
+            },
+            source_address="192.168.0.42",
+        )
+
+        self.assertIsNotNone(peer)
+        assert peer is not None
+        self.assertEqual(peer.ip_address, "192.168.0.42")
+        self.assertIn("peer-1", client._peers)
