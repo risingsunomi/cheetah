@@ -79,6 +79,39 @@ class TestChatScreenGenerationLimits(unittest.TestCase):
         self.assertEqual(screen._gen_overrides["temperature"], 0.2)
 
 
+class TestChatScreenBackendRouting(unittest.TestCase):
+    def test_generate_response_routes_exllamav3_backend(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._llm_backend = "exllamav3"
+        screen._prepare_generation_prompt = lambda: ({"input_ids": [[1, 2]], "attention_mask": [[1, 1]]}, 64)
+        calls: list[tuple[dict[str, object], int, object]] = []
+
+        def fake_generate(enc, max_new_tokens, on_token=None):
+            calls.append((enc, max_new_tokens, on_token))
+            return [42], 0.1
+
+        screen._generate_response_exllamav3 = fake_generate
+
+        result = screen._generate_response()
+
+        self.assertEqual(result, ([42], 0.1))
+        self.assertEqual(calls[0][0]["input_ids"], [[1, 2]])
+        self.assertEqual(calls[0][1], 64)
+
+    def test_peer_generation_rejects_exllamav3_backend(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._llm_backend = "exllamav3"
+        screen._model = object()
+        screen._tokenizer = object()
+
+        response = screen._handle_peer_generate_token_request({"payload": {}})
+
+        self.assertEqual(
+            response,
+            {"error": "distributed generation is not supported for exllamav3"},
+        )
+
+
 class TestChatScreenModelLoad(unittest.IsolatedAsyncioTestCase):
     async def test_start_model_load_resets_max_new_tokens_override_and_logs_effective_config(self) -> None:
         screen = ChatScreen(peer_client=object())

@@ -70,6 +70,7 @@ BASE_REQUIRES = [
     "tokenizers",
     "zstandard",
     _torch_requirement(),
+    "exllamav3",
 ]
 
 _DEFAULT_TORCH_VERSION = os.getenv("TC_TORCH_VERSION", "2.5.1").strip()
@@ -79,6 +80,7 @@ EXTRAS = {
         "pytest",
         "textual-dev",
     ],
+    "exllamav3": ["exllamav3"],
     # Use with pip wheel index URLs if selecting CUDA variants.
     "torch-cpu": [f"torch>={_DEFAULT_TORCH_VERSION}"],
     "torch-cu126": [f"torch=={_DEFAULT_TORCH_VERSION}+cu126"],
@@ -88,7 +90,7 @@ EXTRAS = {
 
 setup(
     name="cheetah",
-    version="0.1",
+    version="0.0.6",
     description="Distributed inference and training with tinygrad or torch backends",
     packages=find_packages(include=["cheetah", "cheetah.*"]),
     include_package_data=True,

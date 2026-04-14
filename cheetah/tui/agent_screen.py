@@ -30,6 +30,7 @@ from cheetah.agent.prompt_loader import (
     save_agent_prompt_template,
 )
 from cheetah.models.llm.backend import (
+    backend_helpers_module,
     detect_quantization_mode,
     get_backend_device,
     get_llm_backend,
@@ -781,29 +782,60 @@ class AgentScreen(Screen[None]):
             device = self._torch_runtime_device()
             input_ids = torch.tensor(enc["input_ids"], dtype=torch.long, device=device)
             attention_mask = torch.tensor(enc["attention_mask"], dtype=torch.long, device=device)
+            out_tokens, _ = streaming_generate_with_peers(
+                self._peer_client,
+                self._model,
+                input_ids,
+                attention_mask,
+                self._tokenizer,
+                max_new_tokens=max_new_tokens,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                alpha_f=alpha_f,
+                alpha_p=alpha_p,
+                verbose=False,
+                on_token=None,
+                abort_check=self._memory_abort_reason,
+            )
+        elif self._llm_backend == "exllamav3":
+            out_tokens, _ = backend_helpers_module("exllamav3").stream_generate(
+                self._model,
+                enc["input_ids"],
+                self._tokenizer,
+                max_new_tokens=max_new_tokens,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                alpha_f=alpha_f,
+                alpha_p=alpha_p,
+                on_token=None,
+                abort_check=self._memory_abort_reason,
+            )
         else:
             import tinygrad as tg
 
             input_ids = tg.Tensor(enc["input_ids"])
             attention_mask = tg.Tensor(enc["attention_mask"])
-
-        out_tokens, _ = streaming_generate_with_peers(
-            self._peer_client,
-            self._model,
-            input_ids,
-            attention_mask,
-            self._tokenizer,
-            max_new_tokens=max_new_tokens,
-            temp=temp,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            alpha_f=alpha_f,
-            alpha_p=alpha_p,
-            verbose=False,
-            on_token=None,
-            abort_check=self._memory_abort_reason,
-        )
+            out_tokens, _ = streaming_generate_with_peers(
+                self._peer_client,
+                self._model,
+                input_ids,
+                attention_mask,
+                self._tokenizer,
+                max_new_tokens=max_new_tokens,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                alpha_f=alpha_f,
+                alpha_p=alpha_p,
+                verbose=False,
+                on_token=None,
+                abort_check=self._memory_abort_reason,
+            )
         if not out_tokens:
             return ""
         return self._tokenizer.decode(out_tokens, skip_special_tokens=True).strip()
@@ -1130,6 +1162,11 @@ class AgentScreen(Screen[None]):
     def _clear_model(self, *, update_log: bool = True) -> None:
         if self._agent_running:
             self._stop_agent()
+        if self._model is not None and hasattr(self._model, "unload"):
+            try:
+                self._model.unload()
+            except Exception:
+                logger.debug("Failed to unload agent model during clear", exc_info=True)
         self._model = None
         self._model_config = None
         self._tokenizer = None

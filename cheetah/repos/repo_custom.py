@@ -12,10 +12,12 @@ import requests
 from .download_progress import DownloadProgress
 
 DEFAULT_FILES = {
+    "added_tokens.json",
     "chat_template.jinja",
     "config.json",
     "generation_config.json",
     "model.safetensors.index.json",
+    "quantization_config.json",
     "tokenizer.json",
     "tokenizer.model",
     "tokenizer_config.json",

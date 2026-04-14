@@ -5,6 +5,7 @@ import io
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -29,6 +30,7 @@ from cheetah.tui.train_menu import (
     _build_training_namespace,
     _ensure_required_keys,
     _prepare_dataset_corpus,
+    _run_training_job,
     _stream_corpus_batches,
     default_training_settings,
 )
@@ -246,6 +248,27 @@ class TestTrainScreen(unittest.TestCase):
         self.assertEqual(args.backend, "torch")
         self.assertEqual(args.device, "mps")
         self.assertEqual(args.max_dataset_entries, 25)
+
+    def test_run_training_job_rejects_exllamav3_backend(self) -> None:
+        settings = {
+            "backend": "exllamav3",
+            "model-id": "Qwen/Qwen2.5-0.5B-Instruct",
+            "data-path": "",
+            "dataset-id": "",
+            "max-dataset-entries": "",
+            "seq-length": "256",
+            "batch-size": "2",
+            "epochs": "1",
+            "lr": "1e-4",
+            "device": "cuda",
+            "gradient-accumulation": "1",
+            "save-dir": "",
+            "offline": False,
+            "from-scratch": False,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "chat-only"):
+            _run_training_job(settings, Event())
 
     def test_ensure_required_keys_supports_config_wrappers(self) -> None:
         wrapper = Namespace(config={})

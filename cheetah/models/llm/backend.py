@@ -7,16 +7,19 @@ from typing import Any, Awaitable, Callable
 LLM_BACKEND_ENV = "TC_LLM_BACKEND"
 TORCH_DEVICE_ENV = "TC_TORCH_DEVICE"
 TINYGRAD_DEVICE_ENV = "TC_TINYGRAD_DEVICE"
+EXLLAMAV3_DEVICE_ENV = "TC_EXLLAMAV3_DEVICE"
 DEFAULT_LLM_BACKEND = "tinygrad"
-SUPPORTED_LLM_BACKENDS = {"tinygrad", "torch"}
+SUPPORTED_LLM_BACKENDS = {"tinygrad", "torch", "exllamav3"}
 _UNSET = object()
 _BACKEND_DEVICE_ENVS = {
     "tinygrad": TINYGRAD_DEVICE_ENV,
     "torch": TORCH_DEVICE_ENV,
+    "exllamav3": EXLLAMAV3_DEVICE_ENV,
 }
 _BACKEND_DEFAULT_DEVICES = {
     "tinygrad": "CPU",
     "torch": "cpu",
+    "exllamav3": "cuda",
 }
 
 
@@ -52,6 +55,10 @@ def normalize_backend_device(value: str | None, backend: str | None = None) -> s
     if selected == "torch":
         normalized = raw.lower()
         return "mps" if normalized == "metal" else normalized
+
+    if selected == "exllamav3":
+        normalized = raw.lower()
+        return "cuda" if normalized == "gpu" else normalized
 
     normalized = raw.upper()
     return "METAL" if normalized == "MPS" else normalized
@@ -105,6 +112,11 @@ def _backend_module(module_name: str, backend: str | None = None):
             raise RuntimeError(
                 "tinygrad backend selected but tinygrad is not installed. "
                 "Install tinygrad or switch TC_LLM_BACKEND=torch."
+            ) from exc
+        if selected == "exllamav3" and exc.name == "exllamav3":
+            raise RuntimeError(
+                "exllamav3 backend selected but exllamav3 is not installed. "
+                "Install exllamav3 or switch TC_LLM_BACKEND to torch or tinygrad."
             ) from exc
         raise
 

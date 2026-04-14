@@ -14,6 +14,7 @@ from transformers import AutoTokenizer
 from rich.markup import escape
 
 from cheetah.models.llm.backend import (
+    backend_helpers_module,
     detect_quantization_mode,
     get_backend_device,
     get_llm_backend,
@@ -768,6 +769,8 @@ class ChatScreen(Screen[None]):
             return {"error": "invalid payload"}
         if self._model is None or self._tokenizer is None:
             return {"error": "model not loaded"}
+        if self._llm_backend == "exllamav3":
+            return {"error": "distributed generation is not supported for exllamav3"}
 
         from cheetah.models.shard import Shard
         from cheetah.orchestration.model_engine import ModelEngine
@@ -1167,6 +1170,12 @@ class ChatScreen(Screen[None]):
                 f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}."
             )
             self._log_sys_msg(ready_msg)
+            peer_count = getattr(self._peer_client, "peer_count", None)
+            if self._llm_backend == "exllamav3" and callable(peer_count) and peer_count() > 1:
+                self._log_sys_msg(
+                    "ExLlamaV3 currently runs locally only in chat; peer sharding is disabled.",
+                    persist=False,
+                )
             self._log_effective_gen_config()
             self._model_loaded = True
             self._set_load_button_enabled(True)
@@ -1202,6 +1211,12 @@ class ChatScreen(Screen[None]):
         enc, max_new_tokens = self._prepare_generation_prompt()
         if self._llm_backend == "torch":
             return self._generate_response_torch(
+                enc=enc,
+                max_new_tokens=max_new_tokens,
+                on_token=on_token,
+            )
+        if self._llm_backend == "exllamav3":
+            return self._generate_response_exllamav3(
                 enc=enc,
                 max_new_tokens=max_new_tokens,
                 on_token=on_token,
@@ -1309,6 +1324,28 @@ class ChatScreen(Screen[None]):
             raise RuntimeError("streaming_generate_with_peers returned no output")
         return result
 
+    def _generate_response_exllamav3(
+        self,
+        enc: Dict[str, Any],
+        max_new_tokens: int = 4096,
+        on_token: Optional[Callable[[int], None]] = None,
+    ) -> tuple[list[int], float]:
+        gen_cfg = self._effective_gen_config()
+        return backend_helpers_module("exllamav3").stream_generate(
+            self._model,
+            enc["input_ids"],
+            self._tokenizer,
+            max_new_tokens=max_new_tokens,
+            temp=float(gen_cfg["temperature"]),
+            top_k=int(gen_cfg["top_k"]),
+            top_p=float(gen_cfg["top_p"]),
+            alpha_f=float(gen_cfg["alpha_f"]),
+            alpha_p=float(gen_cfg["alpha_p"]),
+            repetition_penalty=float(gen_cfg["repetition_penalty"]),
+            on_token=on_token,
+            abort_check=self._memory_abort_reason,
+        )
+
     def _memory_abort_reason(self) -> str | None:
         return memory_abort_reason("chat generation")
 
@@ -1322,6 +1359,11 @@ class ChatScreen(Screen[None]):
             and hasattr(self._model, "reset_kv_cache")
         ):
             self._model.reset_kv_cache()
+        if hasattr(self, "_model") and self._model is not None and hasattr(self._model, "unload"):
+            try:
+                self._model.unload()
+            except Exception:
+                logger.debug("Failed to unload model during clear", exc_info=True)
         self._model = None
         self._model_config = None
         self._tokenizer = None

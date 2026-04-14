@@ -115,6 +115,8 @@ class SettingsScreen(Screen[None]):
             name = str(device.get("name", f"device-{idx}"))
             kind = str(device.get("kind", "device")).upper()
             compute = self._device_value_for_backend(device, backend)
+            if not compute:
+                continue
             ram = device.get("ram_gb", "")
             label = f"{kind}: {name}"
             if ram not in ("", None):
@@ -126,6 +128,16 @@ class SettingsScreen(Screen[None]):
                 selected_any = True
             self._device_checks.append((checkbox, compute))
             container.mount(checkbox)
+        if not self._device_checks:
+            active_env = backend_device_env(backend)
+            if backend == "exllamav3":
+                self._set_status(
+                    f"No compatible CUDA devices found for backend '{backend}'. "
+                    f"Set {active_env} manually if needed."
+                )
+            else:
+                self._set_status(f"No compatible devices found for backend '{backend}'.")
+            return
         if env_target:
             active_env = backend_device_env(backend)
             if selected_any:
@@ -148,7 +160,7 @@ class SettingsScreen(Screen[None]):
         selected_backend = get_llm_backend()
         active_env = backend_device_env(selected_backend)
         active_device = get_backend_device(selected_backend, default="") or "(unset)"
-        for backend in ("tinygrad", "torch"):
+        for backend in ("tinygrad", "torch", "exllamav3"):
             checkbox = Checkbox(backend, id=f"backend-{backend}")
             checkbox.value = backend == selected_backend
             self._backend_checks.append((checkbox, backend))
@@ -223,7 +235,8 @@ class SettingsScreen(Screen[None]):
             [
                 "Settings Screen",
                 "- Select one device target and one backend.",
-                "- Save writes TC_TINYGRAD_DEVICE or TC_TORCH_DEVICE for the selected backend.",
+                "- Save writes the device env for the selected backend.",
+                "- exllamav3 currently expects a CUDA device and is intended for chat inference.",
                 "- h opens this help screen.",
                 "- b / Esc returns to the previous screen.",
             ]
@@ -256,6 +269,13 @@ class SettingsScreen(Screen[None]):
                 # ROCm builds typically expose devices through torch.cuda.
                 return "cuda"
             return "cpu"
+
+        if backend == "exllamav3":
+            if kind != "GPU":
+                return ""
+            if device_upper == "CUDA":
+                return "cuda"
+            return ""
 
         # tinygrad backend values
         if kind == "CPU":

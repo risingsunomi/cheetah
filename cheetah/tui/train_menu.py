@@ -900,6 +900,8 @@ def _run_training_job(
         runtime_state = {}
 
     print(f"[backend] using {backend} on {device}")
+    if backend == "exllamav3":
+        raise RuntimeError("exllamav3 is chat-only in Cheetah and is not supported for training.")
     if backend == "torch" and torch is None:
         raise RuntimeError("PyTorch is required for torch training.")
     if backend == "tinygrad" and tg is None:
