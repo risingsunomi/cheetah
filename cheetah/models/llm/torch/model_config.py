@@ -16,20 +16,6 @@ class ModelConfig:
         self.config: dict = {}
         self.qk_norm_models = ["qwen3", "qwen3_moe"]
 
-    @staticmethod
-    def _decode_hybrid_layers(pattern: str, num_layers: int) -> list[str]:
-        mapping = {"M": "mamba", "*": "attention", "-": "mlp"}
-        if not pattern:
-            return []
-        decoded = [mapping.get(ch, "mlp") for ch in pattern]
-        if num_layers > 0 and len(decoded) != num_layers:
-            logger.warning(
-                "Hybrid override pattern length %d does not match num_hidden_layers %d",
-                len(decoded),
-                num_layers,
-            )
-        return decoded
-
     def load(self, config_file: Path) -> None:
         with open(config_file, "r") as handle:
             base_config = json.loads(handle.read())
@@ -57,10 +43,6 @@ class ModelConfig:
             o_proj_bias = False
 
         num_hidden_layers = int(base_config.get("num_hidden_layers", 0) or 0)
-        hybrid_override_pattern = str(base_config.get("hybrid_override_pattern", ""))
-        layers_block_type = base_config.get("layers_block_type")
-        if not isinstance(layers_block_type, list):
-            layers_block_type = self._decode_hybrid_layers(hybrid_override_pattern, num_hidden_layers)
 
         self.config = {
             "architectures": base_config.get("architectures", []),
@@ -91,8 +73,6 @@ class ModelConfig:
             "rope_scaling": base_config.get("rope_scaling", None),
             "rope_theta": base_config.get("rope_theta", 100000.0),
             "layer_types": list(base_config.get("layer_types", [])),
-            "layers_block_type": list(layers_block_type),
-            "hybrid_override_pattern": hybrid_override_pattern,
             "sliding_window": int(base_config.get("sliding_window", 0) or 0),
             "vocab_size": base_config.get("vocab_size", 0),
             "num_layers": num_hidden_layers,
@@ -125,23 +105,6 @@ class ModelConfig:
             "transformers_version": str(base_config.get("transformers_version", "")),
             "quantization_config": base_config.get("quantization_config"),
             "use_bias": bool(base_config.get("use_bias", False)),
-            "residual_in_fp32": bool(base_config.get("residual_in_fp32", False)),
-            "rescale_prenorm_residual": bool(base_config.get("rescale_prenorm_residual", False)),
-            "use_mamba_kernels": bool(base_config.get("use_mamba_kernels", False)),
-            "ssm_state_size": int(base_config.get("ssm_state_size", 0) or 0),
-            "mamba_num_heads": int(base_config.get("mamba_num_heads", 0) or 0),
-            "n_groups": int(base_config.get("n_groups", 0) or 0),
-            "mamba_head_dim": int(base_config.get("mamba_head_dim", 0) or 0),
-            "conv_kernel": int(base_config.get("conv_kernel", 0) or 0),
-            "expand": float(base_config.get("expand", 2.0) or 2.0),
-            "mamba_hidden_act": str(base_config.get("mamba_hidden_act", base_config.get("hidden_act", "silu"))),
-            "time_step_min": float(base_config.get("time_step_min", 0.001)),
-            "time_step_max": float(base_config.get("time_step_max", 0.1)),
-            "time_step_floor": float(base_config.get("time_step_floor", 1e-4)),
-            "time_step_limit": tuple(base_config.get("time_step_limit", (0.0, float("inf")))),
-            "use_conv_bias": bool(base_config.get("use_conv_bias", True)),
-            "mamba_proj_bias": bool(base_config.get("mamba_proj_bias", False)),
-            "chunk_size": int(base_config.get("chunk_size", 256) or 256),
             "temperature": None,
             "max_new_tokens": None,
             "top_k": None,
@@ -192,7 +155,6 @@ class ModelConfig:
             self.config.get("num_local_experts", 0) > 0
             and self.config.get("num_experts_per_tok", 0) > 0
         )
-        self.config["mamba"] = self.config.get("model_type") == "nemotron_h"
 
         custom_seq = os.getenv("TC_MAX_SEQ_LEN")
         if custom_seq is not None:

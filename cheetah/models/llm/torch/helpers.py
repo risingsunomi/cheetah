@@ -18,7 +18,6 @@ from cheetah.models.shard import Shard
 
 from .load_progress import WeightLoadProgress
 from .model import Model
-from .mamba_model import MambaModel
 from .model_config import ModelConfig
 from .quantize import is_quantized_model_config, load_quantized_safetensors
 
@@ -86,11 +85,9 @@ def _resolve_weight_key(key: str, weight_map: dict[str, str], prefix: str) -> st
 
 def _needs_qk_permute(model_config: dict) -> bool:
     model_type = str(model_config.get("model_type", "")).lower()
-    return model_type not in {"gpt_oss", "nemotron_h"}
+    return model_type != "gpt_oss"
 
-def build_model(config: dict, shard: Shard, use_tied: bool = False) -> Model | MambaModel:
-    if bool(config.get("mamba")) or str(config.get("model_type", "")).lower() == "nemotron_h":
-        return MambaModel(config, shard, use_tied=use_tied)
+def build_model(config: dict, shard: Shard, use_tied: bool = False) -> Model:
     return Model(config, shard, use_tied=use_tied)
 
 def apply_weight(

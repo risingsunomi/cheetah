@@ -216,7 +216,7 @@ class TestHelpersLoader(unittest.TestCase):
             load_safetensors(
                 model,
                 model_dir,
-                model_config={"num_heads": 2, "num_kv_heads": 1, "model_type": "nemotron_h"},
+                model_config={"num_heads": 2, "num_kv_heads": 1, "model_type": "llama"},
                 weight_device="cpu",
                 use_tied=False,
             )
@@ -252,7 +252,7 @@ class TestHelpersLoader(unittest.TestCase):
             load_safetensors(
                 model,
                 model_dir,
-                model_config={"num_heads": 2, "num_kv_heads": 1, "model_type": "nemotron_h"},
+                model_config={"num_heads": 2, "num_kv_heads": 1, "model_type": "llama"},
                 weight_device="cpu",
                 use_tied=False,
             )

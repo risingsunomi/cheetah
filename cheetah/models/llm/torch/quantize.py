@@ -106,7 +106,7 @@ def _resolve_weight_key(key: str, weight_map: Mapping[str, str], prefix: str) ->
 
 def _needs_qk_permute(model_config: Mapping[str, Any]) -> bool:
     model_type = str(model_config.get("model_type", "")).lower()
-    return model_type not in {"gpt_oss", "nemotron_h"}
+    return model_type != "gpt_oss"
 
 
 def _load_quant_state(raw_state: np.ndarray) -> dict[str, Any]:
