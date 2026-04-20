@@ -286,7 +286,14 @@ def _encode_token_tensor(token: int) -> Dict[str, Any]:
 
 def _encode_tensor(tensor: Any) -> Dict[str, Any]:
     if torch is not None and isinstance(tensor, torch.Tensor):
-        arr = tensor.detach().cpu().numpy()
+        detached = tensor.detach().cpu()
+        try:
+            arr = detached.numpy()
+        except TypeError:
+            if detached.is_floating_point():
+                arr = detached.to(dtype=torch.float32).numpy()
+            else:
+                raise
     elif hasattr(tensor, "numpy"):
         arr = tensor.numpy()
     else:
@@ -308,7 +315,7 @@ def _decode_tensor(tensor_payload: Any, backend: str | None = None) -> Any | Non
         raw = base64.b64decode(buf)
     
         dtype = _normalize_dtype(str(tensor_payload.get("dtype", "float32")))
-        arr = np.frombuffer(raw, dtype=np.dtype(dtype))
+        arr = np.frombuffer(raw, dtype=np.dtype(_numpy_dtype(dtype)))
         shape = tensor_payload.get("shape")
 
         if shape:
@@ -443,6 +450,13 @@ def _normalize_dtype(dtype: str) -> str:
         if candidate in lower:
             return candidate
     return "float32"
+
+
+def _numpy_dtype(dtype: str) -> str:
+    normalized = _normalize_dtype(dtype)
+    if normalized == "bfloat16":
+        return "float32"
+    return normalized
 
 
 def _shard_payload(shard: Shard) -> Dict[str, Any]:

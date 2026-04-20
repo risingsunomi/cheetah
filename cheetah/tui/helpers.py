@@ -743,7 +743,14 @@ def _tensor_to_list(tensor: Any) -> list[list[Any]]:
             return tensor
         return [tensor]
     if torch is not None and isinstance(tensor, torch.Tensor):
-        data = tensor.detach().cpu().numpy().tolist()
+        detached = tensor.detach().cpu()
+        try:
+            data = detached.numpy().tolist()
+        except TypeError:
+            if detached.is_floating_point():
+                data = detached.to(dtype=torch.float32).numpy().tolist()
+            else:
+                raise
     elif hasattr(tensor, "numpy"):
         data = tensor.numpy().tolist()
     elif hasattr(tensor, "tolist"):

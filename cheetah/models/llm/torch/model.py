@@ -128,7 +128,7 @@ class Model(nn.Module):
                 raise ValueError("input tensor is required when hidden_state is not provided")
             x = self.embed_tokens(x.long())
         else:
-            x = hidden_state
+            x = hidden_state.to(device=self.device_name, dtype=self.inference_dtype)
 
         local_start, local_end, is_final = self._resolve_shard_window(shard)
         for layer in self.layers[local_start:local_end]:

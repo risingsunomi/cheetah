@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 from types import SimpleNamespace
 
-from cheetah.orchestration.model_engine import ModelEngine
+from cheetah.orchestration.model_engine import ModelEngine, _decode_tensor, _encode_tensor
 from cheetah.orchestration.cdevice import CDevice
 from cheetah.models.shard import Shard
 from cheetah.models.llm.backend import backend_helpers_module, backend_model_class, get_backend_device
@@ -13,6 +13,10 @@ try:
     import tinygrad as tg
 except Exception:
     tg = None
+try:
+    import torch
+except Exception:
+    torch = None
 
 
 class TestModelEngine(unittest.TestCase):
@@ -91,6 +95,22 @@ class TestModelEngine(unittest.TestCase):
         assert shard is not None
         self.assertEqual(shard.start_layer, 0)
         self.assertEqual(shard.end_layer, 2)
+
+    def test_encode_tensor_upcasts_torch_bfloat16_for_network(self):
+        if torch is None:
+            self.skipTest("torch is required for this test.")
+
+        tensor = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3).to(dtype=torch.bfloat16)
+
+        payload = _encode_tensor(tensor)
+        self.assertEqual(payload["dtype"], "float32")
+
+        decoded = _decode_tensor(payload, backend="torch")
+        self.assertIsNotNone(decoded)
+        assert decoded is not None
+        self.assertIsInstance(decoded, torch.Tensor)
+        self.assertEqual(decoded.dtype, torch.float32)
+        self.assertTrue(torch.allclose(decoded, tensor.float()))
 
     def test_model_engine_loads_llama_3_2_1b(self):
         model_name = "unsloth/Llama-3.2-1B-Instruct"
