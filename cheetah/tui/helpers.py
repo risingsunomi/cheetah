@@ -655,13 +655,15 @@ def streaming_generate_with_peers(
             break
 
         for peer in remote_peers:
+            peer_id = _peer_identifier(peer)
             payload = {
                 "command": "generate_token",
                 "payload": {
+                    "sender_peer_id": local_peer_id,
                     "input_ids": input_list,
                     "attention_mask": mask_list,
                     "position_ids": position_list,
-                    "hidden_state": hidden_state_list, 
+                    "hidden_state": hidden_state_list,
                     "temp": temp,
                     "top_k": top_k,
                     "top_p": top_p,
@@ -673,9 +675,11 @@ def streaming_generate_with_peers(
                 },
             }
             try:
+                request_tokens = _flow_token_count(payload)
+                _record_peer_flow(peer_client, local_peer_id or "local", peer_id, request_tokens, phase="request")
                 logger.debug(
                     "Sending payload to peer %s",
-                    _peer_identifier(peer),
+                    peer_id,
                 )
                 host = str(getattr(peer, "ip_address", "") or getattr(peer, "address", "0.0.0.0"))
                 port = int(getattr(peer, "port", os.getenv("TC_TENSOR_PORT", 1045)))
@@ -685,10 +689,13 @@ def streaming_generate_with_peers(
                     expect_reply=True,
                     address=address,
                 )
+                _mark_peer_seen(peer_client, peer_id)
+                response_tokens = _flow_token_count(resp)
+                _record_peer_flow(peer_client, peer_id, local_peer_id or "local", response_tokens, phase="response")
                 otoken_data = resp
-                logger.debug("Received token response from peer %s", _peer_identifier(peer))
+                logger.debug("Received token response from peer %s", peer_id)
             except Exception as err:
-                logger.error(f"Error communicating with peer {_peer_identifier(peer)}: {err}")
+                logger.error(f"Error communicating with peer {peer_id}: {err}")
                 break
 
             prev_len = len(out_tokens)
@@ -763,6 +770,67 @@ def _normalize_peer_entries(peers: Any) -> list[Any]:
 
 def _peer_identifier(peer: Any) -> str:
     return str(getattr(peer, "peer_client_id", "") or getattr(peer, "ip_address", "") or "unknown")
+
+
+def _flow_token_count(message: Any) -> int:
+    payload = message.get("payload", message) if isinstance(message, dict) else message
+    if not isinstance(payload, dict):
+        return 0
+
+    for key in ("attention_mask", "position_ids", "input_ids", "hidden_state"):
+        count = _token_count_from_value(payload.get(key))
+        if count > 0:
+            return count
+
+    if payload.get("token") is not None or payload.get("tensor") is not None:
+        return 1
+    return 0
+
+
+def _token_count_from_value(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, list):
+        if not value:
+            return 0
+        if isinstance(value[0], list):
+            return max((len(row) for row in value if isinstance(row, list)), default=0)
+        return len(value)
+    if isinstance(value, dict):
+        shape = value.get("shape")
+        if isinstance(shape, list) and shape:
+            index = 1 if len(shape) >= 2 else 0
+            try:
+                return max(int(shape[index]), 0)
+            except (TypeError, ValueError):
+                return 0
+    try:
+        shape = tuple(getattr(value, "shape", ()) or ())
+    except Exception:
+        shape = ()
+    if len(shape) >= 2:
+        try:
+            return max(int(shape[1]), 0)
+        except (TypeError, ValueError):
+            return 0
+    if len(shape) == 1:
+        try:
+            return max(int(shape[0]), 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _record_peer_flow(peer_client: Any, source: str, target: str, tokens: int, *, phase: str) -> None:
+    recorder = getattr(peer_client, "record_flow", None)
+    if callable(recorder):
+        recorder(source, target, tokens, phase=phase)
+
+
+def _mark_peer_seen(peer_client: Any, peer_client_id: str) -> None:
+    marker = getattr(peer_client, "mark_peer_seen", None)
+    if callable(marker):
+        marker(peer_client_id)
 
 
 def _plan_peer_shards(model_engine: ModelEngine, peer_client: Any, model: Any) -> None:

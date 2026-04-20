@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import json
 import os
 import queue
@@ -15,7 +16,6 @@ import asyncio
 from cheetah.logging_utils import get_logger
 from cheetah.models.llm.backend import get_backend_device, get_llm_backend
 from cheetah.models.shard import Shard
-from cheetah.orchestration.model_engine import ModelEngine
 from cheetah.orchestration.cdevice import CDevice
 
 logger = get_logger(__name__)
@@ -29,6 +29,16 @@ def _is_unspecified_address(value: str | None) -> bool:
 def _is_loopback_address(value: str | None) -> bool:
     text = str(value or "").strip()
     return text.startswith("127.") or text == "::1"
+
+
+def _peer_stale_after_seconds() -> float:
+    raw = (os.getenv("TC_PEER_STALE_SECONDS") or "").strip()
+    if not raw:
+        return 8.0
+    try:
+        return max(float(raw), 1.0)
+    except ValueError:
+        return 8.0
 
 
 def _resolve_advertise_address(bind_address: str) -> str:
@@ -98,6 +108,9 @@ class PeerClient:
         self._generate_handler: Optional[Callable[[dict], dict]] = None
         self._peers: Dict[str, CDevice] = {}
         self._lock = threading.RLock()
+        self._peer_last_seen: Dict[str, float] = {}
+        self._peer_stale_after = _peer_stale_after_seconds()
+        self._flow_events: deque[dict[str, Any]] = deque(maxlen=256)
         self._thread_ping: Optional[threading.Thread] = None        
         self._thread_udp_discovery: Optional[threading.Thread] = None        
         self._thread_udp_brodcast: Optional[threading.Thread] = None
@@ -256,17 +269,92 @@ class PeerClient:
 
     # Connections ---------------------------------------------------------
     def get_peers(self, include_self: bool = False) -> List[CDevice]:
-        peers = [
-            peer
-            for peer_id, peer in self._peers.items()
-            if peer_id != self.peer_client_id
-        ]
+        self._prune_stale_peers()
+        with self._lock:
+            peers = [
+                peer
+                for peer_id, peer in self._peers.items()
+                if peer_id != self.peer_client_id
+            ]
         if include_self:
             return [self.peer_device, *peers]
         return peers
 
     def peer_count(self) -> int:
         return len(self.get_peers(include_self=True))
+
+    def mark_peer_seen(self, peer_client_id: str | None) -> None:
+        peer_id = str(peer_client_id or "").strip()
+        if not peer_id or peer_id == self.peer_client_id:
+            return
+        with self._lock:
+            self._peer_last_seen[peer_id] = time.time()
+
+    def record_flow(
+        self,
+        source: str | None,
+        target: str | None,
+        tokens: int | None,
+        *,
+        phase: str = "transfer",
+    ) -> None:
+        source_id = str(source or "").strip() or "unknown"
+        target_id = str(target or "").strip() or "unknown"
+        token_count = max(int(tokens or 0), 0)
+        event = {
+            "source": source_id,
+            "target": target_id,
+            "tokens": token_count,
+            "phase": str(phase or "transfer"),
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            self._flow_events.append(event)
+
+    def recent_flows(self, *, max_age: float = 60.0, limit: int = 8) -> list[dict[str, Any]]:
+        cutoff = time.time() - max(max_age, 0.0)
+        with self._lock:
+            events = [dict(event) for event in self._flow_events if float(event.get("timestamp", 0.0) or 0.0) >= cutoff]
+
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for event in events:
+            source = str(event.get("source", "") or "unknown")
+            target = str(event.get("target", "") or "unknown")
+            key = (source, target)
+            if key not in grouped:
+                grouped[key] = {
+                    "source": source,
+                    "target": target,
+                    "tokens": 0,
+                    "count": 0,
+                    "phase": str(event.get("phase", "transfer") or "transfer"),
+                    "last_seen": 0.0,
+                }
+            bucket = grouped[key]
+            bucket["tokens"] += max(int(event.get("tokens", 0) or 0), 0)
+            bucket["count"] += 1
+            bucket["phase"] = str(event.get("phase", bucket["phase"]) or bucket["phase"])
+            bucket["last_seen"] = max(float(bucket["last_seen"]), float(event.get("timestamp", 0.0) or 0.0))
+
+        ordered = sorted(grouped.values(), key=lambda item: float(item.get("last_seen", 0.0) or 0.0), reverse=True)
+        return ordered[: max(int(limit or 0), 0)] if limit else ordered
+
+    def _prune_stale_peers(self) -> None:
+        stale_after = float(getattr(self, "_peer_stale_after", 8.0) or 8.0)
+        cutoff = time.time() - max(stale_after, 1.0)
+        dropped: list[str] = []
+        with self._lock:
+            peer_last_seen = getattr(self, "_peer_last_seen", {})
+            peers = getattr(self, "_peers", {})
+            for peer_id, last_seen in list(peer_last_seen.items()):
+                if peer_id == self.peer_client_id:
+                    continue
+                if peer_id in peers and float(last_seen or 0.0) < cutoff:
+                    peers.pop(peer_id, None)
+                    peer_last_seen.pop(peer_id, None)
+                    dropped.append(peer_id)
+        for peer_id in dropped:
+            logger.info("Peer %s timed out and was removed from the peer list", peer_id)
 
     # Internal ------------------------------------------------------------
     def _ordered_peers(self) -> List[CDevice]:
@@ -403,13 +491,14 @@ class PeerClient:
                         udp_peer_info = json.loads(data.decode("utf-8"))
                         if udp_peer_info["command"] == "D002":
                             udp_client_id = udp_peer_info.get("peer_client_id")
-                            if udp_client_id is not None:
-                                if udp_client_id != self.peer_client_id and udp_client_id not in self._peers.keys():
+                            if udp_client_id is not None and udp_client_id != self.peer_client_id:
+                                is_new_peer = udp_client_id not in self._peers
+                                if is_new_peer:
                                     logger.info("UDP discovery response from %s: %s", addr, udp_peer_info)
                                     logger.info(f"Current peer list: {self._peers}")
                                     logger.info(f"New peer discovered @ {addr}.")
                                     logger.info(f"Adding peer {udp_client_id}")
-                                    self.add_peer(udp_peer_info, source_address=addr[0])
+                                self.add_peer(udp_peer_info, source_address=addr[0])
                     except Exception as err:
                         logger.error(f"Error processing UDP discovery response: {err}")
 
@@ -493,8 +582,14 @@ class PeerClient:
             cdevice.ip_address = _peer_host_from_payload(peer_data, source_address=source_address)
             cdevice.port = peer_data.get("port", cdevice.port)
 
-            self._peers[peer_client_id] = cdevice
-            logger.info("Added peer %s to peer list", peer_client_id)
+            with self._lock:
+                is_new_peer = peer_client_id not in self._peers
+                self._peers[peer_client_id] = cdevice
+                self._peer_last_seen[peer_client_id] = time.time()
+            if is_new_peer:
+                logger.info("Added peer %s to peer list", peer_client_id)
+            else:
+                logger.debug("Refreshed peer %s", peer_client_id)
             return cdevice
         except Exception as err:
             logger.error(f"Failed to add peer to list: {err}")

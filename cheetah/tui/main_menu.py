@@ -147,9 +147,10 @@ class MainMenu(App):
 
     def _get_peer_count(self) -> None:
         count = self._peer_client.peer_count()
-        if count > 1:
-            new_title = f"[Nodes: {count}]"
-            self.app.title = new_title
+        title = f"[Nodes: {count}]"
+        if self.offline_mode:
+            title += " [offline]"
+        self.title = title
 
     @staticmethod
     def _help_text() -> str:

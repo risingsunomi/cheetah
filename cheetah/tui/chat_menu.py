@@ -431,11 +431,7 @@ class ChatScreen(Screen[None]):
         if self.app is None:
             return
         count = self._peer_client.peer_count()
-        if count > 1:
-            current = getattr(self.app, "sub_title", "")
-            new_title = f"[Nodes: {count}]"
-            if new_title != current:
-                self.app.title = new_title
+        self.app.title = f"[Nodes: {count}]"
     
     def _instruct_begin_chat(self) -> None:
         for history in self._history:
@@ -773,6 +769,11 @@ class ChatScreen(Screen[None]):
         from cheetah.orchestration.model_engine import ModelEngine
 
         backend = "torch" if self._llm_backend == "torch" else "tinygrad"
+        sender_peer_id = str(payload.get("sender_peer_id", "") or "").strip()
+        request_tokens = self._flow_token_count(payload)
+        if sender_peer_id:
+            self._record_peer_flow(sender_peer_id, self._peer_client.peer_client_id, request_tokens, phase="request")
+            self._mark_peer_seen(sender_peer_id)
 
         try:
             input_ids_data = self._payload_to_2d_list(payload.get("input_ids"))
@@ -804,7 +805,7 @@ class ChatScreen(Screen[None]):
                 shard = Shard(model_name, start_layer, end_layer, total_layers)
 
             engine = ModelEngine(shard=shard) if shard is not None else ModelEngine()
-            return engine.get_tokens(
+            response = engine.get_tokens(
                 self._model,
                 input_ids,
                 attention_mask,
@@ -818,6 +819,10 @@ class ChatScreen(Screen[None]):
                 repetition_penalty=float(payload.get("repetition_penalty", 1.0) or 1.0),
                 seen_tokens=[int(tok) for tok in payload.get("seen_tokens", []) or []],
             )
+            if sender_peer_id:
+                response_tokens = self._flow_token_count(response)
+                self._record_peer_flow(self._peer_client.peer_client_id, sender_peer_id, response_tokens, phase="response")
+            return response
         except Exception as exc:
             logger.exception("Peer token generation failed: %s", exc)
             return {"error": str(exc)}
@@ -833,6 +838,63 @@ class ChatScreen(Screen[None]):
                 return value
             return [value]
         return [[]]
+
+    @staticmethod
+    def _flow_token_count(message: Any) -> int:
+        payload = message.get("payload", message) if isinstance(message, dict) else message
+        if not isinstance(payload, dict):
+            return 0
+        for key in ("attention_mask", "position_ids", "input_ids", "hidden_state"):
+            count = ChatScreen._token_count_from_payload_value(payload.get(key))
+            if count > 0:
+                return count
+        if payload.get("token") is not None or payload.get("tensor") is not None:
+            return 1
+        return 0
+
+    @staticmethod
+    def _token_count_from_payload_value(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, list):
+            if not value:
+                return 0
+            if isinstance(value[0], list):
+                return max((len(row) for row in value if isinstance(row, list)), default=0)
+            return len(value)
+        if isinstance(value, dict):
+            shape = value.get("shape")
+            if isinstance(shape, list) and shape:
+                index = 1 if len(shape) >= 2 else 0
+                try:
+                    return max(int(shape[index]), 0)
+                except (TypeError, ValueError):
+                    return 0
+        try:
+            shape = tuple(getattr(value, "shape", ()) or ())
+        except Exception:
+            shape = ()
+        if len(shape) >= 2:
+            try:
+                return max(int(shape[1]), 0)
+            except (TypeError, ValueError):
+                return 0
+        if len(shape) == 1:
+            try:
+                return max(int(shape[0]), 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _record_peer_flow(self, source: str, target: str, tokens: int, *, phase: str) -> None:
+        recorder = getattr(self._peer_client, "record_flow", None)
+        if callable(recorder):
+            recorder(source, target, tokens, phase=phase)
+
+    def _mark_peer_seen(self, peer_client_id: str) -> None:
+        marker = getattr(self._peer_client, "mark_peer_seen", None)
+        if callable(marker):
+            marker(peer_client_id)
 
     def _payload_to_tensor(self, data: list[list[Any]], *, backend: str, integer: bool) -> Any:
         if backend == "torch":
