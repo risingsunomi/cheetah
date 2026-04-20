@@ -82,6 +82,27 @@ class Model:
             if callable(reset):
                 reset()
 
+    def _resolve_shard_window(self, shard: Shard | None) -> tuple[int, int, bool]:
+        requested = shard or self.shard
+        loaded_start = int(getattr(self.shard, "start_layer", 0) or 0)
+        loaded_end = int(getattr(self.shard, "end_layer", loaded_start + len(self.layers)) or (loaded_start + len(self.layers)))
+        requested_start = int(getattr(requested, "start_layer", loaded_start) or loaded_start)
+        requested_end = int(getattr(requested, "end_layer", loaded_end) or loaded_end)
+        total_layers = int(getattr(requested, "total_layers", getattr(self.shard, "total_layers", loaded_end + 1)) or (loaded_end + 1))
+
+        if requested_end == total_layers and loaded_end == total_layers - 1:
+            requested_end = loaded_end
+
+        if requested_start < loaded_start or requested_end > loaded_end:
+            raise ValueError(
+                f"Requested shard {requested_start}:{requested_end} is outside loaded range {loaded_start}:{loaded_end}"
+            )
+
+        local_start = requested_start - loaded_start
+        local_end = requested_end - loaded_start
+        is_final = total_layers > 0 and requested_end >= total_layers - 1
+        return local_start, local_end, is_final
+
     def _forward_impl(
         self,
         x,
@@ -89,20 +110,49 @@ class Model:
         attention_mask: tg.Tensor | None=None,
         hidden_state: tg.Tensor | None = None,
         start_pos: int | tg.UOp | None = None,
+        layer_start: int = 0,
+        layer_end: int | None = None,
+        is_final: bool | None = None,
     ):
         if hidden_state is None:
             x = self.embed_tokens(x)
         else:
             x = hidden_state
-            
-        for layer in self.layers:
+
+        if layer_end is None:
+            layer_end = len(self.layers)
+
+        for layer in self.layers[layer_start:layer_end]:
             x = layer(x, attention_mask, position_ids, start_pos=start_pos)
 
-        if self.shard.end_layer == self.shard.total_layers-1:
+        apply_output = self.shard.end_layer == self.shard.total_layers - 1 if is_final is None else bool(is_final)
+        if apply_output:
             x = self.norm(x)
             x = self.output(x)
         
         return x
+
+    def run_shard(
+        self,
+        x,
+        *,
+        position_ids: tg.Tensor | None = None,
+        attention_mask: tg.Tensor | None = None,
+        hidden_state: tg.Tensor | None = None,
+        shard: Shard | None = None,
+        start_pos: int | tg.UOp | None = None,
+    ):
+        layer_start, layer_end, is_final = self._resolve_shard_window(shard)
+        return self._forward_impl(
+            x,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            hidden_state=hidden_state,
+            start_pos=start_pos,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            is_final=is_final,
+        )
 
     def _decode_token_impl(self, x: tg.Tensor, start_pos: int | tg.UOp) -> tg.Tensor:
         return self._forward_impl(x, attention_mask=None, start_pos=start_pos).realize()
@@ -151,10 +201,11 @@ class Model:
         hidden_state: tg.Tensor | None = None,
         start_pos: int | tg.UOp | None = None,
     ):
-        return self._forward_impl(
+        return self.run_shard(
             x,
             position_ids=position_ids,
             attention_mask=attention_mask,
             hidden_state=hidden_state,
             start_pos=start_pos,
+            shard=self.shard,
         )

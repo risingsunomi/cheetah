@@ -290,6 +290,28 @@ class PeerClient:
         with self._lock:
             self._peer_last_seen[peer_id] = time.time()
 
+    def peer_last_seen(self, peer_client_id: str | None) -> float | None:
+        peer_id = str(peer_client_id or "").strip()
+        if not peer_id:
+            return None
+        if peer_id == self.peer_client_id:
+            return time.time()
+        with self._lock:
+            last_seen = self._peer_last_seen.get(peer_id)
+        return None if last_seen is None else float(last_seen)
+
+    def peer_is_active(self, peer_client_id: str | None) -> bool:
+        peer_id = str(peer_client_id or "").strip()
+        if not peer_id:
+            return False
+        if peer_id == self.peer_client_id:
+            return True
+        last_seen = self.peer_last_seen(peer_id)
+        if last_seen is None:
+            return False
+        stale_after = float(getattr(self, "_peer_stale_after", 8.0) or 8.0)
+        return last_seen >= (time.time() - max(stale_after, 1.0))
+
     def record_flow(
         self,
         source: str | None,
@@ -603,7 +625,8 @@ class PeerClient:
             "shard": {
                 "model_name": self.shard.model_name,
                 "start_layer": self.shard.start_layer,
-                "end_layer": self.shard.end_layer
+                "end_layer": self.shard.end_layer,
+                "total_layers": self.shard.total_layers,
             },
             "peer_device": self.peer_device.as_dict()
         }

@@ -124,6 +124,10 @@ class OrchestrationScreen(Screen[None]):
         peers = [self._peer_entry_to_obj(peer) for peer in self._peer_client.get_peers(include_self=True)]
         peers = [peer for peer in peers if peer is not None]
         def _status(peer) -> str:
+            peer_id = str(getattr(peer, "peer_client_id", "") or "")
+            is_active = getattr(self._peer_client, "peer_is_active", None)
+            if callable(is_active) and peer_id:
+                return "[green]●[/]" if is_active(peer_id) else "[yellow]●[/]"
             available = getattr(peer, "available", None)
             if available is not None:
                 return "[green]●[/]" if available else "[red]●[/]"
@@ -167,8 +171,9 @@ class OrchestrationScreen(Screen[None]):
         for peer in ordered:
             flops = _flops_value(peer)
             flops_label = f"{flops:.1f} TFLOPS" if flops else "-- TFLOPS"
+            activity = self._peer_activity_label(peer)
             ring_lines.append("🖥️")
-            ring_lines.append(f"{_host_label(peer)} {flops_label} {_status(peer)}")
+            ring_lines.append(f"{_host_label(peer)} {flops_label} {_status(peer)} {activity}")
         return "\n".join(ring_lines)
 
     def _peer_summary_text(self) -> str:
@@ -195,6 +200,7 @@ class OrchestrationScreen(Screen[None]):
             gpu_model = str(getattr(peer, "gpu_model", "") or "Unknown GPU")
             gpu_vram = str(getattr(peer, "gpu_vram", "") or "0")
             lines.append(f"{host} {flops_label}")
+            lines.append(f"Status: {self._peer_activity_label(peer)}")
             lines.append(f"CPU: {cpu_model} ({cpu_cores} cores, {cpu_ram} GB)")
             lines.append(f"GPU: {gpu_model} ({gpu_vram} VRAM)")
         return "\n".join(lines)
@@ -273,3 +279,24 @@ class OrchestrationScreen(Screen[None]):
         if host in {"", "0.0.0.0"}:
             return peer_id
         return f"{peer_id} ({host})"
+
+    def _peer_activity_label(self, peer: object) -> str:
+        peer_id = str(getattr(peer, "peer_client_id", "") or "").strip()
+        if not peer_id:
+            return "Unknown"
+        if peer_id == self._peer_client.peer_client_id:
+            return "Local"
+
+        last_seen_fn = getattr(self._peer_client, "peer_last_seen", None)
+        is_active_fn = getattr(self._peer_client, "peer_is_active", None)
+        if not callable(last_seen_fn):
+            return "Unknown"
+
+        last_seen = last_seen_fn(peer_id)
+        if last_seen is None:
+            return "Offline"
+
+        age = max(time.time() - float(last_seen), 0.0)
+        is_active = bool(is_active_fn(peer_id)) if callable(is_active_fn) else False
+        prefix = "Active" if is_active else "Idle"
+        return f"{prefix} {age:.0f}s ago"

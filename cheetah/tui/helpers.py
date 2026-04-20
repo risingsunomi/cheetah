@@ -608,7 +608,7 @@ def streaming_generate_with_peers(
 
     input_list = _tensor_to_list(input_ids)
     mask_list = _tensor_to_list(attention_mask)
-    position_list = [[0]]
+    position_list = [[]]
     hidden_state_list = []
     seen_tokens = [int(v) for row in input_list for v in row]
 
@@ -617,6 +617,7 @@ def streaming_generate_with_peers(
 
     for step in range(max_new_tokens):
         _raise_if_abort(abort_check)
+        prefill = step == 0
         logger.debug(f"[step: {step} Starting distributed generation with {len(peers)} peers for up to {max_new_tokens} tokens")
         logger.debug(f"Initial input_ids: {input_list}, attention_mask: {mask_list}")
         input_ids = _list_to_tensor(input_list, like=input_ids)
@@ -626,6 +627,8 @@ def streaming_generate_with_peers(
             input_ids,
             attention_mask,
             tokenizer,
+            position_ids=None,
+            prefill=prefill,
             temp=temp,
             top_k=top_k,
             top_p=top_p,
@@ -664,6 +667,7 @@ def streaming_generate_with_peers(
                     "attention_mask": mask_list,
                     "position_ids": position_list,
                     "hidden_state": hidden_state_list,
+                    "prefill": prefill,
                     "temp": temp,
                     "top_k": top_k,
                     "top_p": top_p,
@@ -689,6 +693,8 @@ def streaming_generate_with_peers(
                     expect_reply=True,
                     address=address,
                 )
+                if isinstance(resp, dict) and resp.get("error"):
+                    raise RuntimeError(str(resp.get("error")))
                 _mark_peer_seen(peer_client, peer_id)
                 response_tokens = _flow_token_count(resp)
                 _record_peer_flow(peer_client, peer_id, local_peer_id or "local", response_tokens, phase="response")
@@ -696,7 +702,7 @@ def streaming_generate_with_peers(
                 logger.debug("Received token response from peer %s", peer_id)
             except Exception as err:
                 logger.error(f"Error communicating with peer {peer_id}: {err}")
-                break
+                raise
 
             prev_len = len(out_tokens)
             mask_list, position_list, hidden_state_list, end_token = _apply_token_data(
@@ -844,6 +850,13 @@ def _plan_peer_shards(model_engine: ModelEngine, peer_client: Any, model: Any) -
         return
     model_name = str(getattr(model, "model_name", "") or getattr(model, "name", "") or "model")
     model_engine.plan_shards(peers, model_name, total_layers)
+    local_shard = getattr(getattr(peer_client, "peer_device", None), "shard", None)
+    if local_shard is not None:
+        model_engine.shard = local_shard
+        try:
+            peer_client.shard = local_shard
+        except Exception:
+            pass
 
 
 def _apply_token_data(

@@ -778,11 +778,17 @@ class ChatScreen(Screen[None]):
         try:
             input_ids_data = self._payload_to_2d_list(payload.get("input_ids"))
             attention_mask_data = self._payload_to_2d_list(payload.get("attention_mask"))
+            position_ids_data = self._payload_to_2d_list(payload.get("position_ids"))
             hidden_state_data = self._payload_to_2d_list(payload.get("hidden_state"))
             hidden_state = None if hidden_state_data in ([], [[]]) else self._payload_to_tensor(
                 hidden_state_data,
                 backend=backend,
                 integer=False,
+            )
+            position_ids = None if position_ids_data in ([], [[]]) else self._payload_to_tensor(
+                position_ids_data,
+                backend=backend,
+                integer=True,
             )
 
             input_ids = self._payload_to_tensor(input_ids_data, backend=backend, integer=True)
@@ -811,6 +817,8 @@ class ChatScreen(Screen[None]):
                 attention_mask,
                 self._tokenizer,
                 hidden_state=hidden_state,
+                position_ids=position_ids,
+                prefill=bool(payload.get("prefill", False)),
                 temp=float(payload.get("temp", 1.0) or 1.0),
                 top_k=int(payload.get("top_k", 0) or 0),
                 top_p=float(payload.get("top_p", 0.8) or 0.8),

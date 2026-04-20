@@ -204,3 +204,15 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         self.assertEqual(flows[0]["target"], "peer-1")
         self.assertEqual(flows[0]["tokens"], 96)
         self.assertEqual(flows[0]["count"], 2)
+
+    def test_peer_is_active_uses_last_seen_window(self):
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client._lock = threading.RLock()
+        client._peer_last_seen = {"peer-1": 95.0}
+        client._peer_stale_after = 10.0
+
+        with mock.patch("cheetah.orchestration.peer_client.time.time", return_value=100.0):
+            self.assertTrue(PeerClient.peer_is_active(client, "peer-1"))
+            self.assertFalse(PeerClient.peer_is_active(client, "peer-2"))
+            self.assertTrue(PeerClient.peer_is_active(client, "self"))
