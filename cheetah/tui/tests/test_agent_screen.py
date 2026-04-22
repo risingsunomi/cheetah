@@ -294,11 +294,20 @@ class TestAgentScreenModelLoad(unittest.IsolatedAsyncioTestCase):
                     "remote_results": [
                         {
                             "peer": remote_peer,
-                            "response": {"elapsed": 1.2, "already_loaded": False},
+                            "response": {
+                                "elapsed": 1.2,
+                                "already_loaded": False,
+                                "config_fingerprint": "match-config",
+                                "tokenizer_fingerprint": "match-tokenizer",
+                            },
                         }
                     ]
                 },
             ) as load_peers,
+            patch(
+                "cheetah.tui.agent_screen.validate_peer_runtime_fingerprints",
+                return_value=[],
+            ) as validate_fingerprints,
         ):
             await screen._start_model_load()
 
@@ -309,6 +318,7 @@ class TestAgentScreenModelLoad(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shard.end_layer, 4)
         self.assertTrue(screen._model_loaded)
         load_peers.assert_called_once()
+        validate_fingerprints.assert_called_once()
         self.assertEqual(runtime_calls[0]["model_id"], "demo/model")
         self.assertEqual(runtime_calls[0]["shard"].start_layer, 0)
         self.assertIn("Waiting for 1 peer shard(s) to finish loading...", log_messages)

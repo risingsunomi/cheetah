@@ -26,6 +26,7 @@ from cheetah.models.llm.backend import (
     backend_helpers_module,
     detect_quantization_mode as detect_quantization_mode_backend,
     get_backend_device,
+    runtime_asset_fingerprints,
 )
 from cheetah.models.shard import Shard
 from cheetah.orchestration.model_engine import ModelEngine
@@ -1004,6 +1005,42 @@ def format_shard_span(shard: Any) -> str:
     total_layers = int(getattr(shard, "total_layers", end_layer + 1) or (end_layer + 1))
     transformer_layers = max(total_layers - 1, 1)
     return f"transformer layers {start_layer}:{end_layer} of {transformer_layers}"
+
+
+def local_runtime_fingerprints(*, model_config: Any, model_path: str | Path | None) -> dict[str, str]:
+    return runtime_asset_fingerprints(
+        model_config=model_config,
+        model_path=model_path,
+    )
+
+
+def validate_peer_runtime_fingerprints(
+    remote_results: list[dict[str, Any]],
+    *,
+    local_model_config: Any,
+    local_model_path: str | Path | None,
+) -> list[str]:
+    local = local_runtime_fingerprints(
+        model_config=local_model_config,
+        model_path=local_model_path,
+    )
+    mismatches: list[str] = []
+    for entry in remote_results:
+        peer = entry.get("peer")
+        response = entry.get("response", {}) if isinstance(entry.get("response"), dict) else {}
+        label = _peer_log_label(peer, fallback=_peer_identifier(peer))
+        remote_config_fp = str(response.get("config_fingerprint", "") or "")
+        remote_tokenizer_fp = str(response.get("tokenizer_fingerprint", "") or "")
+        if not remote_config_fp:
+            mismatches.append(f"{label} did not report a model config fingerprint")
+            continue
+        if remote_config_fp and remote_config_fp != local["config_fingerprint"]:
+            mismatches.append(f"{label} model config fingerprint mismatch")
+        if local["tokenizer_fingerprint"] and not remote_tokenizer_fp:
+            mismatches.append(f"{label} did not report a tokenizer fingerprint")
+        elif local["tokenizer_fingerprint"] and remote_tokenizer_fp != local["tokenizer_fingerprint"]:
+            mismatches.append(f"{label} tokenizer fingerprint mismatch")
+    return mismatches
 
 
 def _peer_model_load_timeout_seconds() -> float:

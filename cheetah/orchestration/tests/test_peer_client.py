@@ -119,6 +119,49 @@ class TestPeerClientReceiver(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload, expected)
 
+    async def test_send_payload_reads_full_chunked_json_reply(self):
+        host = TEST_RECEIVER_BIND_HOST
+        port = TEST_PORT + 1
+        timeout = TEST_TIMEOUT
+        expected = {"ok": True, "message": "chunked-response"}
+        request_seen: asyncio.Event = asyncio.Event()
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await reader.read(65536)
+            request_seen.set()
+            raw = json.dumps(expected).encode("utf-8")
+            midpoint = max(len(raw) // 2, 1)
+            writer.write(raw[:midpoint])
+            await writer.drain()
+            await asyncio.sleep(0.01)
+            writer.write(raw[midpoint:])
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(handle, host, port)
+        client = None
+        try:
+            with mock.patch.dict(os.environ, {"TC_PORT": "0"}, clear=False):
+                client = PeerClient()
+                _stop_peer_client(client)
+                response = await asyncio.to_thread(
+                    lambda: client.send_payload(
+                        {"command": "generate_token", "payload": {"input_ids": [[1]], "attention_mask": [[1]]}},
+                        expect_reply=True,
+                        address=(TEST_RECEIVER_CONNECT_HOST, port),
+                    )
+                )
+
+            await asyncio.wait_for(request_seen.wait(), timeout=timeout)
+        finally:
+            if client is not None:
+                _stop_peer_client(client)
+            server.close()
+            await server.wait_closed()
+
+        self.assertEqual(response, expected)
+
 
 class TestPeerDiscoveryHelpers(unittest.TestCase):
     def test_resolve_advertise_address_prefers_explicit_override(self):
@@ -332,6 +375,7 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         load_model.assert_awaited_once()
         self.assertTrue(response["ok"])
         self.assertFalse(response["already_loaded"])
+        self.assertTrue(response["config_fingerprint"])
         self.assertEqual(client._generation_model, model)
         self.assertEqual(client._generation_tokenizer, tokenizer)
         self.assertEqual(client._generation_model_id, "demo")
@@ -351,7 +395,7 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         client._generation_backend = "torch"
         client._generation_model_id = "demo"
         client._generation_model_config = {"num_layers": 4}
-        client._generation_model_path = "/tmp/model"
+        client._generation_model_path = ""
         client._generation_shard = Shard("demo", 0, 2, 5)
         client._generate_handler = None
 
@@ -375,4 +419,5 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         load_model.assert_not_awaited()
         self.assertTrue(response["ok"])
         self.assertTrue(response["already_loaded"])
+        self.assertTrue(response["config_fingerprint"])
         self.assertEqual(response["shard"]["start_layer"], 0)

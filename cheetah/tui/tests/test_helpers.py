@@ -383,6 +383,34 @@ class TestDistributedShardLogging(unittest.TestCase):
         self.assertEqual(plan["remote_peers"][0].shard.start_layer, 4)
         self.assertEqual(plan["remote_peers"][0].shard.end_layer, 8)
 
+    def test_validate_peer_runtime_fingerprints_detects_mismatch(self) -> None:
+        remote_peer = SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20")
+
+        with patch.object(
+            helpers,
+            "local_runtime_fingerprints",
+            return_value={
+                "config_fingerprint": "local-config",
+                "tokenizer_fingerprint": "local-tokenizer",
+            },
+        ):
+            mismatches = helpers.validate_peer_runtime_fingerprints(
+                [
+                    {
+                        "peer": remote_peer,
+                        "response": {
+                            "config_fingerprint": "remote-config",
+                            "tokenizer_fingerprint": "remote-tokenizer",
+                        },
+                    }
+                ],
+                local_model_config={"num_layers": 8},
+                local_model_path="/tmp/model",
+            )
+
+        self.assertIn("peer-1 (192.168.0.20) model config fingerprint mismatch", mismatches)
+        self.assertIn("peer-1 (192.168.0.20) tokenizer fingerprint mismatch", mismatches)
+
 
 if __name__ == "__main__":
     unittest.main()

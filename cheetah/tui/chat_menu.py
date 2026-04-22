@@ -34,6 +34,7 @@ from cheetah.tui.helpers import (
     distributed_shard_log_messages,
     format_shard_span,
     load_model_shards_on_peers,
+    validate_peer_runtime_fingerprints,
     memory_abort_reason,
     split_thinking_response,
     total_layers_from_model_config,
@@ -1306,6 +1307,13 @@ class ChatScreen(Screen[None]):
                         total_layers=total_layers_from_model_config(self._model_config),
                         peers=peer_plan.get("peers"),
                     )
+                    mismatches = validate_peer_runtime_fingerprints(
+                        peer_load_plan.get("remote_results", []),
+                        local_model_config=self._model_config,
+                        local_model_path=self._model_cache_path,
+                    )
+                    if mismatches:
+                        raise RuntimeError("; ".join(mismatches))
                     for entry in peer_load_plan.get("remote_results", []):
                         peer = entry.get("peer")
                         response = entry.get("response", {}) if isinstance(entry.get("response"), dict) else {}

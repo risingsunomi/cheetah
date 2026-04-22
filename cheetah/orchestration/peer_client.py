@@ -15,7 +15,12 @@ from contextlib import closing
 import asyncio
 
 from cheetah.logging_utils import get_logger
-from cheetah.models.llm.backend import get_backend_device, get_llm_backend, load_model_for_backend
+from cheetah.models.llm.backend import (
+    get_backend_device,
+    get_llm_backend,
+    load_model_for_backend,
+    runtime_asset_fingerprints,
+)
 from cheetah.models.shard import Shard
 from cheetah.orchestration.model_engine import ModelEngine
 from cheetah.orchestration.cdevice import CDevice
@@ -341,12 +346,17 @@ class PeerClient:
         ):
             if current_shard is not None:
                 self.shard = current_shard
+            fingerprints = runtime_asset_fingerprints(
+                model_config=getattr(self, "_generation_model_config", None),
+                model_path=getattr(self, "_generation_model_path", ""),
+            )
             return {
                 "ok": True,
                 "already_loaded": True,
                 "model_id": model_id,
                 "backend": backend,
                 "shard": _shard_payload(current_shard),
+                **fingerprints,
                 "elapsed": 0.0,
             }
 
@@ -372,6 +382,10 @@ class PeerClient:
                 model_path=str(model_path),
                 shard=getattr(model, "shard", None) or shard,
             )
+            fingerprints = runtime_asset_fingerprints(
+                model_config=model_config,
+                model_path=model_path,
+            )
             return {
                 "ok": True,
                 "already_loaded": False,
@@ -379,6 +393,7 @@ class PeerClient:
                 "backend": backend,
                 "model_path": str(model_path),
                 "shard": _shard_payload(getattr(self, "_generation_shard", None)),
+                **fingerprints,
                 "elapsed": elapsed,
             }
         except Exception as exc:
@@ -492,10 +507,16 @@ class PeerClient:
                 if not expect_reply:
                     return {}
                 sock.shutdown(socket.SHUT_WR)
-                response = sock.recv(65536)
+                chunks: list[bytes] = []
+                while True:
+                    response = sock.recv(65536)
+                    if not response:
+                        break
+                    chunks.append(response)
             
                 self.in_use = False
-                json_response = json.loads(response.decode("utf-8"))
+                raw = b"".join(chunks)
+                json_response = json.loads(raw.decode("utf-8"))
                 logger.debug(f"Received response from {host}:{port} - {json_response}")
                 return json_response
         except Exception as err:

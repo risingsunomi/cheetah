@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
 import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -19,6 +21,14 @@ _BACKEND_DEFAULT_DEVICES = {
     "tinygrad": "CPU",
     "torch": "cpu",
 }
+_TOKENIZER_FINGERPRINT_FILES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "merges.txt",
+    "vocab.json",
+)
 
 
 def normalize_llm_backend(value: str | None) -> str:
@@ -134,6 +144,43 @@ def backend_model_config_class(backend: str | None = None):
     return backend_model_config_module(backend=backend).ModelConfig
 
 
+def model_config_fingerprint(model_config: Any) -> str:
+    normalized = _json_safe_value(model_config)
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def tokenizer_assets_fingerprint(model_path: str | Path | None) -> str:
+    if model_path is None:
+        return ""
+    root = Path(model_path).expanduser()
+    if not root.exists():
+        return ""
+
+    digest = hashlib.sha256()
+    found = False
+    for filename in _TOKENIZER_FINGERPRINT_FILES:
+        candidate = root / filename
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        digest.update(filename.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(candidate.read_bytes())
+        found = True
+    return digest.hexdigest() if found else ""
+
+
+def runtime_asset_fingerprints(
+    *,
+    model_config: Any,
+    model_path: str | Path | None,
+) -> dict[str, str]:
+    return {
+        "config_fingerprint": model_config_fingerprint(model_config),
+        "tokenizer_fingerprint": tokenizer_assets_fingerprint(model_path),
+    }
+
+
 async def resolve_model_assets_for_backend(
     model_id: str,
     *,
@@ -209,3 +256,13 @@ def detect_quantization_mode(model_config: Any, backend: str | None = None) -> t
     if quant_type:
         parts.append(quant_type)
     return True, " ".join(parts)
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(val) for key, val in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
