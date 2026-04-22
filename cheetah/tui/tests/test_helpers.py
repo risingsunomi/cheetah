@@ -246,6 +246,88 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
         self.assertEqual(model.decode_calls, 1)
         self.assertEqual(model.start_positions, [2])
 
+    def test_streaming_generate_with_peers_uses_prefill_timeout_for_peer_rpc(self) -> None:
+        class _FakeEngine:
+            def __init__(self) -> None:
+                self.shard = None
+
+            def get_tokens(self, *args, **kwargs):
+                del args, kwargs
+                return {
+                    "hidden_state": [[[0.1]]],
+                    "attention_mask": [[1, 1]],
+                    "position_ids": [[0, 1]],
+                    "end_token": False,
+                }
+
+            def recv_tokens(self, payload, tokenizer=None, backend=None):
+                del tokenizer, backend
+                return payload
+
+        class _PeerClientStub:
+            def __init__(self) -> None:
+                self.peer_client_id = "self"
+                self_peer = SimpleNamespace(
+                    peer_client_id="self",
+                    ip_address="192.168.0.10",
+                    port=8765,
+                    gpu_vram="8",
+                    cpu_ram="8",
+                    gpu_flops=0.0,
+                )
+                remote_peer = SimpleNamespace(
+                    peer_client_id="peer-1",
+                    ip_address="192.168.0.20",
+                    port=8765,
+                    gpu_vram="8",
+                    cpu_ram="8",
+                    gpu_flops=0.0,
+                )
+                self.peer_device = self_peer
+                self._peers = [self_peer, remote_peer]
+                self.calls: list[dict[str, object]] = []
+
+            def get_peers(self, include_self: bool = False):
+                return list(self._peers if include_self else self._peers[1:])
+
+            def send_payload(self, message, *, expect_reply=True, address=None, timeout=None):
+                self.calls.append(
+                    {
+                        "message": message,
+                        "expect_reply": expect_reply,
+                        "address": address,
+                        "timeout": timeout,
+                    }
+                )
+                return {
+                    "token": 1,
+                    "attention_mask": [[1, 1]],
+                    "position_ids": [[0, 1]],
+                    "end_token": True,
+                }
+
+        peer_client = _PeerClientStub()
+        model = SimpleNamespace(config={"num_layers": 8}, shard=None)
+        tokenizer = _DummyTokenizer(chat_template="")
+
+        with patch.object(helpers, "_local_engine", return_value=_FakeEngine()):
+            with patch.dict(os.environ, {"TC_PEER_PREFILL_TIMEOUT_SECONDS": "45"}, clear=False):
+                out, _ = helpers.streaming_generate_with_peers(
+                    peer_client,
+                    model,
+                    input_ids=tg.Tensor([[10, 11]]),
+                    attention_mask=tg.Tensor([[1, 1]]),
+                    tokenizer=tokenizer,
+                    max_new_tokens=1,
+                    temp=0.0,
+                    top_k=0,
+                    top_p=1.0,
+                )
+
+        self.assertEqual(out, [1])
+        self.assertEqual(len(peer_client.calls), 1)
+        self.assertEqual(peer_client.calls[0]["timeout"], 45.0)
+
 
 class TestDistributedShardLogging(unittest.TestCase):
     def test_distributed_shard_plan_messages_list_local_then_remote_peers(self) -> None:

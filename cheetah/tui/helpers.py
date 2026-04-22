@@ -660,6 +660,17 @@ def streaming_generate_with_peers(
 
         for peer in remote_peers:
             peer_id = _peer_identifier(peer)
+            request_timeout = _peer_generation_timeout_seconds(
+                prefill=prefill,
+                token_count=_flow_token_count(
+                    {
+                        "input_ids": input_list,
+                        "attention_mask": mask_list,
+                        "position_ids": position_list,
+                        "hidden_state": hidden_state_list,
+                    }
+                ),
+            )
             payload = {
                 "command": "generate_token",
                 "payload": {
@@ -693,6 +704,7 @@ def streaming_generate_with_peers(
                     payload,
                     expect_reply=True,
                     address=address,
+                    timeout=request_timeout,
                 )
                 if isinstance(resp, dict) and resp.get("error"):
                     raise RuntimeError(str(resp.get("error")))
@@ -701,6 +713,17 @@ def streaming_generate_with_peers(
                 _record_peer_flow(peer_client, peer_id, local_peer_id or "local", response_tokens, phase="response")
                 otoken_data = resp
                 logger.debug("Received token response from peer %s", peer_id)
+            except TimeoutError as err:
+                phase = "prefill" if prefill else "decode"
+                logger.error(
+                    "Timed out waiting for peer %s during %s after %.1fs",
+                    peer_id,
+                    phase,
+                    request_timeout,
+                )
+                raise TimeoutError(
+                    f"peer {peer_id} timed out during {phase} after {request_timeout:.1f}s"
+                ) from err
             except Exception as err:
                 logger.error(f"Error communicating with peer {peer_id}: {err}")
                 raise
@@ -991,6 +1014,23 @@ def _peer_model_load_timeout_seconds() -> float:
         return max(float(raw), 1.0)
     except ValueError:
         return 180.0
+
+
+def _peer_generation_timeout_seconds(*, prefill: bool, token_count: int = 0) -> float:
+    env_name = "TC_PEER_PREFILL_TIMEOUT_SECONDS" if prefill else "TC_PEER_DECODE_TIMEOUT_SECONDS"
+    default_timeout = 60.0 if prefill else 30.0
+    raw = (os.getenv(env_name) or "").strip()
+    if raw:
+        try:
+            return max(float(raw), 0.1)
+        except ValueError:
+            pass
+
+    if prefill and token_count > 0:
+        # Give larger prompts more time on slower peers without forcing every
+        # decode step to wait the full prefill ceiling.
+        return max(default_timeout, 15.0 + (float(token_count) / 8.0))
+    return default_timeout
 
 
 def _tensor_to_list(tensor: Any) -> list[list[Any]]:
