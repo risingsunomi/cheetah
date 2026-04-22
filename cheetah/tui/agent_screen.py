@@ -34,17 +34,23 @@ from cheetah.models.llm.backend import (
     get_backend_device,
     get_llm_backend,
     load_model_for_backend,
+    resolve_model_assets_for_backend,
 )
 from cheetah.orchestration.peer_client import PeerClient
 from cheetah.tui.help_screen import HelpScreen
 from cheetah.tui.helpers import (
     MemoryPressureError,
     apply_chat_template_with_thinking,
+    build_peer_load_plan,
+    clear_model_shards_on_peers,
     default_enable_thinking,
     distributed_shard_log_messages,
+    format_shard_span,
     memory_abort_reason,
+    load_model_shards_on_peers,
     relieve_memory_pressure,
     streaming_generate_with_peers,
+    total_layers_from_model_config,
 )
 from cheetah.tui.widget.model_picker_screen import ModelPickerScreen
 
@@ -411,55 +417,118 @@ class AgentScreen(Screen[None]):
         self._llm_backend = get_llm_backend()
         self._refresh_backend_label()
         self._log(f"Loading model '{self._model_id}' with backend '{self._llm_backend}'...")
+        peer_plan: dict[str, Any] | None = None
         try:
-            self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model()
-        except Exception as exc:
-            self._log(f"Model load failed: {exc}")
-            logger.exception("Agent model load failed")
-        else:
-            self._model_is_quantized, quant_mode = detect_quantization_mode(
-                self._model_config,
+            preview_config, _ = await resolve_model_assets_for_backend(
+                model_id=self._model_id,
+                offline_mode=self._offline,
                 backend=self._llm_backend,
             )
-            mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
-            total_layers = 0
-            if isinstance(self._model_config, dict):
-                try:
-                    num_layers = int(self._model_config.get("num_layers", 0) or 0)
-                except (TypeError, ValueError):
-                    num_layers = 0
-                total_layers = num_layers + 1 if num_layers > 0 else 0
+            total_layers = total_layers_from_model_config(preview_config)
+            peer_plan = build_peer_load_plan(
+                self._peer_client,
+                model_name=self._model_id or "model",
+                total_layers=total_layers,
+            )
             for line in distributed_shard_log_messages(
                 self._peer_client,
                 model_name=self._model_id or "model",
                 total_layers=total_layers,
             ):
                 self._log(line)
-            register_runtime = getattr(self._peer_client, "register_generation_runtime", None)
-            if callable(register_runtime):
-                register_runtime(
-                    model=self._model,
-                    tokenizer=self._tokenizer,
-                    backend=self._llm_backend,
+            local_shard = peer_plan.get("local_shard") if peer_plan else None
+            self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model(
+                shard=local_shard,
+            )
+        except Exception as exc:
+            self._clear_model(update_log=False, clear_remote=False)
+            if peer_plan is not None and peer_plan.get("distributed"):
+                await asyncio.to_thread(
+                    clear_model_shards_on_peers,
+                    self._peer_client,
+                    peers=peer_plan.get("remote_peers"),
                     model_id=self._model_id or "",
                 )
-            self._model_loaded = True
-            if self._thinking_checkbox is not None and "enable_thinking" not in self._gen_overrides:
-                self._thinking_checkbox.value = default_enable_thinking(
-                    model_path=self._model_cache_path,
-                    tokenizer=self._tokenizer,
+            self._log(f"Model load failed: {exc}")
+            logger.exception("Agent model load failed")
+        else:
+            try:
+                self._model_is_quantized, quant_mode = detect_quantization_mode(
+                    self._model_config,
+                    backend=self._llm_backend,
                 )
-            self._log(f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}.")
+                mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
+                local_shard = getattr(self._model, "shard", None)
+                register_runtime = getattr(self._peer_client, "register_generation_runtime", None)
+                if callable(register_runtime):
+                    register_runtime(
+                        model=self._model,
+                        tokenizer=self._tokenizer,
+                        backend=self._llm_backend,
+                        model_id=self._model_id or "",
+                        model_config=self._model_config,
+                        model_path=str(self._model_cache_path or ""),
+                        shard=getattr(self._model, "shard", None),
+                    )
+                if peer_plan is not None and peer_plan.get("distributed"):
+                    remote_peer_count = len(peer_plan.get("remote_peers", []))
+                    if remote_peer_count > 0:
+                        self._log(f"Waiting for {remote_peer_count} peer shard(s) to finish loading...")
+                    peer_load_plan = await asyncio.to_thread(
+                        load_model_shards_on_peers,
+                        self._peer_client,
+                        model_id=self._model_id or "",
+                        backend=self._llm_backend,
+                        offline_mode=self._offline,
+                        total_layers=total_layers_from_model_config(self._model_config),
+                        peers=peer_plan.get("peers"),
+                    )
+                    for entry in peer_load_plan.get("remote_results", []):
+                        peer = entry.get("peer")
+                        response = entry.get("response", {}) if isinstance(entry.get("response"), dict) else {}
+                        label = self._peer_label_for_log(peer)
+                        status = "already ready" if response.get("already_loaded") else "ready"
+                        try:
+                            peer_elapsed = float(response.get("elapsed", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            peer_elapsed = 0.0
+                        shard = getattr(peer, "shard", None)
+                        self._log(f"{label} {status} in {peer_elapsed:.1f}s: {format_shard_span(shard)}.")
+                self._model_loaded = True
+                if self._thinking_checkbox is not None and "enable_thinking" not in self._gen_overrides:
+                    self._thinking_checkbox.value = default_enable_thinking(
+                        model_path=self._model_cache_path,
+                        tokenizer=self._tokenizer,
+                    )
+                if peer_plan is not None and peer_plan.get("distributed") and local_shard is not None:
+                    self._log(
+                        f"Local shard ready in {elapsed:.1f}s. Backend: {self._llm_backend}. "
+                        f"Mode: {mode_label}. {format_shard_span(local_shard)}."
+                    )
+                    self._log(f"Shard-aware model ready on {len(peer_plan.get('peers', []))} nodes.")
+                else:
+                    self._log(f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}.")
+            except Exception as exc:
+                self._clear_model(update_log=False, clear_remote=False)
+                if peer_plan is not None and peer_plan.get("distributed"):
+                    await asyncio.to_thread(
+                        clear_model_shards_on_peers,
+                        self._peer_client,
+                        peers=peer_plan.get("remote_peers"),
+                        model_id=self._model_id or "",
+                    )
+                self._log(f"Model load failed: {exc}")
+                logger.exception("Agent model load failed")
         finally:
             self._set_load_button_enabled(True)
             self._refresh_state_label()
 
-    async def _load_model(self) -> tuple[Any, dict[str, Any], AutoTokenizer, Path, float]:
+    async def _load_model(self, *, shard: Any = None) -> tuple[Any, dict[str, Any], AutoTokenizer, Path, float]:
         self._llm_backend = get_llm_backend()
         start = time.time()
         model, model_config, tokenizer, model_path = await load_model_for_backend(
             model_id=self._model_id,
-            shard=None,
+            shard=shard,
             weight_device=None,
             offline_mode=self._offline,
             backend=self._llm_backend,
@@ -1149,13 +1218,38 @@ class AgentScreen(Screen[None]):
         if self._load_button is not None:
             self._load_button.disabled = not enabled
 
-    def _clear_model(self, *, update_log: bool = True) -> None:
+    def _peer_label_for_log(self, peer: Any) -> str:
+        if peer is None:
+            return "peer"
+        peer_id = str(getattr(peer, "peer_client_id", "") or "peer").strip()
+        host = str(getattr(peer, "ip_address", "") or getattr(peer, "address", "")).strip()
+        if not host or host == peer_id:
+            return peer_id
+        return f"{peer_id} ({host})"
+
+    def _clear_model(self, *, update_log: bool = True, clear_remote: bool = True) -> None:
         existing_model = self._model
         if self._agent_running:
             self._stop_agent()
         clear_runtime = getattr(self._peer_client, "clear_generation_runtime", None)
         if callable(clear_runtime):
             clear_runtime(model=existing_model)
+        if clear_remote:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                clear_model_shards_on_peers(
+                    self._peer_client,
+                    model_id=self._model_id or "",
+                )
+            else:
+                loop.create_task(
+                    asyncio.to_thread(
+                        clear_model_shards_on_peers,
+                        self._peer_client,
+                        model_id=self._model_id or "",
+                    )
+                )
         self._model = None
         self._model_config = None
         self._tokenizer = None

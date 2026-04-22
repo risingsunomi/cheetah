@@ -18,6 +18,7 @@ from cheetah.models.llm.backend import (
     get_backend_device,
     get_llm_backend,
     load_model_for_backend,
+    resolve_model_assets_for_backend,
 )
 from cheetah.tui.widget.model_picker_screen import ModelPickerScreen
 from cheetah.tui.chat_log_storage import ChatLogStorage, ChatLogSummary, ChatMessage
@@ -27,10 +28,15 @@ from cheetah.tui.help_screen import HelpScreen
 from cheetah.tui.helpers import (
     MemoryPressureError,
     apply_chat_template_with_thinking,
+    build_peer_load_plan,
+    clear_model_shards_on_peers,
     default_enable_thinking,
     distributed_shard_log_messages,
+    format_shard_span,
+    load_model_shards_on_peers,
     memory_abort_reason,
     split_thinking_response,
+    total_layers_from_model_config,
 )
 
 from textual.app import ComposeResult
@@ -1218,49 +1224,117 @@ class ChatScreen(Screen[None]):
         return self._parse_log_item_id(getattr(widget, "id", None))
 
     async def _start_model_load(self) -> None:
-        # loaded_model = self._load_model()
+        peer_plan: dict[str, Any] | None = None
         try:
-            self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model()
-        except Exception as exc:
-            self._log_sys_msg(f"Model load failed: {exc}\n traceback: {traceback.format_exc()}")
-            self._set_load_button_enabled(True)
-            if self._chat_input is not None:
-                self._chat_input.focus()
-        else:
-            self._gen_overrides.pop("max_new_tokens", None)
-            self._model_is_quantized, quant_mode = detect_quantization_mode(
-                self._model_config,
+            preview_config, _ = await resolve_model_assets_for_backend(
+                model_id=self._model_id,
+                offline_mode=self._offline,
                 backend=self._llm_backend,
+                progress_callback=self._log_model_download_progress,
             )
-            mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
-            ready_msg = (
-                f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}."
+            total_layers = total_layers_from_model_config(preview_config)
+            peer_plan = build_peer_load_plan(
+                self._peer_client,
+                model_name=self._model_id or "model",
+                total_layers=total_layers,
             )
-            self._log_sys_msg(ready_msg)
-            self._log_effective_gen_config()
-            total_layers = 0
-            if isinstance(self._model_config, dict):
-                try:
-                    num_layers = int(self._model_config.get("num_layers", 0) or 0)
-                except (TypeError, ValueError):
-                    num_layers = 0
-                total_layers = num_layers + 1 if num_layers > 0 else 0
             for line in distributed_shard_log_messages(
                 self._peer_client,
                 model_name=self._model_id or "model",
                 total_layers=total_layers,
             ):
                 self._log_sys_msg(line)
-            register_runtime = getattr(self._peer_client, "register_generation_runtime", None)
-            if callable(register_runtime):
-                register_runtime(
-                    model=self._model,
-                    tokenizer=self._tokenizer,
-                    backend=self._llm_backend,
+
+            local_shard = peer_plan.get("local_shard") if peer_plan else None
+            self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model(
+                shard=local_shard,
+            )
+        except Exception as exc:
+            self._clear_model(persist=False, clear_remote=False)
+            if peer_plan is not None and peer_plan.get("distributed"):
+                await asyncio.to_thread(
+                    clear_model_shards_on_peers,
+                    self._peer_client,
+                    peers=peer_plan.get("remote_peers"),
                     model_id=self._model_id or "",
                 )
-            self._model_loaded = True
+            self._log_sys_msg(f"Model load failed: {exc}\n traceback: {traceback.format_exc()}")
             self._set_load_button_enabled(True)
+            if self._chat_input is not None:
+                self._chat_input.focus()
+        else:
+            try:
+                self._gen_overrides.pop("max_new_tokens", None)
+                self._model_is_quantized, quant_mode = detect_quantization_mode(
+                    self._model_config,
+                    backend=self._llm_backend,
+                )
+                mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
+                local_shard = getattr(self._model, "shard", None)
+                if peer_plan is not None and peer_plan.get("distributed") and local_shard is not None:
+                    ready_msg = (
+                        f"Local shard ready in {elapsed:.1f}s. Backend: {self._llm_backend}. "
+                        f"Mode: {mode_label}. {format_shard_span(local_shard)}."
+                    )
+                else:
+                    ready_msg = (
+                        f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}."
+                    )
+                self._log_sys_msg(ready_msg)
+                self._log_effective_gen_config()
+                register_runtime = getattr(self._peer_client, "register_generation_runtime", None)
+                if callable(register_runtime):
+                    register_runtime(
+                        model=self._model,
+                        tokenizer=self._tokenizer,
+                        backend=self._llm_backend,
+                        model_id=self._model_id or "",
+                        model_config=self._model_config,
+                        model_path=str(self._model_cache_path or ""),
+                        shard=getattr(self._model, "shard", None),
+                    )
+                if peer_plan is not None and peer_plan.get("distributed"):
+                    remote_peer_count = len(peer_plan.get("remote_peers", []))
+                    if remote_peer_count > 0:
+                        self._log_sys_msg(f"Waiting for {remote_peer_count} peer shard(s) to finish loading...")
+                    peer_load_plan = await asyncio.to_thread(
+                        load_model_shards_on_peers,
+                        self._peer_client,
+                        model_id=self._model_id or "",
+                        backend=self._llm_backend,
+                        offline_mode=self._offline,
+                        total_layers=total_layers_from_model_config(self._model_config),
+                        peers=peer_plan.get("peers"),
+                    )
+                    for entry in peer_load_plan.get("remote_results", []):
+                        peer = entry.get("peer")
+                        response = entry.get("response", {}) if isinstance(entry.get("response"), dict) else {}
+                        label = self._peer_label_for_log(peer)
+                        status = "already ready" if response.get("already_loaded") else "ready"
+                        try:
+                            peer_elapsed = float(response.get("elapsed", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            peer_elapsed = 0.0
+                        shard = getattr(peer, "shard", None)
+                        self._log_sys_msg(f"{label} {status} in {peer_elapsed:.1f}s: {format_shard_span(shard)}.")
+                    self._log_sys_msg(
+                        f"Shard-aware model ready on {len(peer_plan.get('peers', []))} nodes."
+                    )
+                self._model_loaded = True
+                self._set_load_button_enabled(True)
+            except Exception as exc:
+                self._clear_model(persist=False, clear_remote=False)
+                if peer_plan is not None and peer_plan.get("distributed"):
+                    await asyncio.to_thread(
+                        clear_model_shards_on_peers,
+                        self._peer_client,
+                        peers=peer_plan.get("remote_peers"),
+                        model_id=self._model_id or "",
+                    )
+                self._log_sys_msg(f"Model load failed: {exc}\n traceback: {traceback.format_exc()}")
+                self._set_load_button_enabled(True)
+                if self._chat_input is not None:
+                    self._chat_input.focus()
 
     def _log_sys_msg(self, message: str, *, persist: bool = False) -> None:
         self._append_system(message, persist=persist)
@@ -1268,13 +1342,13 @@ class ChatScreen(Screen[None]):
     async def _log_model_download_progress(self, message: str) -> None:
         self._log_sys_msg(f"[download] {message}", persist=False)
 
-    async def _load_model(self) -> tuple[Any, object, AutoTokenizer, Path, float]:
+    async def _load_model(self, *, shard: Any = None) -> tuple[Any, object, AutoTokenizer, Path, float]:
         try:
             self._llm_backend = get_llm_backend()
             start = time.time()
             model, model_config, tokenizer, model_path = await load_model_for_backend(
                 model_id=self._model_id,
-                shard=None,
+                shard=shard,
                 weight_device=None,
                 offline_mode=self._offline,
                 backend=self._llm_backend,
@@ -1403,7 +1477,22 @@ class ChatScreen(Screen[None]):
     def _memory_abort_reason(self) -> str | None:
         return memory_abort_reason("chat generation")
 
-    def _clear_model(self, *, persist: bool = False, reset_kv_cache: bool = False) -> None:
+    def _peer_label_for_log(self, peer: Any) -> str:
+        if peer is None:
+            return "peer"
+        peer_id = str(getattr(peer, "peer_client_id", "") or "peer").strip()
+        host = str(getattr(peer, "ip_address", "") or getattr(peer, "address", "")).strip()
+        if not host or host == peer_id:
+            return peer_id
+        return f"{peer_id} ({host})"
+
+    def _clear_model(
+        self,
+        *,
+        persist: bool = False,
+        reset_kv_cache: bool = False,
+        clear_remote: bool = True,
+    ) -> None:
         existing_model = getattr(self, "_model", None)
         if persist:
             self._log_sys_msg("Clearing loaded model.", persist=True)
@@ -1417,6 +1506,22 @@ class ChatScreen(Screen[None]):
         clear_runtime = getattr(self._peer_client, "clear_generation_runtime", None)
         if callable(clear_runtime):
             clear_runtime(model=existing_model)
+        if clear_remote:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                clear_model_shards_on_peers(
+                    self._peer_client,
+                    model_id=self._model_id or "",
+                )
+            else:
+                loop.create_task(
+                    asyncio.to_thread(
+                        clear_model_shards_on_peers,
+                        self._peer_client,
+                        model_id=self._model_id or "",
+                    )
+                )
         self._model = None
         self._model_config = None
         self._tokenizer = None

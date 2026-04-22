@@ -759,37 +759,238 @@ def distributed_shard_plan_messages(
     model_name: str,
     total_layers: int,
 ) -> list[str]:
-    normalized = _normalize_peer_entries(peers)
+    normalized = planned_peer_shards(
+        peers,
+        model_name=model_name,
+        total_layers=total_layers,
+    )
     if len(normalized) <= 1 or int(total_layers or 0) <= 1:
         return []
 
-    planning_peers: list[Any] = []
-    labels: dict[str, str] = {}
+    lines = [f"Using {len(normalized)} nodes for shard-aware execution."]
     for index, peer in enumerate(normalized):
-        peer_id = str(getattr(peer, "peer_client_id", "") or f"peer-{index + 1}")
-        labels[peer_id] = _peer_log_label(peer, fallback=peer_id)
-        planning_peers.append(
-            SimpleNamespace(
-                peer_client_id=peer_id,
-                gpu_vram=getattr(peer, "gpu_vram", 0.0),
-                cpu_ram=getattr(peer, "cpu_ram", 0.0),
-                gpu_flops=getattr(peer, "gpu_flops", 0.0),
-            )
-        )
-
-    shards = ModelEngine.plan_shards(planning_peers, model_name or "model", int(total_layers))
-    if not shards:
-        return []
-
-    transformer_layers = max(int(total_layers) - 1, 1)
-    lines = [f"Using {len(planning_peers)} nodes for shard-aware execution."]
-    for peer, shard in zip(planning_peers, shards):
-        label = labels.get(str(peer.peer_client_id), str(peer.peer_client_id))
-        scope = "local shard" if str(peer.peer_client_id) == str(local_peer_id) else "shard on peer"
-        lines.append(
-            f"Loading {scope} {label}: transformer layers {int(shard.start_layer)}:{int(shard.end_layer)} of {transformer_layers}."
-        )
+        peer_id = str(_peer_value(peer, "peer_client_id", "") or f"peer-{index + 1}")
+        label = _peer_log_label(peer, fallback=peer_id)
+        shard = _peer_value(peer, "shard", None)
+        if shard is None:
+            continue
+        scope = "local shard" if str(peer_id) == str(local_peer_id) else "shard on peer"
+        lines.append(f"Loading {scope} {label}: {format_shard_span(shard)}.")
     return lines
+
+
+def total_layers_from_model_config(model_config: Any) -> int:
+    if not isinstance(model_config, dict):
+        return 0
+    try:
+        num_layers = int(model_config.get("num_layers", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return num_layers + 1 if num_layers > 0 else 0
+
+
+def planned_peer_shards(
+    peers: Any,
+    *,
+    model_name: str,
+    total_layers: int,
+) -> list[Any]:
+    normalized = _normalize_peer_entries(peers)
+    if len(normalized) <= 1 or int(total_layers or 0) <= 1:
+        return normalized
+
+    planning_peers: list[Any] = []
+    for index, peer in enumerate(normalized):
+        peer_id = str(_peer_value(peer, "peer_client_id", "") or f"peer-{index + 1}")
+        planning_peer = peer
+        if isinstance(peer, dict) or not hasattr(peer, "gpu_vram") or not hasattr(peer, "cpu_ram") or not hasattr(peer, "gpu_flops"):
+            planning_peer = SimpleNamespace(
+                peer_client_id=peer_id,
+                gpu_vram=_peer_value(peer, "gpu_vram", 0.0),
+                cpu_ram=_peer_value(peer, "cpu_ram", 0.0),
+                gpu_flops=_peer_value(peer, "gpu_flops", 0.0),
+            )
+            if hasattr(peer, "__dict__"):
+                for attr, value in vars(peer).items():
+                    setattr(planning_peer, attr, value)
+            elif isinstance(peer, dict):
+                for attr, value in peer.items():
+                    setattr(planning_peer, attr, value)
+        planning_peers.append(planning_peer)
+
+    ModelEngine.plan_shards(planning_peers, model_name or "model", int(total_layers))
+    return planning_peers
+
+
+def build_peer_load_plan(
+    peer_client: Any,
+    *,
+    model_name: str,
+    total_layers: int,
+) -> dict[str, Any]:
+    get_peers = getattr(peer_client, "get_peers", None)
+    if not callable(get_peers):
+        return {
+            "distributed": False,
+            "peers": [],
+            "remote_peers": [],
+            "local_peer": None,
+            "local_shard": None,
+        }
+
+    peers = planned_peer_shards(
+        get_peers(include_self=True),
+        model_name=model_name,
+        total_layers=total_layers,
+    )
+    local_peer_id = str(getattr(peer_client, "peer_client_id", "") or "")
+    local_peer = next(
+        (
+            peer for peer in peers
+            if str(_peer_value(peer, "peer_client_id", "") or "") == local_peer_id
+        ),
+        peers[0] if peers else None,
+    )
+    remote_peers = [
+        peer for peer in peers
+        if str(_peer_value(peer, "peer_client_id", "") or "") != local_peer_id
+    ]
+    local_shard = _peer_value(local_peer, "shard", None) if local_peer is not None else None
+    return {
+        "distributed": len(peers) > 1 and int(total_layers or 0) > 1,
+        "peers": peers,
+        "remote_peers": remote_peers,
+        "local_peer": local_peer,
+        "local_shard": local_shard,
+    }
+
+
+def load_model_shards_on_peers(
+    peer_client: Any,
+    *,
+    model_id: str,
+    backend: str,
+    offline_mode: bool,
+    total_layers: int,
+    peers: Any | None = None,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    if peers is None:
+        plan = build_peer_load_plan(peer_client, model_name=model_id, total_layers=total_layers)
+    else:
+        planned = planned_peer_shards(peers, model_name=model_id, total_layers=total_layers)
+        plan = {
+            "distributed": len(planned) > 1 and int(total_layers or 0) > 1,
+            "peers": planned,
+        }
+    if "remote_peers" not in plan:
+        planned = plan.get("peers", [])
+        local_peer_id = str(getattr(peer_client, "peer_client_id", "") or "")
+        plan["remote_peers"] = [
+            peer for peer in planned
+            if str(_peer_value(peer, "peer_client_id", "") or "") != local_peer_id
+        ]
+        local_peer = next(
+            (
+                peer for peer in planned
+                if str(_peer_value(peer, "peer_client_id", "") or "") == local_peer_id
+            ),
+            planned[0] if planned else None,
+        )
+        plan["local_peer"] = local_peer
+        plan["local_shard"] = _peer_value(local_peer, "shard", None) if local_peer is not None else None
+
+    if not plan.get("distributed"):
+        return plan
+
+    load_timeout = _peer_model_load_timeout_seconds() if timeout is None else timeout
+    remote_results: list[dict[str, Any]] = []
+    for peer in plan["remote_peers"]:
+        peer_id = _peer_identifier(peer)
+        host = str(_peer_value(peer, "ip_address", "") or _peer_value(peer, "address", "0.0.0.0"))
+        port = int(_peer_value(peer, "port", os.getenv("TC_TENSOR_PORT", 1045)))
+        response = peer_client.send_payload(
+            {
+                "command": "load_model",
+                "payload": {
+                    "model_id": model_id,
+                    "backend": backend,
+                    "offline_mode": bool(offline_mode),
+                    "shard": _peer_shard_payload(peer),
+                },
+            },
+            expect_reply=True,
+            address=(host, port),
+            timeout=load_timeout,
+        )
+        if isinstance(response, dict) and response.get("error"):
+            raise RuntimeError(f"{_peer_log_label(peer, fallback=peer_id)}: {response.get('error')}")
+        _mark_peer_seen(peer_client, peer_id)
+        remote_results.append(
+            {
+                "peer": peer,
+                "response": response,
+            }
+        )
+
+    plan["remote_results"] = remote_results
+    return plan
+
+
+def clear_model_shards_on_peers(
+    peer_client: Any,
+    *,
+    peers: Any | None = None,
+    model_id: str | None = None,
+    timeout: float | None = None,
+) -> None:
+    get_peers = getattr(peer_client, "get_peers", None)
+    if peers is None:
+        if not callable(get_peers):
+            return
+        peers = get_peers(include_self=False)
+
+    remote_peers = _normalize_peer_entries(peers)
+    if not remote_peers:
+        return
+
+    clear_timeout = _peer_model_load_timeout_seconds() if timeout is None else timeout
+    for peer in remote_peers:
+        host = str(_peer_value(peer, "ip_address", "") or _peer_value(peer, "address", "0.0.0.0"))
+        port = int(_peer_value(peer, "port", os.getenv("TC_TENSOR_PORT", 1045)))
+        try:
+            peer_client.send_payload(
+                {
+                    "command": "clear_model",
+                    "payload": {
+                        "model_id": str(model_id or ""),
+                    },
+                },
+                expect_reply=True,
+                address=(host, port),
+                timeout=clear_timeout,
+            )
+            _mark_peer_seen(peer_client, _peer_identifier(peer))
+        except Exception:
+            logger.debug("Failed to clear peer model runtime", exc_info=True)
+
+
+def format_shard_span(shard: Any) -> str:
+    start_layer = int(getattr(shard, "start_layer", 0) or 0)
+    end_layer = int(getattr(shard, "end_layer", 0) or 0)
+    total_layers = int(getattr(shard, "total_layers", end_layer + 1) or (end_layer + 1))
+    transformer_layers = max(total_layers - 1, 1)
+    return f"transformer layers {start_layer}:{end_layer} of {transformer_layers}"
+
+
+def _peer_model_load_timeout_seconds() -> float:
+    raw = (os.getenv("TC_PEER_MODEL_LOAD_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return 180.0
+    try:
+        return max(float(raw), 1.0)
+    except ValueError:
+        return 180.0
 
 
 def _tensor_to_list(tensor: Any) -> list[list[Any]]:
@@ -840,13 +1041,19 @@ def _normalize_peer_entries(peers: Any) -> list[Any]:
     return normalized
 
 
+def _peer_value(peer: Any, attr: str, default: Any = None) -> Any:
+    if isinstance(peer, dict):
+        return peer.get(attr, default)
+    return getattr(peer, attr, default)
+
+
 def _peer_identifier(peer: Any) -> str:
-    return str(getattr(peer, "peer_client_id", "") or getattr(peer, "ip_address", "") or "unknown")
+    return str(_peer_value(peer, "peer_client_id", "") or _peer_value(peer, "ip_address", "") or "unknown")
 
 
 def _peer_log_label(peer: Any, *, fallback: str) -> str:
-    peer_id = str(getattr(peer, "peer_client_id", "") or "").strip() or fallback
-    host = str(getattr(peer, "ip_address", "") or getattr(peer, "address", "")).strip()
+    peer_id = str(_peer_value(peer, "peer_client_id", "") or "").strip() or fallback
+    host = str(_peer_value(peer, "ip_address", "") or _peer_value(peer, "address", "")).strip()
     if host in {"", "0.0.0.0"} or host == peer_id:
         return peer_id
     return f"{peer_id} ({host})"
@@ -916,14 +1123,17 @@ def _mark_peer_seen(peer_client: Any, peer_client_id: str) -> None:
 def _plan_peer_shards(model_engine: ModelEngine, peer_client: Any, model: Any) -> None:
     if peer_client is None:
         return
-    peers = _normalize_peer_entries(peer_client.get_peers(include_self=True))
-    if len(peers) <= 1:
-        return
     total_layers = _infer_total_layers(model)
     if total_layers <= 0:
         return
     model_name = str(getattr(model, "model_name", "") or getattr(model, "name", "") or "model")
-    model_engine.plan_shards(peers, model_name, total_layers)
+    peers = planned_peer_shards(
+        peer_client.get_peers(include_self=True),
+        model_name=model_name,
+        total_layers=total_layers,
+    )
+    if len(peers) <= 1:
+        return
     local_shard = getattr(getattr(peer_client, "peer_device", None), "shard", None)
     if local_shard is not None:
         model_engine.shard = local_shard
@@ -1002,7 +1212,7 @@ def _local_engine(model: Any) -> ModelEngine:
 
 
 def _peer_shard_payload(peer: Any) -> dict[str, int | str]:
-    shard = getattr(peer, "shard", None)
+    shard = _peer_value(peer, "shard", None)
     if shard is None:
         return {}
     try:

@@ -2,6 +2,7 @@ import asyncio
 import base64
 from collections import deque
 import json
+from pathlib import Path
 import unittest
 import os
 import threading
@@ -286,3 +287,92 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         self.assertIn("hidden_state", response)
         self.assertNotIn("error", response)
         self.assertEqual(client._peer_last_seen["peer-1"] > 0.0, True)
+
+    def test_handle_load_model_request_loads_requested_shard(self):
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client.shard = Shard("", 0, 0, 0)
+        client._lock = threading.RLock()
+        client._peer_last_seen = {}
+        client._peer_stale_after = 10.0
+        client._flow_events = deque(maxlen=256)
+        client._generation_model = None
+        client._generation_tokenizer = None
+        client._generation_backend = "torch"
+        client._generation_model_id = ""
+        client._generation_model_config = None
+        client._generation_model_path = ""
+        client._generation_shard = None
+        client._generate_handler = None
+
+        model = SimpleNamespace(shard=Shard("demo", 0, 2, 5))
+        tokenizer = object()
+
+        with mock.patch(
+            "cheetah.orchestration.peer_client.load_model_for_backend",
+            new=mock.AsyncMock(return_value=(model, {"num_layers": 4}, tokenizer, Path("/tmp/model"))),
+        ) as load_model:
+            response = PeerClient._handle_load_model_request(
+                client,
+                {
+                    "payload": {
+                        "model_id": "demo",
+                        "backend": "torch",
+                        "offline_mode": True,
+                        "shard": {
+                            "model_name": "demo",
+                            "start_layer": 0,
+                            "end_layer": 2,
+                            "total_layers": 5,
+                        },
+                    }
+                },
+            )
+
+        load_model.assert_awaited_once()
+        self.assertTrue(response["ok"])
+        self.assertFalse(response["already_loaded"])
+        self.assertEqual(client._generation_model, model)
+        self.assertEqual(client._generation_tokenizer, tokenizer)
+        self.assertEqual(client._generation_model_id, "demo")
+        self.assertEqual(client._generation_shard.start_layer, 0)
+        self.assertEqual(client.shard.end_layer, 2)
+
+    def test_handle_load_model_request_reuses_matching_runtime(self):
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client.shard = Shard("demo", 0, 2, 5)
+        client._lock = threading.RLock()
+        client._peer_last_seen = {}
+        client._peer_stale_after = 10.0
+        client._flow_events = deque(maxlen=256)
+        client._generation_model = object()
+        client._generation_tokenizer = object()
+        client._generation_backend = "torch"
+        client._generation_model_id = "demo"
+        client._generation_model_config = {"num_layers": 4}
+        client._generation_model_path = "/tmp/model"
+        client._generation_shard = Shard("demo", 0, 2, 5)
+        client._generate_handler = None
+
+        with mock.patch("cheetah.orchestration.peer_client.load_model_for_backend", new=mock.AsyncMock()) as load_model:
+            response = PeerClient._handle_load_model_request(
+                client,
+                {
+                    "payload": {
+                        "model_id": "demo",
+                        "backend": "torch",
+                        "shard": {
+                            "model_name": "demo",
+                            "start_layer": 0,
+                            "end_layer": 2,
+                            "total_layers": 5,
+                        },
+                    }
+                },
+            )
+
+        load_model.assert_not_awaited()
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["already_loaded"])
+        self.assertEqual(response["shard"]["start_layer"], 0)

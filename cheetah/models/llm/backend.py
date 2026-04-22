@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 LLM_BACKEND_ENV = "TC_LLM_BACKEND"
@@ -131,6 +132,39 @@ def backend_model_config_module(backend: str | None = None):
 
 def backend_model_config_class(backend: str | None = None):
     return backend_model_config_module(backend=backend).ModelConfig
+
+
+async def resolve_model_assets_for_backend(
+    model_id: str,
+    *,
+    offline_mode: bool = False,
+    backend: str | None = None,
+    progress_callback: Callable[[str], Awaitable[None] | None] | None = None,
+) -> tuple[dict[str, Any], Path]:
+    from cheetah.repos import RepoCustom
+
+    selected_backend = normalize_llm_backend(backend or os.getenv(LLM_BACKEND_ENV))
+    sanitized = model_id.replace("/", "__")
+    cache_path = (Path.home() / ".cache" / "cheetah_models") / sanitized
+    candidate_path = Path(model_id).expanduser()
+
+    resolved_path: Path | None = None
+    if candidate_path.exists():
+        resolved_path = candidate_path
+    elif cache_path.exists():
+        resolved_path = cache_path
+
+    helpers = backend_helpers_module(backend=selected_backend)
+    if resolved_path is not None and any(resolved_path.glob("*.*")):
+        model_config = helpers.load_model_config(resolved_path)
+        return model_config, resolved_path
+
+    if offline_mode:
+        raise FileNotFoundError(f"Model {model_id} not found in offline mode")
+
+    model_repo = RepoCustom(model_id, backend=selected_backend)
+    model_path, model_config, _ = await model_repo.download(progress_callback=progress_callback)
+    return model_config, model_path
 
 
 async def load_model_for_backend(

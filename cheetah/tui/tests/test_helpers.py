@@ -267,6 +267,40 @@ class TestDistributedShardLogging(unittest.TestCase):
         self.assertIn("Loading shard on peer peer-1 (192.168.0.20):", lines[2])
         self.assertIn("Loading shard on peer peer-2 (192.168.0.30):", lines[3])
 
+    def test_build_peer_load_plan_returns_local_and_remote_shards(self) -> None:
+        self_peer = SimpleNamespace(
+            peer_client_id="self",
+            ip_address="192.168.0.10",
+            gpu_vram="8",
+            cpu_ram="8",
+            gpu_flops=0.0,
+        )
+        remote_peer = SimpleNamespace(
+            peer_client_id="peer-1",
+            ip_address="192.168.0.20",
+            gpu_vram="8",
+            cpu_ram="8",
+            gpu_flops=0.0,
+        )
+        peer_client = SimpleNamespace(
+            peer_client_id="self",
+            get_peers=lambda include_self=True: [self_peer, remote_peer] if include_self else [remote_peer],
+        )
+
+        plan = helpers.build_peer_load_plan(
+            peer_client,
+            model_name="demo",
+            total_layers=9,
+        )
+
+        self.assertTrue(plan["distributed"])
+        self.assertEqual(len(plan["peers"]), 2)
+        self.assertEqual(len(plan["remote_peers"]), 1)
+        self.assertEqual(plan["local_shard"].start_layer, 0)
+        self.assertEqual(plan["local_shard"].end_layer, 4)
+        self.assertEqual(plan["remote_peers"][0].shard.start_layer, 4)
+        self.assertEqual(plan["remote_peers"][0].shard.end_layer, 8)
+
 
 if __name__ == "__main__":
     unittest.main()

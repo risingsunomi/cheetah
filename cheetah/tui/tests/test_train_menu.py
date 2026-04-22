@@ -32,6 +32,7 @@ from cheetah.tui.train_menu import (
     _stream_corpus_batches,
     default_training_settings,
 )
+from cheetah.tui.helpers import distributed_shard_plan_messages
 from cheetah.tui.training_path_screen import TrainingPathScreen
 from cheetah.tui.training_path_types import TrainingNode
 
@@ -173,6 +174,30 @@ class TestTrainScreen(unittest.TestCase):
         self.assertEqual(len(snapshot), 2)
         self.assertEqual(snapshot[0]["peer_client_id"], "self")
         self.assertEqual(snapshot[1]["peer_client_id"], "peer-1")
+
+    def test_build_training_settings_snapshot_still_supports_shard_plan_logging(self) -> None:
+        peers = [
+            SimpleNamespace(peer_client_id="self", ip_address="192.168.0.10", gpu_vram="8", cpu_ram="8", gpu_flops=0.0),
+            SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20", gpu_vram="8", cpu_ram="8", gpu_flops=0.0),
+        ]
+        screen = TrainScreen(peer_client=_PeerClientStub(peers))
+        screen._settings["model-id"] = "Qwen/Qwen2.5-0.5B-Instruct"
+
+        with patch("cheetah.tui.train_menu.get_llm_backend", return_value="torch"):
+            settings = screen._build_training_settings()
+
+        self.assertIsNotNone(settings)
+        assert settings is not None
+        lines = distributed_shard_plan_messages(
+            settings["peer-snapshot"],
+            local_peer_id=settings["local-peer-id"],
+            model_name="demo",
+            total_layers=9,
+        )
+
+        self.assertEqual(lines[0], "Using 2 nodes for shard-aware execution.")
+        self.assertIn("Loading local shard self (192.168.0.10):", lines[1])
+        self.assertIn("Loading shard on peer peer-1 (192.168.0.20):", lines[2])
 
     def test_build_training_settings_chains_previous_step_for_finetune(self) -> None:
         with TemporaryDirectory() as tmp:

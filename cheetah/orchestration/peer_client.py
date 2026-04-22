@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections import deque
+import gc
 import json
 import os
 import queue
@@ -14,7 +15,7 @@ from contextlib import closing
 import asyncio
 
 from cheetah.logging_utils import get_logger
-from cheetah.models.llm.backend import get_backend_device, get_llm_backend
+from cheetah.models.llm.backend import get_backend_device, get_llm_backend, load_model_for_backend
 from cheetah.models.shard import Shard
 from cheetah.orchestration.model_engine import ModelEngine
 from cheetah.orchestration.cdevice import CDevice
@@ -111,6 +112,9 @@ class PeerClient:
         self._generation_tokenizer: Any | None = None
         self._generation_backend: str = get_llm_backend()
         self._generation_model_id: str = ""
+        self._generation_model_config: Any | None = None
+        self._generation_model_path: str = ""
+        self._generation_shard: Shard | None = None
         self._peers: Dict[str, CDevice] = {}
         self._lock = threading.RLock()
         self._peer_last_seen: Dict[str, float] = {}
@@ -213,6 +217,12 @@ class PeerClient:
                             else:
                                 response = self._generate_handler(msg)
                                 self._send_reply(conn, response)
+                        elif command == "load_model":
+                            response = self._handle_load_model_request(msg)
+                            self._send_reply(conn, response)
+                        elif command == "clear_model":
+                            response = self._handle_clear_model_request(msg)
+                            self._send_reply(conn, response)
                         else:
                             self._send_reply(conn, {"error": f"unknown command {command}"})
                     except Exception:
@@ -236,8 +246,15 @@ class PeerClient:
         except Exception:
             logger.debug("Failed to send reply payload")
 
-    def send_payload(self, message: dict, *, expect_reply: bool = True, address: Tuple[str, int] | None = None) -> Dict[str, Any]:
-        return self._send(message, expect_reply=expect_reply, address=address)
+    def send_payload(
+        self,
+        message: dict,
+        *,
+        expect_reply: bool = True,
+        address: Tuple[str, int] | None = None,
+        timeout: float | None = None,
+    ) -> Dict[str, Any]:
+        return self._send(message, expect_reply=expect_reply, address=address, timeout=timeout)
 
     def set_generate_handler(self, handler: Callable[[dict], dict]) -> None:
         self._generate_handler = handler
@@ -249,19 +266,130 @@ class PeerClient:
         tokenizer: Any,
         backend: str,
         model_id: str = "",
+        model_config: Any | None = None,
+        model_path: str | None = None,
+        shard: Shard | None = None,
     ) -> None:
         self._generation_model = model
         self._generation_tokenizer = tokenizer
         self._generation_backend = str(backend or get_llm_backend() or "tinygrad")
         self._generation_model_id = str(model_id or "")
+        self._generation_model_config = model_config
+        self._generation_model_path = str(model_path or "")
+        self._generation_shard = shard or getattr(model, "shard", None)
+        if self._generation_shard is not None:
+            self.shard = self._generation_shard
         self.set_generate_handler(self._handle_generate_token_request)
 
-    def clear_generation_runtime(self, *, model: Any | None = None) -> None:
+    def clear_generation_runtime(
+        self,
+        *,
+        model: Any | None = None,
+        model_id: str | None = None,
+    ) -> None:
         if model is not None and model is not self._generation_model:
+            return
+        current_model_id = str(getattr(self, "_generation_model_id", "") or "")
+        if model_id is not None and current_model_id and str(model_id) != current_model_id:
             return
         self._generation_model = None
         self._generation_tokenizer = None
         self._generation_model_id = ""
+        self._generation_model_config = None
+        self._generation_model_path = ""
+        self._generation_shard = None
+        self.shard = Shard("", 0, 0, 0)
+        gc.collect()
+
+    def _handle_clear_model_request(self, message: dict) -> dict:
+        payload = message.get("payload", {})
+        model_id = ""
+        if isinstance(payload, dict):
+            model_id = str(payload.get("model_id", "") or "").strip()
+        self.clear_generation_runtime(model_id=model_id or None)
+        return {
+            "ok": True,
+            "cleared": True,
+            "model_id": model_id,
+        }
+
+    def _handle_load_model_request(self, message: dict) -> dict:
+        payload = message.get("payload", {})
+        if not isinstance(payload, dict):
+            return {"error": "invalid payload"}
+
+        model_id = str(payload.get("model_id", "") or "").strip()
+        if not model_id:
+            return {"error": "missing model id"}
+
+        backend = str(payload.get("backend", "") or get_llm_backend() or "tinygrad")
+        offline_mode = bool(payload.get("offline_mode", False))
+        shard = _shard_from_payload(payload.get("shard"), fallback_model_name=model_id)
+
+        current_model = getattr(self, "_generation_model", None)
+        current_tokenizer = getattr(self, "_generation_tokenizer", None)
+        current_model_id = str(getattr(self, "_generation_model_id", "") or "")
+        current_backend = str(getattr(self, "_generation_backend", "") or get_llm_backend() or "tinygrad")
+        current_shard = getattr(self, "_generation_shard", None)
+
+        if (
+            current_model is not None
+            and current_tokenizer is not None
+            and current_model_id == model_id
+            and current_backend == backend
+            and _shards_equal(current_shard, shard)
+        ):
+            if current_shard is not None:
+                self.shard = current_shard
+            return {
+                "ok": True,
+                "already_loaded": True,
+                "model_id": model_id,
+                "backend": backend,
+                "shard": _shard_payload(current_shard),
+                "elapsed": 0.0,
+            }
+
+        try:
+            self.clear_generation_runtime()
+            start = time.time()
+            model, model_config, tokenizer, model_path = asyncio.run(
+                load_model_for_backend(
+                    model_id=model_id,
+                    shard=shard,
+                    weight_device=None,
+                    offline_mode=offline_mode,
+                    backend=backend,
+                )
+            )
+            elapsed = time.time() - start
+            self.register_generation_runtime(
+                model=model,
+                tokenizer=tokenizer,
+                backend=backend,
+                model_id=model_id,
+                model_config=model_config,
+                model_path=str(model_path),
+                shard=getattr(model, "shard", None) or shard,
+            )
+            return {
+                "ok": True,
+                "already_loaded": False,
+                "model_id": model_id,
+                "backend": backend,
+                "model_path": str(model_path),
+                "shard": _shard_payload(getattr(self, "_generation_shard", None)),
+                "elapsed": elapsed,
+            }
+        except Exception as exc:
+            logger.exception("Peer model load failed: %s", exc)
+            self.clear_generation_runtime()
+            return {
+                "error": str(exc),
+                "model_id": model_id,
+                "backend": backend,
+                "shard": _shard_payload(shard),
+            }
 
     def _handle_generate_token_request(self, message: dict) -> dict:
         payload = message.get("payload", {})
@@ -341,7 +469,13 @@ class PeerClient:
             logger.exception("Peer token generation failed: %s", exc)
             return {"error": str(exc)}
 
-    def _send(self, message: dict, expect_reply: bool = True, address: Tuple[str, int] | None = None) -> Dict[str, Any]:
+    def _send(
+        self,
+        message: dict,
+        expect_reply: bool = True,
+        address: Tuple[str, int] | None = None,
+        timeout: float | None = None,
+    ) -> Dict[str, Any]:
         self.in_use = True
         try:
             data = json.dumps(message).encode("utf-8")
@@ -351,7 +485,9 @@ class PeerClient:
                 host, port = self.address, self.port
                 logger.warning(f"Using default address {host}:{port}")
 
-            with socket.create_connection((host, port), timeout=3) as sock:
+            socket_timeout = 3.0 if timeout is None else max(float(timeout), 0.1)
+            with socket.create_connection((host, port), timeout=socket_timeout) as sock:
+                sock.settimeout(socket_timeout)
                 sock.sendall(data)
                 if not expect_reply:
                     return {}
@@ -831,3 +967,35 @@ def _to_float(val: Any) -> float:
         return float(val)
     except Exception:
         return 0.0
+
+
+def _shard_from_payload(payload: Any, *, fallback_model_name: str = "model") -> Shard | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        model_name = str(payload.get("model_name", "") or fallback_model_name or "model")
+        start_layer = int(payload.get("start_layer", 0) or 0)
+        end_layer = int(payload.get("end_layer", 0) or 0)
+        total_layers = int(payload.get("total_layers", end_layer + 1) or (end_layer + 1))
+    except (TypeError, ValueError):
+        return None
+    return Shard(model_name, start_layer, end_layer, total_layers)
+
+
+def _shard_payload(shard: Shard | None) -> dict[str, int | str]:
+    if shard is None:
+        return {}
+    return {
+        "model_name": str(getattr(shard, "model_name", "") or ""),
+        "start_layer": int(getattr(shard, "start_layer", 0) or 0),
+        "end_layer": int(getattr(shard, "end_layer", 0) or 0),
+        "total_layers": int(getattr(shard, "total_layers", 0) or 0),
+    }
+
+
+def _shards_equal(lhs: Shard | None, rhs: Shard | None) -> bool:
+    if lhs is rhs:
+        return True
+    if lhs is None or rhs is None:
+        return False
+    return _shard_payload(lhs) == _shard_payload(rhs)
