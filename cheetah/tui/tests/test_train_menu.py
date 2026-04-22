@@ -39,6 +39,7 @@ from cheetah.tui.training_path_types import TrainingNode
 class _PeerClientStub:
     def __init__(self, peers):
         self._peers = list(peers)
+        self.peer_client_id = "self"
 
     def get_peers(self, include_self: bool = False):
         return list(self._peers)
@@ -152,6 +153,26 @@ class TestTrainScreen(unittest.TestCase):
         self.assertEqual(settings["model-id"], "Qwen/Qwen2.5-0.5B-Instruct")
         self.assertNotIn("config-path", settings)
         self.assertEqual(settings["weights-dir"], "")
+
+    def test_build_training_settings_includes_peer_snapshot(self) -> None:
+        peers = [
+            SimpleNamespace(peer_client_id="self", ip_address="192.168.0.10", gpu_vram="8", cpu_ram="16", gpu_flops=0.0),
+            SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20", gpu_vram="4", cpu_ram="8", gpu_flops=0.0),
+        ]
+        screen = TrainScreen(peer_client=_PeerClientStub(peers))
+        screen._settings["model-id"] = "Qwen/Qwen2.5-0.5B-Instruct"
+
+        with patch("cheetah.tui.train_menu.get_llm_backend", return_value="torch"):
+            settings = screen._build_training_settings()
+
+        self.assertIsNotNone(settings)
+        assert settings is not None
+        self.assertEqual(settings["local-peer-id"], "self")
+        snapshot = settings["peer-snapshot"]
+        self.assertIsInstance(snapshot, list)
+        self.assertEqual(len(snapshot), 2)
+        self.assertEqual(snapshot[0]["peer_client_id"], "self")
+        self.assertEqual(snapshot[1]["peer_client_id"], "peer-1")
 
     def test_build_training_settings_chains_previous_step_for_finetune(self) -> None:
         with TemporaryDirectory() as tmp:

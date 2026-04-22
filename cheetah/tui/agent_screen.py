@@ -41,6 +41,7 @@ from cheetah.tui.helpers import (
     MemoryPressureError,
     apply_chat_template_with_thinking,
     default_enable_thinking,
+    distributed_shard_log_messages,
     memory_abort_reason,
     relieve_memory_pressure,
     streaming_generate_with_peers,
@@ -421,6 +422,27 @@ class AgentScreen(Screen[None]):
                 backend=self._llm_backend,
             )
             mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
+            total_layers = 0
+            if isinstance(self._model_config, dict):
+                try:
+                    num_layers = int(self._model_config.get("num_layers", 0) or 0)
+                except (TypeError, ValueError):
+                    num_layers = 0
+                total_layers = num_layers + 1 if num_layers > 0 else 0
+            for line in distributed_shard_log_messages(
+                self._peer_client,
+                model_name=self._model_id or "model",
+                total_layers=total_layers,
+            ):
+                self._log(line)
+            register_runtime = getattr(self._peer_client, "register_generation_runtime", None)
+            if callable(register_runtime):
+                register_runtime(
+                    model=self._model,
+                    tokenizer=self._tokenizer,
+                    backend=self._llm_backend,
+                    model_id=self._model_id or "",
+                )
             self._model_loaded = True
             if self._thinking_checkbox is not None and "enable_thinking" not in self._gen_overrides:
                 self._thinking_checkbox.value = default_enable_thinking(
@@ -1128,8 +1150,12 @@ class AgentScreen(Screen[None]):
             self._load_button.disabled = not enabled
 
     def _clear_model(self, *, update_log: bool = True) -> None:
+        existing_model = self._model
         if self._agent_running:
             self._stop_agent()
+        clear_runtime = getattr(self._peer_client, "clear_generation_runtime", None)
+        if callable(clear_runtime):
+            clear_runtime(model=existing_model)
         self._model = None
         self._model_config = None
         self._tokenizer = None

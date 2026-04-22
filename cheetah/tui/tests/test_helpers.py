@@ -247,5 +247,26 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
         self.assertEqual(model.start_positions, [2])
 
 
+class TestDistributedShardLogging(unittest.TestCase):
+    def test_distributed_shard_plan_messages_list_local_then_remote_peers(self) -> None:
+        peers = [
+            SimpleNamespace(peer_client_id="self", ip_address="192.168.0.10", gpu_vram="8", cpu_ram="16", gpu_flops=0.0),
+            SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20", gpu_vram="4", cpu_ram="8", gpu_flops=0.0),
+            SimpleNamespace(peer_client_id="peer-2", ip_address="192.168.0.30", gpu_vram="2", cpu_ram="4", gpu_flops=0.0),
+        ]
+
+        lines = helpers.distributed_shard_plan_messages(
+            peers,
+            local_peer_id="self",
+            model_name="demo",
+            total_layers=12,
+        )
+
+        self.assertEqual(lines[0], "Using 3 nodes for shard-aware execution.")
+        self.assertIn("Loading local shard self (192.168.0.10):", lines[1])
+        self.assertIn("Loading shard on peer peer-1 (192.168.0.20):", lines[2])
+        self.assertIn("Loading shard on peer peer-2 (192.168.0.30):", lines[3])
+
+
 if __name__ == "__main__":
     unittest.main()

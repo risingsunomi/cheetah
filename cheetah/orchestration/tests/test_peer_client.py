@@ -12,11 +12,16 @@ try:
     import tinygrad as tg
 except Exception:
     tg = None
+try:
+    import torch
+except Exception:
+    torch = None
 from cheetah.orchestration.peer_client import (
     PeerClient,
     _peer_host_from_payload,
     _resolve_advertise_address,
 )
+from cheetah.models.shard import Shard
 
 TEST_RECEIVER_BIND_HOST = "0.0.0.0"
 TEST_RECEIVER_CONNECT_HOST = "127.0.0.1"
@@ -216,3 +221,68 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
             self.assertTrue(PeerClient.peer_is_active(client, "peer-1"))
             self.assertFalse(PeerClient.peer_is_active(client, "peer-2"))
             self.assertTrue(PeerClient.peer_is_active(client, "self"))
+
+    def test_register_generation_runtime_sets_working_default_handler(self):
+        if torch is None:
+            self.skipTest("torch is required for this test.")
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.shard = Shard("demo", 0, 1, 4)
+
+            def run_shard(
+                self,
+                x,
+                *,
+                attention_mask=None,
+                position_ids=None,
+                hidden_state=None,
+                shard=None,
+                start_pos=None,
+            ):
+                return torch.ones((1, attention_mask.shape[1], 4), dtype=torch.float32)
+
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client._lock = threading.RLock()
+        client._peer_last_seen = {}
+        client._peer_stale_after = 10.0
+        client._flow_events = deque(maxlen=256)
+        client._generation_model = None
+        client._generation_tokenizer = None
+        client._generation_backend = "torch"
+        client._generation_model_id = ""
+        client._generate_handler = None
+
+        model = FakeModel()
+        tokenizer = SimpleNamespace(eos_token_id=999)
+        PeerClient.register_generation_runtime(
+            client,
+            model=model,
+            tokenizer=tokenizer,
+            backend="torch",
+            model_id="demo",
+        )
+
+        self.assertTrue(callable(client._generate_handler))
+        response = client._generate_handler(
+            {
+                "payload": {
+                    "sender_peer_id": "peer-1",
+                    "input_ids": [[1, 2, 3]],
+                    "attention_mask": [[1, 1, 1]],
+                    "hidden_state": [[]],
+                    "prefill": True,
+                    "shard": {
+                        "model_name": "demo",
+                        "start_layer": 0,
+                        "end_layer": 1,
+                        "total_layers": 4,
+                    },
+                }
+            }
+        )
+
+        self.assertIn("hidden_state", response)
+        self.assertNotIn("error", response)
+        self.assertEqual(client._peer_last_seen["peer-1"] > 0.0, True)

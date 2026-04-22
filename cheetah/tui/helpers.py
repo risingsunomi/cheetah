@@ -6,6 +6,7 @@ import os
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import tinygrad as tg
@@ -733,6 +734,64 @@ def streaming_generate_with_peers(
     return out_tokens, elapsed
 
 
+def distributed_shard_log_messages(
+    peer_client: Any,
+    *,
+    model_name: str,
+    total_layers: int,
+) -> list[str]:
+    get_peers = getattr(peer_client, "get_peers", None)
+    if not callable(get_peers):
+        return []
+    local_peer_id = str(getattr(peer_client, "peer_client_id", "") or "")
+    return distributed_shard_plan_messages(
+        get_peers(include_self=True),
+        local_peer_id=local_peer_id,
+        model_name=model_name,
+        total_layers=total_layers,
+    )
+
+
+def distributed_shard_plan_messages(
+    peers: Any,
+    *,
+    local_peer_id: str,
+    model_name: str,
+    total_layers: int,
+) -> list[str]:
+    normalized = _normalize_peer_entries(peers)
+    if len(normalized) <= 1 or int(total_layers or 0) <= 1:
+        return []
+
+    planning_peers: list[Any] = []
+    labels: dict[str, str] = {}
+    for index, peer in enumerate(normalized):
+        peer_id = str(getattr(peer, "peer_client_id", "") or f"peer-{index + 1}")
+        labels[peer_id] = _peer_log_label(peer, fallback=peer_id)
+        planning_peers.append(
+            SimpleNamespace(
+                peer_client_id=peer_id,
+                gpu_vram=getattr(peer, "gpu_vram", 0.0),
+                cpu_ram=getattr(peer, "cpu_ram", 0.0),
+                gpu_flops=getattr(peer, "gpu_flops", 0.0),
+            )
+        )
+
+    shards = ModelEngine.plan_shards(planning_peers, model_name or "model", int(total_layers))
+    if not shards:
+        return []
+
+    transformer_layers = max(int(total_layers) - 1, 1)
+    lines = [f"Using {len(planning_peers)} nodes for shard-aware execution."]
+    for peer, shard in zip(planning_peers, shards):
+        label = labels.get(str(peer.peer_client_id), str(peer.peer_client_id))
+        scope = "local shard" if str(peer.peer_client_id) == str(local_peer_id) else "shard on peer"
+        lines.append(
+            f"Loading {scope} {label}: transformer layers {int(shard.start_layer)}:{int(shard.end_layer)} of {transformer_layers}."
+        )
+    return lines
+
+
 def _tensor_to_list(tensor: Any) -> list[list[Any]]:
     if tensor is None:
         return [[]]
@@ -783,6 +842,14 @@ def _normalize_peer_entries(peers: Any) -> list[Any]:
 
 def _peer_identifier(peer: Any) -> str:
     return str(getattr(peer, "peer_client_id", "") or getattr(peer, "ip_address", "") or "unknown")
+
+
+def _peer_log_label(peer: Any, *, fallback: str) -> str:
+    peer_id = str(getattr(peer, "peer_client_id", "") or "").strip() or fallback
+    host = str(getattr(peer, "ip_address", "") or getattr(peer, "address", "")).strip()
+    if host in {"", "0.0.0.0"} or host == peer_id:
+        return peer_id
+    return f"{peer_id} ({host})"
 
 
 def _flow_token_count(message: Any) -> int:

@@ -28,6 +28,7 @@ from cheetah.tui.helpers import (
     MemoryPressureError,
     apply_chat_template_with_thinking,
     default_enable_thinking,
+    distributed_shard_log_messages,
     memory_abort_reason,
     split_thinking_response,
 )
@@ -159,7 +160,6 @@ class ChatScreen(Screen[None]):
         if self._model_label is not None:
             self._model_label.update(self._model_id or "<select>")
         await self._initialize_chat_logs()
-        self._peer_client.set_generate_handler(self._handle_peer_generate_token_request)
         # Slow down peer discovery to avoid UI pauses while typing.
         await asyncio.to_thread(self._get_peer_count)
         self.set_interval(5.0, self._get_peer_count)
@@ -1238,6 +1238,27 @@ class ChatScreen(Screen[None]):
             )
             self._log_sys_msg(ready_msg)
             self._log_effective_gen_config()
+            total_layers = 0
+            if isinstance(self._model_config, dict):
+                try:
+                    num_layers = int(self._model_config.get("num_layers", 0) or 0)
+                except (TypeError, ValueError):
+                    num_layers = 0
+                total_layers = num_layers + 1 if num_layers > 0 else 0
+            for line in distributed_shard_log_messages(
+                self._peer_client,
+                model_name=self._model_id or "model",
+                total_layers=total_layers,
+            ):
+                self._log_sys_msg(line)
+            register_runtime = getattr(self._peer_client, "register_generation_runtime", None)
+            if callable(register_runtime):
+                register_runtime(
+                    model=self._model,
+                    tokenizer=self._tokenizer,
+                    backend=self._llm_backend,
+                    model_id=self._model_id or "",
+                )
             self._model_loaded = True
             self._set_load_button_enabled(True)
 
@@ -1383,6 +1404,7 @@ class ChatScreen(Screen[None]):
         return memory_abort_reason("chat generation")
 
     def _clear_model(self, *, persist: bool = False, reset_kv_cache: bool = False) -> None:
+        existing_model = getattr(self, "_model", None)
         if persist:
             self._log_sys_msg("Clearing loaded model.", persist=True)
         if (
@@ -1392,6 +1414,9 @@ class ChatScreen(Screen[None]):
             and hasattr(self._model, "reset_kv_cache")
         ):
             self._model.reset_kv_cache()
+        clear_runtime = getattr(self._peer_client, "clear_generation_runtime", None)
+        if callable(clear_runtime):
+            clear_runtime(model=existing_model)
         self._model = None
         self._model_config = None
         self._tokenizer = None

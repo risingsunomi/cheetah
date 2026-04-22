@@ -16,6 +16,7 @@ import asyncio
 from cheetah.logging_utils import get_logger
 from cheetah.models.llm.backend import get_backend_device, get_llm_backend
 from cheetah.models.shard import Shard
+from cheetah.orchestration.model_engine import ModelEngine
 from cheetah.orchestration.cdevice import CDevice
 
 logger = get_logger(__name__)
@@ -106,6 +107,10 @@ class PeerClient:
         self.stop_udp_broadcast = False
         self.stop_tensor_recv = False
         self._generate_handler: Optional[Callable[[dict], dict]] = None
+        self._generation_model: Any | None = None
+        self._generation_tokenizer: Any | None = None
+        self._generation_backend: str = get_llm_backend()
+        self._generation_model_id: str = ""
         self._peers: Dict[str, CDevice] = {}
         self._lock = threading.RLock()
         self._peer_last_seen: Dict[str, float] = {}
@@ -121,6 +126,7 @@ class PeerClient:
         self._run_udp_response()
         self._run_udp_discover()
         self._run_tensor_receiver()
+        self.set_generate_handler(self._handle_generate_token_request)
 
     # Networking ---------------------------------------------------------
     def recv_tensor_bytes(
@@ -236,6 +242,105 @@ class PeerClient:
     def set_generate_handler(self, handler: Callable[[dict], dict]) -> None:
         self._generate_handler = handler
 
+    def register_generation_runtime(
+        self,
+        *,
+        model: Any,
+        tokenizer: Any,
+        backend: str,
+        model_id: str = "",
+    ) -> None:
+        self._generation_model = model
+        self._generation_tokenizer = tokenizer
+        self._generation_backend = str(backend or get_llm_backend() or "tinygrad")
+        self._generation_model_id = str(model_id or "")
+        self.set_generate_handler(self._handle_generate_token_request)
+
+    def clear_generation_runtime(self, *, model: Any | None = None) -> None:
+        if model is not None and model is not self._generation_model:
+            return
+        self._generation_model = None
+        self._generation_tokenizer = None
+        self._generation_model_id = ""
+
+    def _handle_generate_token_request(self, message: dict) -> dict:
+        payload = message.get("payload", {})
+        if not isinstance(payload, dict):
+            return {"error": "invalid payload"}
+
+        model = self._generation_model
+        tokenizer = self._generation_tokenizer
+        if model is None or tokenizer is None:
+            return {"error": "model not loaded"}
+
+        backend = str(self._generation_backend or get_llm_backend() or "tinygrad")
+        sender_peer_id = str(payload.get("sender_peer_id", "") or "").strip()
+        request_tokens = self._flow_token_count(payload)
+        if sender_peer_id:
+            self.record_flow(sender_peer_id, self.peer_client_id, request_tokens, phase="request")
+            self.mark_peer_seen(sender_peer_id)
+
+        try:
+            input_ids_data = self._payload_to_2d_list(payload.get("input_ids"))
+            attention_mask_data = self._payload_to_2d_list(payload.get("attention_mask"))
+            position_ids_data = self._payload_to_2d_list(payload.get("position_ids"))
+            hidden_state_data = self._payload_to_2d_list(payload.get("hidden_state"))
+
+            hidden_state = None if hidden_state_data in ([], [[]]) else self._payload_to_tensor(
+                hidden_state_data,
+                backend=backend,
+                integer=False,
+            )
+            position_ids = None if position_ids_data in ([], [[]]) else self._payload_to_tensor(
+                position_ids_data,
+                backend=backend,
+                integer=True,
+            )
+
+            input_ids = self._payload_to_tensor(input_ids_data, backend=backend, integer=True)
+            attention_mask = self._payload_to_tensor(attention_mask_data, backend=backend, integer=True)
+
+            shard = getattr(model, "shard", None)
+            shard_payload = payload.get("shard")
+            if isinstance(shard_payload, dict):
+                model_name = str(
+                    shard_payload.get("model_name")
+                    or getattr(shard, "model_name", "")
+                    or self._generation_model_id
+                    or "model"
+                )
+                start_layer = int(shard_payload.get("start_layer", getattr(shard, "start_layer", 0)) or 0)
+                end_layer = int(shard_payload.get("end_layer", getattr(shard, "end_layer", 0)) or 0)
+                total_layers = int(
+                    shard_payload.get("total_layers", getattr(shard, "total_layers", end_layer)) or end_layer
+                )
+                shard = Shard(model_name, start_layer, end_layer, total_layers)
+
+            engine = ModelEngine(shard=shard) if shard is not None else ModelEngine()
+            response = engine.get_tokens(
+                model,
+                input_ids,
+                attention_mask,
+                tokenizer,
+                hidden_state=hidden_state,
+                position_ids=position_ids,
+                prefill=bool(payload.get("prefill", False)),
+                temp=float(payload.get("temp", 1.0) or 1.0),
+                top_k=int(payload.get("top_k", 0) or 0),
+                top_p=float(payload.get("top_p", 0.8) or 0.8),
+                alpha_f=float(payload.get("alpha_f", 0.0) or 0.0),
+                alpha_p=float(payload.get("alpha_p", 0.0) or 0.0),
+                repetition_penalty=float(payload.get("repetition_penalty", 1.0) or 1.0),
+                seen_tokens=[int(tok) for tok in payload.get("seen_tokens", []) or []],
+            )
+            if sender_peer_id:
+                response_tokens = self._flow_token_count(response)
+                self.record_flow(self.peer_client_id, sender_peer_id, response_tokens, phase="response")
+            return response
+        except Exception as exc:
+            logger.exception("Peer token generation failed: %s", exc)
+            return {"error": str(exc)}
+
     def _send(self, message: dict, expect_reply: bool = True, address: Tuple[str, int] | None = None) -> Dict[str, Any]:
         self.in_use = True
         try:
@@ -282,6 +387,93 @@ class PeerClient:
 
     def peer_count(self) -> int:
         return len(self.get_peers(include_self=True))
+
+    @staticmethod
+    def _payload_to_2d_list(value: Any) -> list[list[Any]]:
+        if value is None:
+            return [[]]
+        if isinstance(value, list):
+            if not value:
+                return [[]]
+            if isinstance(value[0], list):
+                return value
+            return [value]
+        return [[]]
+
+    @staticmethod
+    def _flow_token_count(message: Any) -> int:
+        payload = message.get("payload", message) if isinstance(message, dict) else message
+        if not isinstance(payload, dict):
+            return 0
+        for key in ("attention_mask", "position_ids", "input_ids", "hidden_state"):
+            count = PeerClient._token_count_from_payload_value(payload.get(key))
+            if count > 0:
+                return count
+        if payload.get("token") is not None or payload.get("tensor") is not None:
+            return 1
+        return 0
+
+    @staticmethod
+    def _token_count_from_payload_value(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, list):
+            if not value:
+                return 0
+            if isinstance(value[0], list):
+                return max((len(row) for row in value if isinstance(row, list)), default=0)
+            return len(value)
+        if isinstance(value, dict):
+            shape = value.get("shape")
+            if isinstance(shape, list) and shape:
+                index = 1 if len(shape) >= 2 else 0
+                try:
+                    return max(int(shape[index]), 0)
+                except (TypeError, ValueError):
+                    return 0
+        try:
+            shape = tuple(getattr(value, "shape", ()) or ())
+        except Exception:
+            shape = ()
+        if len(shape) >= 2:
+            try:
+                return max(int(shape[1]), 0)
+            except (TypeError, ValueError):
+                return 0
+        if len(shape) == 1:
+            try:
+                return max(int(shape[0]), 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _payload_to_tensor(self, data: list[list[Any]], *, backend: str, integer: bool) -> Any:
+        selected_backend = str(backend or get_llm_backend() or "tinygrad").strip().lower()
+        if selected_backend == "torch":
+            import torch
+
+            device = self._torch_runtime_device()
+            dtype = torch.long if integer else torch.float32
+            return torch.tensor(data, dtype=dtype, device=device)
+
+        import tinygrad as tg
+
+        dtype = tg.dtypes.int32 if integer else None
+        device = get_backend_device("tinygrad", default="CPU")
+        assert device is not None
+        tensor = tg.Tensor(data, device=device)
+        if dtype is not None:
+            tensor = tensor.cast(dtype)
+        return tensor
+
+    @staticmethod
+    def _torch_runtime_device() -> str:
+        device = str(get_backend_device("torch", default="cpu") or "cpu").strip().lower()
+        if device in {"metal", "mps"}:
+            return "mps"
+        if device.startswith("cuda"):
+            return device
+        return "cpu"
 
     def mark_peer_seen(self, peer_client_id: str | None) -> None:
         peer_id = str(peer_client_id or "").strip()
