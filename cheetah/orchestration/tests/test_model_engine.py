@@ -96,21 +96,21 @@ class TestModelEngine(unittest.TestCase):
         self.assertEqual(shard.start_layer, 0)
         self.assertEqual(shard.end_layer, 2)
 
-    def test_encode_tensor_upcasts_torch_bfloat16_for_network(self):
+    def test_encode_tensor_preserves_torch_bfloat16_for_network(self):
         if torch is None:
             self.skipTest("torch is required for this test.")
 
         tensor = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3).to(dtype=torch.bfloat16)
 
         payload = _encode_tensor(tensor)
-        self.assertEqual(payload["dtype"], "float32")
+        self.assertEqual(payload["dtype"], "bfloat16")
 
         decoded = _decode_tensor(payload, backend="torch")
         self.assertIsNotNone(decoded)
         assert decoded is not None
         self.assertIsInstance(decoded, torch.Tensor)
-        self.assertEqual(decoded.dtype, torch.float32)
-        self.assertTrue(torch.allclose(decoded, tensor.float()))
+        self.assertEqual(decoded.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(decoded.cpu(), tensor.cpu()))
 
     def test_model_engine_loads_llama_3_2_1b(self):
         model_name = "unsloth/Llama-3.2-1B-Instruct"

@@ -286,7 +286,14 @@ def _encode_token_tensor(token: int) -> Dict[str, Any]:
 
 def _encode_tensor(tensor: Any) -> Dict[str, Any]:
     if torch is not None and isinstance(tensor, torch.Tensor):
-        detached = tensor.detach().cpu()
+        detached = tensor.detach().cpu().contiguous()
+        if detached.dtype == torch.bfloat16:
+            raw_view = detached.view(torch.uint16).numpy()
+            return {
+                "buffer": base64.b64encode(raw_view.tobytes()).decode("ascii"),
+                "shape": list(detached.shape),
+                "dtype": "bfloat16",
+            }
         try:
             arr = detached.numpy()
         except TypeError:
@@ -313,16 +320,31 @@ def _decode_tensor(tensor_payload: Any, backend: str | None = None) -> Any | Non
         return None
     try:
         raw = base64.b64decode(buf)
-    
         dtype = _normalize_dtype(str(tensor_payload.get("dtype", "float32")))
-        arr = np.frombuffer(raw, dtype=np.dtype(_numpy_dtype(dtype)))
         shape = tensor_payload.get("shape")
-
-        if shape:
-            arr = arr.reshape(shape)
-
-        arr = np.array(arr, copy=True)
         selected_backend = str(backend or "").strip().lower()
+
+        if dtype == "bfloat16":
+            if selected_backend == "torch" and torch is not None:
+                raw_values = np.frombuffer(raw, dtype=np.uint16)
+                if shape:
+                    raw_values = raw_values.reshape(shape)
+                raw_values = np.array(raw_values, copy=True)
+                tensor = torch.from_numpy(raw_values).view(torch.bfloat16)
+                target_device = _torch_target_device()
+                try:
+                    tensor = tensor.to(device=target_device)
+                except Exception:
+                    pass
+                return tensor
+
+            arr = _bfloat16_buffer_to_float32(raw, shape)
+        else:
+            arr = np.frombuffer(raw, dtype=np.dtype(_numpy_dtype(dtype)))
+            if shape:
+                arr = arr.reshape(shape)
+            arr = np.array(arr, copy=True)
+
         if selected_backend == "torch" and torch is not None:
             try:
                 tensor = torch.from_numpy(arr)
@@ -457,6 +479,14 @@ def _numpy_dtype(dtype: str) -> str:
     if normalized == "bfloat16":
         return "float32"
     return normalized
+
+
+def _bfloat16_buffer_to_float32(raw: bytes, shape: Any) -> np.ndarray:
+    raw_values = np.frombuffer(raw, dtype=np.uint16)
+    if shape:
+        raw_values = raw_values.reshape(shape)
+    widened = raw_values.astype(np.uint32) << 16
+    return np.array(widened.view(np.float32), copy=True)
 
 
 def _shard_payload(shard: Shard) -> Dict[str, Any]:

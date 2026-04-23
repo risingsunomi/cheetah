@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import tinygrad as tg
+import numpy as np
 
 from cheetah.tui import helpers
 
@@ -254,15 +255,34 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
             def get_tokens(self, *args, **kwargs):
                 del args, kwargs
                 return {
-                    "hidden_state": [[[0.1]]],
-                    "attention_mask": [[1, 1]],
-                    "position_ids": [[0, 1]],
+                    "hidden_state": {
+                        "buffer": "zczMPQ==",
+                        "shape": [1, 1, 1],
+                        "dtype": "float32",
+                    },
+                    "attention_mask": {
+                        "buffer": "AQAAAAEAAAA=",
+                        "shape": [1, 2],
+                        "dtype": "int32",
+                    },
+                    "position_ids": {
+                        "buffer": "AAAAAAAAAAABAAAA",
+                        "shape": [1, 2],
+                        "dtype": "int32",
+                    },
                     "end_token": False,
                 }
 
             def recv_tokens(self, payload, tokenizer=None, backend=None):
                 del tokenizer, backend
-                return payload
+                normalized = dict(payload)
+                if isinstance(payload.get("hidden_state"), dict):
+                    normalized["hidden_state"] = np.array([[[0.1]]], dtype=np.float32).tolist()
+                if isinstance(payload.get("attention_mask"), dict):
+                    normalized["attention_mask"] = [[1, 1]]
+                if isinstance(payload.get("position_ids"), dict):
+                    normalized["position_ids"] = [[0, 1]]
+                return normalized
 
         class _PeerClientStub:
             def __init__(self) -> None:
@@ -327,6 +347,10 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
         self.assertEqual(out, [1])
         self.assertEqual(len(peer_client.calls), 1)
         self.assertEqual(peer_client.calls[0]["timeout"], 45.0)
+        sent_payload = peer_client.calls[0]["message"]["payload"]
+        self.assertIsInstance(sent_payload["hidden_state"], dict)
+        self.assertEqual(sent_payload["hidden_state"]["dtype"], "float32")
+        self.assertIsInstance(sent_payload["attention_mask"], dict)
 
 
 class TestDistributedShardLogging(unittest.TestCase):

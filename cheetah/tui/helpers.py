@@ -640,6 +640,9 @@ def streaming_generate_with_peers(
             repetition_penalty=repetition_penalty,
             seen_tokens=seen_tokens,
         )
+        transport_attention_mask = otoken_data.get("attention_mask", mask_list)
+        transport_position_ids = otoken_data.get("position_ids", position_list)
+        transport_hidden_state = otoken_data.get("hidden_state", hidden_state_list)
 
         prev_len = len(out_tokens)
         mask_list, position_list, hidden_state_list, end_token = _apply_token_data(
@@ -667,9 +670,9 @@ def streaming_generate_with_peers(
                 token_count=_flow_token_count(
                     {
                         "input_ids": input_list,
-                        "attention_mask": mask_list,
-                        "position_ids": position_list,
-                        "hidden_state": hidden_state_list,
+                        "attention_mask": transport_attention_mask,
+                        "position_ids": transport_position_ids,
+                        "hidden_state": transport_hidden_state,
                     }
                 ),
             )
@@ -678,9 +681,9 @@ def streaming_generate_with_peers(
                 "payload": {
                     "sender_peer_id": local_peer_id,
                     "input_ids": input_list,
-                    "attention_mask": mask_list,
-                    "position_ids": position_list,
-                    "hidden_state": hidden_state_list,
+                    "attention_mask": transport_attention_mask,
+                    "position_ids": transport_position_ids,
+                    "hidden_state": transport_hidden_state,
                     "prefill": prefill,
                     "temp": temp,
                     "top_k": top_k,
@@ -714,6 +717,9 @@ def streaming_generate_with_peers(
                 response_tokens = _flow_token_count(resp)
                 _record_peer_flow(peer_client, peer_id, local_peer_id or "local", response_tokens, phase="response")
                 otoken_data = resp
+                transport_attention_mask = resp.get("attention_mask", transport_attention_mask)
+                transport_position_ids = resp.get("position_ids", transport_position_ids)
+                transport_hidden_state = resp.get("hidden_state", transport_hidden_state)
                 logger.debug("Received token response from peer %s", peer_id)
             except TimeoutError as err:
                 phase = "prefill" if prefill else "decode"

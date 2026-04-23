@@ -23,7 +23,7 @@ from cheetah.models.llm.backend import (
     runtime_asset_fingerprints,
 )
 from cheetah.models.shard import Shard
-from cheetah.orchestration.model_engine import ModelEngine
+from cheetah.orchestration.model_engine import ModelEngine, _decode_tensor
 from cheetah.orchestration.cdevice import CDevice
 
 logger = get_logger(__name__)
@@ -427,24 +427,26 @@ class PeerClient:
             self.mark_peer_seen(sender_peer_id)
 
         try:
-            input_ids_data = self._payload_to_2d_list(payload.get("input_ids"))
-            attention_mask_data = self._payload_to_2d_list(payload.get("attention_mask"))
-            position_ids_data = self._payload_to_2d_list(payload.get("position_ids"))
-            hidden_state_data = self._payload_to_2d_list(payload.get("hidden_state"))
-
-            hidden_state = None if hidden_state_data in ([], [[]]) else self._payload_to_tensor(
-                hidden_state_data,
-                backend=backend,
-                integer=False,
-            )
-            position_ids = None if position_ids_data in ([], [[]]) else self._payload_to_tensor(
-                position_ids_data,
+            input_ids = self._payload_to_tensor(
+                payload.get("input_ids"),
                 backend=backend,
                 integer=True,
             )
-
-            input_ids = self._payload_to_tensor(input_ids_data, backend=backend, integer=True)
-            attention_mask = self._payload_to_tensor(attention_mask_data, backend=backend, integer=True)
+            attention_mask = self._payload_to_tensor(
+                payload.get("attention_mask"),
+                backend=backend,
+                integer=True,
+            )
+            position_ids = self._payload_to_tensor(
+                payload.get("position_ids"),
+                backend=backend,
+                integer=True,
+            )
+            hidden_state = self._payload_to_tensor(
+                payload.get("hidden_state"),
+                backend=backend,
+                integer=False,
+            )
 
             shard = getattr(model, "shard", None)
             shard_payload = payload.get("shard")
@@ -549,16 +551,16 @@ class PeerClient:
         return len(self.get_peers(include_self=True))
 
     @staticmethod
-    def _payload_to_2d_list(value: Any) -> list[list[Any]]:
+    def _payload_to_nested_list(value: Any) -> list[Any]:
         if value is None:
-            return [[]]
+            return []
         if isinstance(value, list):
             if not value:
-                return [[]]
+                return []
             if isinstance(value[0], list):
                 return value
             return [value]
-        return [[]]
+        return []
 
     @staticmethod
     def _flow_token_count(message: Any) -> int:
@@ -607,8 +609,31 @@ class PeerClient:
                 return 0
         return 0
 
-    def _payload_to_tensor(self, data: list[list[Any]], *, backend: str, integer: bool) -> Any:
+    def _payload_to_tensor(self, value: Any, *, backend: str, integer: bool) -> Any:
+        if value is None:
+            return None
+
         selected_backend = str(backend or get_llm_backend() or "tinygrad").strip().lower()
+
+        if isinstance(value, dict):
+            tensor = _decode_tensor(value, backend=backend)
+            if tensor is None:
+                return None
+            if selected_backend == "torch":
+                import torch
+
+                dtype = torch.long if integer else self._torch_tensor_transport_dtype(tensor.dtype)
+                return tensor.to(device=self._torch_runtime_device(), dtype=dtype)
+            if not integer:
+                return tensor
+            import tinygrad as tg
+
+            return tensor.cast(tg.dtypes.int32)
+
+        data = self._payload_to_nested_list(value)
+        if data in ([], [[]]):
+            return None
+
         if selected_backend == "torch":
             import torch
 
@@ -634,6 +659,19 @@ class PeerClient:
         if device.startswith("cuda"):
             return device
         return "cpu"
+
+    def _torch_tensor_transport_dtype(self, dtype: Any):
+        import torch
+
+        if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+            return dtype
+
+        device = self._torch_runtime_device()
+        if device == "mps" and dtype == torch.bfloat16:
+            return torch.float16
+        if device == "cpu" and dtype == torch.float16:
+            return torch.float32
+        return dtype
 
     def mark_peer_seen(self, peer_client_id: str | None) -> None:
         peer_id = str(peer_client_id or "").strip()
