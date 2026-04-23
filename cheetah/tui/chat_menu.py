@@ -21,6 +21,7 @@ from cheetah.models.llm.backend import (
     resolve_model_assets_for_backend,
 )
 from cheetah.tui.widget.model_picker_screen import ModelPickerScreen
+from cheetah.tui.widget.static_footer import StaticBindingFooter
 from cheetah.tui.chat_log_storage import ChatLogStorage, ChatLogSummary, ChatMessage
 from cheetah.orchestration.peer_client import PeerClient
 from cheetah.tui.orchestration_screen import OrchestrationScreen
@@ -50,7 +51,6 @@ from textual.screen import Screen, ModalScreen
 from textual.widgets import ( 
     Button,
     Checkbox,
-    Footer,
     Header,
     Input,
     Label,
@@ -157,7 +157,7 @@ class ChatScreen(Screen[None]):
                         self._stats_label = stats_value
                         yield stats_value
             yield Input(placeholder="", id="chat-input")
-        yield Footer()
+        yield StaticBindingFooter(self.BINDINGS)
 
     async def on_mount(self, _: Mount) -> None:
         self._chat_log = self.query_one("#chat-log", RichLog)

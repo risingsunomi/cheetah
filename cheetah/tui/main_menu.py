@@ -4,7 +4,7 @@ from typing import Optional
 import asyncio
 
 from textual.app import App, ComposeResult
-from textual.widgets import Footer, Header, Button, Label
+from textual.widgets import Header, Button, Label
 from textual.containers import Container
 
 from .chat_menu import ChatScreen
@@ -13,6 +13,7 @@ from .train_menu import TrainScreen
 from .orchestration_screen import OrchestrationScreen
 from .settings_screen import SettingsScreen
 from .help_screen import HelpScreen
+from .widget.static_footer import StaticBindingFooter
 from cheetah.orchestration.peer_client import PeerClient
 
 
@@ -59,7 +60,7 @@ class MainMenu(App):
             yield Button("Network", id="network-btn")
             yield Button("Settings", id="settings-btn")
             yield Button("Quit", id="quit-btn")
-        yield Footer()
+        yield StaticBindingFooter(self.BINDINGS)
 
     async def on_mount(self) -> None:
         self.title="[Nodes: 1]"
