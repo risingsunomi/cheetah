@@ -30,6 +30,10 @@ class TestModelEngine(unittest.TestCase):
         shards = ModelEngine.plan_shards(peers, "demo", total_layers=12)
         self.assertEqual(len(shards), 3)
         self.assertEqual(shards[0].start_layer, 0)
+        self.assertEqual(shards[0].end_layer, 4)
+        self.assertEqual(shards[1].start_layer, 4)
+        self.assertEqual(shards[1].end_layer, 8)
+        self.assertEqual(shards[2].start_layer, 8)
         self.assertEqual(shards[-1].end_layer, 11)
         self.assertEqual(shards[-1].total_layers, 12)
         for peer in peers:

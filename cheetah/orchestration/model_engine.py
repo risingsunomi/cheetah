@@ -188,21 +188,16 @@ class ModelEngine:
         if total_layers <= 1:
             return []
 
-        capacities = []
-        for peer in peers:
-            vram = _to_float(getattr(peer, "gpu_vram", 0.0))
-            ram = _to_float(getattr(peer, "cpu_ram", 0.0))
-            flops = getattr(peer, "gpu_flops", 0.0) if hasattr(peer, "gpu_flops") else 0.0
-            capacity = max(vram, ram, flops, 1.0)
-            capacities.append((peer, capacity))
-
         transformer_layers = max(int(total_layers) - 1, 1)
-        total_cap = sum(cap for _, cap in capacities) or 1.0
+        usable_peers = list(peers[: min(len(peers), transformer_layers)])
+        if not usable_peers:
+            return []
+
+        base_span, remainder = divmod(transformer_layers, len(usable_peers))
         shards: List[Shard] = []
         start = 0
-        for peer, cap in capacities:
-            fraction = cap / total_cap
-            span = max(int(transformer_layers * fraction), 1)
+        for index, peer in enumerate(usable_peers):
+            span = base_span + (1 if index < remainder else 0)
             end = min(start + span, transformer_layers)
             shards.append(Shard(model_name=model_name, start_layer=start, end_layer=end, total_layers=total_layers))
             try:
@@ -210,18 +205,7 @@ class ModelEngine:
             except Exception:
                 pass
             start = end
-        if shards:
-            shards[-1].end_layer = transformer_layers
         return shards
-
-
-def _to_float(val: Any) -> float:
-    try:
-        if isinstance(val, str):
-            return float(val.lower().replace("gb", "").strip() or 0.0)
-        return float(val)
-    except Exception:
-        return 0.0
 
 
 def _sample_with_backend(*args: Any, **kwargs: Any):

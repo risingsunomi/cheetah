@@ -407,6 +407,26 @@ class TestDistributedShardLogging(unittest.TestCase):
         self.assertEqual(plan["remote_peers"][0].shard.start_layer, 4)
         self.assertEqual(plan["remote_peers"][0].shard.end_layer, 8)
 
+    def test_planned_peer_shards_limits_distribution_to_transformer_layer_count(self) -> None:
+        peers = [
+            SimpleNamespace(peer_client_id="self", ip_address="192.168.0.10"),
+            SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20"),
+            SimpleNamespace(peer_client_id="peer-2", ip_address="192.168.0.30"),
+            SimpleNamespace(peer_client_id="peer-3", ip_address="192.168.0.40"),
+        ]
+
+        planned = helpers.planned_peer_shards(
+            peers,
+            model_name="demo",
+            total_layers=3,
+        )
+
+        self.assertEqual(len(planned), 2)
+        self.assertEqual(planned[0].shard.start_layer, 0)
+        self.assertEqual(planned[0].shard.end_layer, 1)
+        self.assertEqual(planned[1].shard.start_layer, 1)
+        self.assertEqual(planned[1].shard.end_layer, 2)
+
     def test_validate_peer_runtime_fingerprints_detects_mismatch(self) -> None:
         remote_peer = SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20")
 

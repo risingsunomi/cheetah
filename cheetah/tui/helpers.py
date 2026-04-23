@@ -827,8 +827,13 @@ def planned_peer_shards(
     total_layers: int,
 ) -> list[Any]:
     normalized = _normalize_peer_entries(peers)
-    if len(normalized) <= 1 or int(total_layers or 0) <= 1:
-        return normalized
+    total_layers_int = int(total_layers or 0)
+    transformer_layers = max(total_layers_int - 1, 0)
+    if len(normalized) <= 1 or transformer_layers <= 1:
+        return normalized[:1] if normalized else []
+
+    usable_count = min(len(normalized), transformer_layers)
+    normalized = normalized[:usable_count]
 
     planning_peers: list[Any] = []
     for index, peer in enumerate(normalized):
@@ -849,7 +854,7 @@ def planned_peer_shards(
                     setattr(planning_peer, attr, value)
         planning_peers.append(planning_peer)
 
-    ModelEngine.plan_shards(planning_peers, model_name or "model", int(total_layers))
+    ModelEngine.plan_shards(planning_peers, model_name or "model", total_layers_int)
     return planning_peers
 
 
