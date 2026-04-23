@@ -26,6 +26,7 @@ from cheetah.models.llm.backend import (
     backend_helpers_module,
     detect_quantization_mode as detect_quantization_mode_backend,
     get_backend_device,
+    RUNTIME_FINGERPRINT_PROTOCOL,
     runtime_asset_fingerprints,
 )
 from cheetah.models.shard import Shard
@@ -1029,8 +1030,24 @@ def validate_peer_runtime_fingerprints(
         peer = entry.get("peer")
         response = entry.get("response", {}) if isinstance(entry.get("response"), dict) else {}
         label = _peer_log_label(peer, fallback=_peer_identifier(peer))
+        remote_protocol = response.get("fingerprint_protocol")
         remote_config_fp = str(response.get("config_fingerprint", "") or "")
         remote_tokenizer_fp = str(response.get("tokenizer_fingerprint", "") or "")
+        if remote_protocol is None:
+            mismatches.append(
+                f"{label} is running an older peer fingerprint protocol; update and restart that node"
+            )
+            continue
+        try:
+            remote_protocol_int = int(remote_protocol)
+        except (TypeError, ValueError):
+            mismatches.append(f"{label} reported an invalid peer fingerprint protocol")
+            continue
+        if remote_protocol_int != RUNTIME_FINGERPRINT_PROTOCOL:
+            mismatches.append(
+                f"{label} peer fingerprint protocol {remote_protocol_int} != {RUNTIME_FINGERPRINT_PROTOCOL}"
+            )
+            continue
         if not remote_config_fp:
             mismatches.append(f"{label} did not report a model config fingerprint")
             continue

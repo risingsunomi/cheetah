@@ -399,6 +399,7 @@ class TestDistributedShardLogging(unittest.TestCase):
                     {
                         "peer": remote_peer,
                         "response": {
+                            "fingerprint_protocol": 2,
                             "config_fingerprint": "remote-config",
                             "tokenizer_fingerprint": "remote-tokenizer",
                         },
@@ -410,6 +411,36 @@ class TestDistributedShardLogging(unittest.TestCase):
 
         self.assertIn("peer-1 (192.168.0.20) model config fingerprint mismatch", mismatches)
         self.assertIn("peer-1 (192.168.0.20) tokenizer fingerprint mismatch", mismatches)
+
+    def test_validate_peer_runtime_fingerprints_flags_older_peer_protocol(self) -> None:
+        remote_peer = SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20")
+
+        with patch.object(
+            helpers,
+            "local_runtime_fingerprints",
+            return_value={
+                "config_fingerprint": "local-config",
+                "tokenizer_fingerprint": "local-tokenizer",
+            },
+        ):
+            mismatches = helpers.validate_peer_runtime_fingerprints(
+                [
+                    {
+                        "peer": remote_peer,
+                        "response": {
+                            "config_fingerprint": "legacy-config",
+                            "tokenizer_fingerprint": "legacy-tokenizer",
+                        },
+                    }
+                ],
+                local_model_config={"num_layers": 8},
+                local_model_path="/tmp/model",
+            )
+
+        self.assertEqual(
+            mismatches,
+            ["peer-1 (192.168.0.20) is running an older peer fingerprint protocol; update and restart that node"],
+        )
 
 
 if __name__ == "__main__":

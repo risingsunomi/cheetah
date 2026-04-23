@@ -22,6 +22,7 @@ from cheetah.orchestration.peer_client import (
     _peer_host_from_payload,
     _resolve_advertise_address,
 )
+from cheetah.models.llm.backend import RUNTIME_FINGERPRINT_PROTOCOL
 from cheetah.models.shard import Shard
 
 TEST_RECEIVER_BIND_HOST = "0.0.0.0"
@@ -376,6 +377,7 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertFalse(response["already_loaded"])
         self.assertTrue(response["config_fingerprint"])
+        self.assertEqual(response["fingerprint_protocol"], RUNTIME_FINGERPRINT_PROTOCOL)
         self.assertEqual(client._generation_model, model)
         self.assertEqual(client._generation_tokenizer, tokenizer)
         self.assertEqual(client._generation_model_id, "demo")
@@ -420,4 +422,5 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertTrue(response["already_loaded"])
         self.assertTrue(response["config_fingerprint"])
+        self.assertEqual(response["fingerprint_protocol"], RUNTIME_FINGERPRINT_PROTOCOL)
         self.assertEqual(response["shard"]["start_layer"], 0)

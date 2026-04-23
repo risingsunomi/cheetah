@@ -29,6 +29,14 @@ _TOKENIZER_FINGERPRINT_FILES = (
     "merges.txt",
     "vocab.json",
 )
+RUNTIME_FINGERPRINT_PROTOCOL = 2
+_MODEL_CONFIG_RUNTIME_ONLY_KEYS = {
+    "temperature",
+    "max_new_tokens",
+    "top_k",
+    "top_p",
+    "repetition_penalty",
+}
 
 
 def normalize_llm_backend(value: str | None) -> str:
@@ -145,29 +153,17 @@ def backend_model_config_class(backend: str | None = None):
 
 
 def model_config_fingerprint(model_config: Any) -> str:
-    normalized = _json_safe_value(model_config)
+    normalized = _json_safe_value(_stable_model_config_view(model_config))
     payload = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
-def tokenizer_assets_fingerprint(model_path: str | Path | None) -> str:
-    if model_path is None:
-        return ""
-    root = Path(model_path).expanduser()
-    if not root.exists():
-        return ""
+def model_config_file_fingerprint(model_path: str | Path | None) -> str:
+    return _asset_fingerprint(model_path, ("config.json",))
 
-    digest = hashlib.sha256()
-    found = False
-    for filename in _TOKENIZER_FINGERPRINT_FILES:
-        candidate = root / filename
-        if not candidate.exists() or not candidate.is_file():
-            continue
-        digest.update(filename.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(candidate.read_bytes())
-        found = True
-    return digest.hexdigest() if found else ""
+
+def tokenizer_assets_fingerprint(model_path: str | Path | None) -> str:
+    return _asset_fingerprint(model_path, _TOKENIZER_FINGERPRINT_FILES)
 
 
 def runtime_asset_fingerprints(
@@ -175,8 +171,11 @@ def runtime_asset_fingerprints(
     model_config: Any,
     model_path: str | Path | None,
 ) -> dict[str, str]:
+    config_fingerprint = model_config_file_fingerprint(model_path)
+    if not config_fingerprint:
+        config_fingerprint = model_config_fingerprint(model_config)
     return {
-        "config_fingerprint": model_config_fingerprint(model_config),
+        "config_fingerprint": config_fingerprint,
         "tokenizer_fingerprint": tokenizer_assets_fingerprint(model_path),
     }
 
@@ -266,3 +265,33 @@ def _json_safe_value(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _asset_fingerprint(model_path: str | Path | None, filenames: tuple[str, ...]) -> str:
+    if model_path is None:
+        return ""
+    root = Path(model_path).expanduser()
+    if not root.exists():
+        return ""
+
+    digest = hashlib.sha256()
+    found = False
+    for filename in filenames:
+        candidate = root / filename
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        digest.update(filename.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(candidate.read_bytes())
+        found = True
+    return digest.hexdigest() if found else ""
+
+
+def _stable_model_config_view(model_config: Any) -> Any:
+    if not isinstance(model_config, dict):
+        return model_config
+    return {
+        key: value
+        for key, value in model_config.items()
+        if str(key) not in _MODEL_CONFIG_RUNTIME_ONLY_KEYS
+    }

@@ -16,6 +16,7 @@ import asyncio
 
 from cheetah.logging_utils import get_logger
 from cheetah.models.llm.backend import (
+    RUNTIME_FINGERPRINT_PROTOCOL,
     get_backend_device,
     get_llm_backend,
     load_model_for_backend,
@@ -355,6 +356,7 @@ class PeerClient:
                 "already_loaded": True,
                 "model_id": model_id,
                 "backend": backend,
+                "fingerprint_protocol": RUNTIME_FINGERPRINT_PROTOCOL,
                 "shard": _shard_payload(current_shard),
                 **fingerprints,
                 "elapsed": 0.0,
@@ -391,6 +393,7 @@ class PeerClient:
                 "already_loaded": False,
                 "model_id": model_id,
                 "backend": backend,
+                "fingerprint_protocol": RUNTIME_FINGERPRINT_PROTOCOL,
                 "model_path": str(model_path),
                 "shard": _shard_payload(getattr(self, "_generation_shard", None)),
                 **fingerprints,
