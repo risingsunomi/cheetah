@@ -352,6 +352,135 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
         self.assertEqual(sent_payload["hidden_state"]["dtype"], "float32")
         self.assertIsInstance(sent_payload["attention_mask"], dict)
 
+    def test_streaming_generate_with_peers_keeps_decode_mask_one_step_behind_local_state(self) -> None:
+        class _FakeEngine:
+            def __init__(self) -> None:
+                self.shard = None
+                self.attention_mask_lengths: list[int] = []
+                self.call_index = 0
+
+            def get_tokens(self, model, input_ids, attention_mask, tokenizer, **kwargs):
+                del model, input_ids, tokenizer, kwargs
+                self.attention_mask_lengths.append(int(attention_mask.shape[1]))
+                if self.call_index == 0:
+                    self.call_index += 1
+                    return {
+                        "hidden_state": {
+                            "buffer": "zczMPQ==",
+                            "shape": [1, 1, 1],
+                            "dtype": "float32",
+                        },
+                        "attention_mask": {
+                            "buffer": "AQAAAAEAAAA=",
+                            "shape": [1, 2],
+                            "dtype": "int32",
+                        },
+                        "position_ids": {
+                            "buffer": "AAAAAAAAAAABAAAA",
+                            "shape": [1, 2],
+                            "dtype": "int32",
+                        },
+                        "end_token": False,
+                    }
+
+                return {
+                    "hidden_state": {
+                        "buffer": "zczMPQ==",
+                        "shape": [1, 1, 1],
+                        "dtype": "float32",
+                    },
+                    "attention_mask": {
+                        "buffer": "AQAAAAEAAAABAAAA",
+                        "shape": [1, 3],
+                        "dtype": "int32",
+                    },
+                    "position_ids": {
+                        "buffer": "AgAAAA==",
+                        "shape": [1],
+                        "dtype": "int32",
+                    },
+                    "end_token": False,
+                }
+
+            def recv_tokens(self, payload, tokenizer=None, backend=None):
+                del tokenizer, backend
+                return payload
+
+        class _PeerClientStub:
+            def __init__(self) -> None:
+                self.peer_client_id = "self"
+                self_peer = SimpleNamespace(
+                    peer_client_id="self",
+                    ip_address="192.168.0.10",
+                    port=8765,
+                    gpu_vram="8",
+                    cpu_ram="8",
+                    gpu_flops=0.0,
+                )
+                remote_peer = SimpleNamespace(
+                    peer_client_id="peer-1",
+                    ip_address="192.168.0.20",
+                    port=8765,
+                    gpu_vram="8",
+                    cpu_ram="8",
+                    gpu_flops=0.0,
+                )
+                self.peer_device = self_peer
+                self._peers = [self_peer, remote_peer]
+                self.calls: list[dict[str, object]] = []
+
+            def get_peers(self, include_self: bool = False):
+                return list(self._peers if include_self else self._peers[1:])
+
+            def send_payload(self, message, *, expect_reply=True, address=None, timeout=None):
+                self.calls.append(
+                    {
+                        "message": message,
+                        "expect_reply": expect_reply,
+                        "address": address,
+                        "timeout": timeout,
+                    }
+                )
+                if len(self.calls) == 1:
+                    return {
+                        "token": 7,
+                        "attention_mask": [[1, 1]],
+                        "position_ids": [[0, 1]],
+                        "end_token": False,
+                    }
+                return {
+                    "token": 8,
+                    "attention_mask": [[1, 1, 1]],
+                    "position_ids": [2],
+                    "end_token": True,
+                }
+
+        peer_client = _PeerClientStub()
+        fake_engine = _FakeEngine()
+        model = SimpleNamespace(config={"num_layers": 8}, shard=None)
+        tokenizer = _DummyTokenizer(chat_template="")
+
+        with patch.object(helpers, "_local_engine", return_value=fake_engine):
+            out, _ = helpers.streaming_generate_with_peers(
+                peer_client,
+                model,
+                input_ids=tg.Tensor([[10, 11]]),
+                attention_mask=tg.Tensor([[1, 1]]),
+                tokenizer=tokenizer,
+                max_new_tokens=2,
+                temp=0.0,
+                top_k=0,
+                top_p=1.0,
+            )
+
+        self.assertEqual(out, [7, 8])
+        self.assertEqual(fake_engine.attention_mask_lengths, [2, 2])
+        first_payload = peer_client.calls[0]["message"]["payload"]
+        second_payload = peer_client.calls[1]["message"]["payload"]
+        self.assertEqual(first_payload["attention_mask"]["shape"], [1, 2])
+        self.assertEqual(second_payload["attention_mask"]["shape"], [1, 3])
+        self.assertEqual(second_payload["position_ids"]["shape"], [1])
+
 
 class TestDistributedShardLogging(unittest.TestCase):
     def test_distributed_shard_plan_messages_list_local_then_remote_peers(self) -> None:

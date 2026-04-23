@@ -1277,10 +1277,6 @@ def _apply_token_data(
         if on_token is not None:
             on_token(tok)
         input_list[0].append(tok)
-        if mask_list:
-            mask_list[0].append(1)
-        else:
-            mask_list = [[1]]
         hidden_state_list = []
     elif hidden_state is not None:
         hidden_state_list = _tensor_to_list(hidden_state)
