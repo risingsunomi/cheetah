@@ -68,7 +68,11 @@ class ModelEngine:
                 print(f"hidden_state len: {hidden_state.shape[1]}")
                 curr_pos = int(attention_mask.shape[1] - 1)
                 if position_ids is None:
-                    position_ids = _position_ids_tensor(curr_pos, hidden_state)
+                    # position_ids = _position_ids_tensor(curr_pos, hidden_state)
+                    position_ids = _full_position_ids_tensor(
+                        attention_mask,
+                        like=input_ids if hidden_state is None else hidden_state,
+                    )
                 print(f"curr_pos: {curr_pos}")
                 print(f"position_ids: {position_ids}")
                 print(f"hidden_state: {hidden_state}")
@@ -105,13 +109,16 @@ class ModelEngine:
 
         is_final = _is_final_shard(self.shard)
         if not is_final:
-            return {
+            resp_data = {
                 "hidden_state": _encode_tensor(model_output),
                 "attention_mask": _encode_tensor(attention_mask),
                 "position_ids": _encode_tensor(position_ids),
                 "shard": _shard_payload(self.shard),
                 "end_token": False,
             }
+
+            print(f"resp_data: {resp_data}")
+            return resp_data
 
         next_logit = model_output[:, -1, :].flatten()
         tok = _sample_with_backend(
@@ -127,7 +134,7 @@ class ModelEngine:
         tok = int(tok)
         end_token = bool(getattr(tokenizer, "eos_token_id", None) == tok)
 
-        return {
+        resp_data = {
             "token": _encode_token_tensor(tok),
             "tensor": _encode_token_tensor(tok),
             "attention_mask": _encode_tensor(attention_mask),
@@ -135,6 +142,9 @@ class ModelEngine:
             "shard": _shard_payload(self.shard),
             "end_token": end_token,
         }
+
+        print(f"resp_data: {resp_data}")
+        return resp_data
 
     def recv_tokens(
         self,
@@ -282,7 +292,8 @@ def _encode_tensor(tensor: Any) -> Dict[str, Any]:
     if torch is not None and isinstance(tensor, torch.Tensor):
         detached = tensor.detach().cpu().contiguous()
         if detached.dtype == torch.bfloat16:
-            raw_view = detached.view(torch.uint16).numpy()
+            raw_view = detached.view(torch.float16).numpy()
+            print(f"raw_view: {raw_view}")
             return {
                 "buffer": base64.b64encode(raw_view.tobytes()).decode("ascii"),
                 "shape": list(detached.shape),
