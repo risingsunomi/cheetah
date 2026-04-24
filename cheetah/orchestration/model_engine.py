@@ -64,8 +64,8 @@ class ModelEngine:
                 start_pos=None,
             )
         else:
-            curr_pos = int(attention_mask.shape[1] - 1)
             if hidden_state is not None:
+                curr_pos = int(attention_mask.shape[1] - 1)
                 if position_ids is None:
                     position_ids = _position_ids_tensor(curr_pos, hidden_state)
                 model_output = _run_model_shard(
@@ -78,6 +78,7 @@ class ModelEngine:
                     start_pos=curr_pos,
                 )
             else:
+                curr_pos = int(attention_mask.shape[1])
                 prev_token = _scalar_int(input_ids[:, -1], default=0)
                 next_tok = _next_token_tensor(prev_token, input_ids)
                 attention_mask = _append_attention_mask(attention_mask)

@@ -1,8 +1,13 @@
+from pathlib import Path
+import tempfile
 import unittest
 
+import numpy as np
 import tinygrad as tg
+from safetensors.numpy import save_file
 
-from cheetah.models.llm.tinygrad.helpers import generate
+from cheetah.models.llm.tinygrad.helpers import generate, load_safetensors
+from cheetah.models.shard import Shard
 
 
 class _DummyGenerateModel:
@@ -74,6 +79,12 @@ class _DummyOptimizedGenerateModel(_DummyGenerateModel):
         return logits
 
 
+class _DummyShardedLayerModel:
+    def __init__(self):
+        self.layers = [tg.nn.Linear(2, 2, bias=False)]
+        self.shard = Shard("demo", start_layer=1, end_layer=2, total_layers=3)
+
+
 class TestHelpersGenerate(unittest.TestCase):
     def test_generate_handles_eos_without_tensor_bool(self):
         model = _DummyGenerateModel()
@@ -115,6 +126,35 @@ class TestHelpersGenerate(unittest.TestCase):
         self.assertEqual(len(model.position_ids_seen), 1)
         self.assertEqual(model.position_ids_seen[0].tolist(), [[0, 1, 2]])
         self.assertEqual(model.decode_start_pos_seen, [3])
+
+    def test_load_safetensors_maps_shard_local_layer_index_to_global_weight_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            weight_file = "model.safetensors"
+            global_zero = np.zeros((2, 2), dtype=np.float32)
+            global_one = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+
+            save_file(
+                {
+                    "model.layers.0.weight": global_zero,
+                    "model.layers.1.weight": global_one,
+                },
+                str(model_dir / weight_file),
+            )
+            (model_dir / "model.safetensors.index.json").write_text(
+                '{"metadata":{"total_size":0},"weight_map":{"model.layers.0.weight":"model.safetensors","model.layers.1.weight":"model.safetensors"}}'
+            )
+
+            model = _DummyShardedLayerModel()
+            load_safetensors(
+                model,
+                model_dir,
+                model_config={"num_heads": 2, "num_kv_heads": 1},
+                weight_device="CPU",
+                use_tied=False,
+            )
+
+            self.assertEqual(model.layers[0].weight.numpy().tolist(), global_one.tolist())
 
 
 if __name__ == "__main__":

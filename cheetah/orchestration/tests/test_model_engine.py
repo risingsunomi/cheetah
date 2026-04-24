@@ -100,6 +100,58 @@ class TestModelEngine(unittest.TestCase):
         self.assertEqual(shard.start_layer, 0)
         self.assertEqual(shard.end_layer, 2)
 
+    def test_get_tokens_decode_uses_next_absolute_position_for_new_token(self):
+        if torch is None:
+            self.skipTest("torch is required for this test.")
+
+        class FakeShardModel:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def run_shard(
+                self,
+                x,
+                *,
+                attention_mask=None,
+                position_ids=None,
+                hidden_state=None,
+                shard=None,
+                start_pos=None,
+            ):
+                self.calls.append(
+                    {
+                        "x": x,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "hidden_state": hidden_state,
+                        "shard": shard,
+                        "start_pos": start_pos,
+                    }
+                )
+                return torch.ones((1, 1, 4), dtype=torch.float32)
+
+        engine = ModelEngine(shard=Shard("demo", start_layer=0, end_layer=1, total_layers=4))
+        model = FakeShardModel()
+        input_ids = torch.tensor([[10, 11, 12]], dtype=torch.long)
+        attention_mask = torch.tensor([[1, 1]], dtype=torch.long)
+
+        payload = engine.get_tokens(
+            model,
+            input_ids,
+            attention_mask,
+            SimpleNamespace(eos_token_id=99),
+            prefill=False,
+        )
+
+        self.assertIn("hidden_state", payload)
+        self.assertEqual(len(model.calls), 1)
+        call = model.calls[0]
+        assert isinstance(call["position_ids"], torch.Tensor)
+        assert isinstance(call["attention_mask"], torch.Tensor)
+        self.assertTrue(torch.equal(call["position_ids"].cpu(), torch.tensor([2], dtype=torch.long)))
+        self.assertEqual(tuple(call["attention_mask"].shape), (1, 3))
+        self.assertEqual(call["start_pos"], 2)
+
     def test_encode_tensor_preserves_torch_bfloat16_for_network(self):
         if torch is None:
             self.skipTest("torch is required for this test.")

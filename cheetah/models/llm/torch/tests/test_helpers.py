@@ -14,6 +14,8 @@ try:
 except ModuleNotFoundError:
     torch = None
 
+from cheetah.models.shard import Shard
+
 if torch is not None:
     from cheetah.models.llm.torch.helpers import generate, load_model, load_safetensors, sample
     from cheetah.models.llm.torch.helpers import permute as helpers_permute
@@ -63,6 +65,12 @@ if torch is not None:
         def __init__(self):
             super().__init__()
             self.backbone = _DummyBackbone()
+
+    class _DummyShardedLayerModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
+            self.shard = Shard("demo", start_layer=1, end_layer=2, total_layers=3)
 
 
     class _DummyGenerateModel(torch.nn.Module):
@@ -260,6 +268,42 @@ class TestHelpersLoader(unittest.TestCase):
             torch.testing.assert_close(
                 model.backbone.embeddings.weight.detach().cpu(),
                 expected.to(dtype=model.backbone.embeddings.weight.dtype),
+            )
+
+    def test_load_safetensors_maps_shard_local_layer_index_to_global_weight_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            weight_file = "model.safetensors"
+            global_zero = torch.zeros((2, 2), dtype=torch.float32)
+            global_one = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+
+            save_torch_file(
+                {
+                    "model.layers.0.weight": global_zero,
+                    "model.layers.1.weight": global_one,
+                },
+                str(model_dir / weight_file),
+            )
+            _write_model_index(
+                model_dir,
+                {
+                    "model.layers.0.weight": weight_file,
+                    "model.layers.1.weight": weight_file,
+                },
+            )
+
+            model = _DummyShardedLayerModel()
+            load_safetensors(
+                model,
+                model_dir,
+                model_config={"num_heads": 2, "num_kv_heads": 1, "model_type": "llama"},
+                weight_device="cpu",
+                use_tied=False,
+            )
+
+            torch.testing.assert_close(
+                model.layers[0].weight.detach().cpu(),
+                global_one.to(dtype=model.layers[0].weight.dtype),
             )
 
 
