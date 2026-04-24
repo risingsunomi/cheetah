@@ -836,6 +836,7 @@ class ChatScreen(Screen[None]):
                 alpha_p=float(payload.get("alpha_p", 0.0) or 0.0),
                 repetition_penalty=float(payload.get("repetition_penalty", 1.0) or 1.0),
                 seen_tokens=[int(tok) for tok in payload.get("seen_tokens", []) or []],
+                trace=bool(payload.get("trace", False)),
             )
             if sender_peer_id:
                 response_tokens = self._flow_token_count(response)

@@ -75,6 +75,12 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--top-p", type=float, default=1.0)
     generate.add_argument("--repetition-penalty", type=float, default=1.0)
     generate.add_argument("--stream", action="store_true", help="stream decoded text as tokens arrive")
+    generate.add_argument(
+        "--trace-tensors",
+        action="store_true",
+        default=_env_flag("TC_TRACE_TENSOR_TRANSFERS"),
+        help="print distributed tensor transfer shapes, sizes, and remote KV cache positions",
+    )
     return parser
 
 
@@ -240,6 +246,8 @@ def _generate(args: argparse.Namespace) -> int:
         top_p=float(args.top_p),
         repetition_penalty=float(args.repetition_penalty),
         on_token=_on_token,
+        trace_transfers=bool(args.trace_tensors),
+        on_transfer=_print_transfer_event if args.trace_tensors else None,
     )
 
     if args.stream:
@@ -296,6 +304,81 @@ def _torch_device_name() -> str:
     if device in {"metal", "mps"}:
         return "mps"
     return device
+
+
+def _print_transfer_event(event: dict[str, Any]) -> None:
+    name = str(event.get("event", "transfer"))
+    phase = str(event.get("phase", ""))
+    step = event.get("step", "")
+    peer = str(event.get("peer", "local"))
+    shard = _format_shard_payload(event.get("shard"))
+    byte_count = int(event.get("bytes", 0) or 0)
+    prefix = f"[trace] step={step} phase={phase} event={name} peer={peer}"
+    if shard:
+        prefix += f" shard={shard}"
+    if byte_count:
+        prefix += f" bytes={byte_count}"
+    print(prefix, flush=True)
+
+    tensors = event.get("tensors")
+    if isinstance(tensors, dict) and tensors:
+        _print_tensor_group("tensors", tensors)
+    for group_name in ("request", "response"):
+        group = event.get(group_name)
+        if isinstance(group, dict) and group:
+            _print_tensor_group(group_name, group)
+
+    diagnostics = event.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        cache = diagnostics.get("kv_cache")
+        if isinstance(cache, dict):
+            print(
+                "[trace]   kv_cache: "
+                f"layers={cache.get('layer_count')} "
+                f"min={cache.get('min_cache_pos')} "
+                f"max={cache.get('max_cache_pos')} "
+                f"positions={cache.get('cache_pos')}",
+                flush=True,
+            )
+        output = diagnostics.get("output")
+        if isinstance(output, dict):
+            print(f"[trace]   output{_format_tensor_summary(output)}", flush=True)
+
+
+def _print_tensor_group(name: str, tensors: dict[str, Any]) -> None:
+    parts = [f"{key}{_format_tensor_summary(value)}" for key, value in tensors.items()]
+    print(f"[trace]   {name}: {', '.join(parts)}", flush=True)
+
+
+def _format_tensor_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    shape = value.get("shape")
+    dtype = value.get("dtype", "")
+    device = value.get("device", "")
+    bytes_count = value.get("bytes")
+    extra = []
+    if dtype:
+        extra.append(str(dtype))
+    if device:
+        extra.append(str(device))
+    if bytes_count:
+        extra.append(f"{bytes_count}B64")
+    suffix = f" ({', '.join(extra)})" if extra else ""
+    return f" shape={shape}{suffix}"
+
+
+def _format_shard_payload(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return ""
+    return f"{value.get('start_layer')}:{value.get('end_layer')}/{value.get('total_layers')}"
+
+
+def _env_flag(name: str) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _add_manual_peer(client: PeerClient, peer_spec: str, *, backend: str) -> None:

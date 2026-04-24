@@ -107,7 +107,8 @@ python -m cheetah.orchestration.distributed_probe generate \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --prompt "Explain why the sky is blue in one paragraph." \
   --max-new-tokens 64 \
-  --temperature 0
+  --temperature 0 \
+  --trace-tensors
 ```
 
 Torch uses the same script:
@@ -127,8 +128,11 @@ python -m cheetah.orchestration.distributed_probe generate \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --prompt "Write a concise test sentence." \
   --max-new-tokens 32 \
-  --temperature 0
+  --temperature 0 \
+  --trace-tensors
 ```
+
+With `--trace-tensors`, the driver prints each local shard step and each peer request/response. During `phase=prefill`, the remote peer should report `kv_cache min=<prompt_length> max=<prompt_length>`. During each decode step, that value should advance by one. If decode starts with the wrong cache position, distributed inference now raises a `Shard KV cache is not primed for decode` error instead of continuing into gibberish.
 
 ## Files To Read
 

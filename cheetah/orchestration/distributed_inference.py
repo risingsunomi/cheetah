@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from cheetah.logging_utils import get_logger
 logger = get_logger(__name__)
 TokenCallback = Callable[[int], None]
 AbortCheck = Callable[[], str | None]
+TransferCallback = Callable[[dict[str, Any]], None]
 
 
 class MemoryPressureError(RuntimeError):
@@ -299,6 +301,8 @@ def streaming_generate_with_peers(
     verbose: bool = False,
     on_token: TokenCallback | None = None,
     abort_check: AbortCheck | None = None,
+    trace_transfers: bool = False,
+    on_transfer: TransferCallback | None = None,
 ) -> tuple[list[int], float]:
     peers = _normalize_peer_entries(peer_client.get_peers(include_self=True)) if peer_client is not None else []
     backend = "torch" if torch is not None and isinstance(input_ids, torch.Tensor) else "tinygrad"
@@ -364,6 +368,7 @@ def streaming_generate_with_peers(
 
     engine = _local_engine(model)
     _plan_peer_shards(engine, peer_client, model)
+    trace_enabled = bool(trace_transfers or on_transfer is not None)
 
     input_list = _tensor_to_list(input_ids)
     mask_list = _tensor_to_list(attention_mask)
@@ -395,6 +400,25 @@ def streaming_generate_with_peers(
             alpha_p=alpha_p,
             repetition_penalty=repetition_penalty,
             seen_tokens=seen_tokens,
+            trace=trace_enabled,
+        )
+        _emit_transfer(
+            on_transfer,
+            {
+                "event": "local_shard",
+                "phase": "prefill" if prefill else "decode",
+                "step": step,
+                "peer": local_peer_id or "local",
+                "shard": _shard_payload_from_any(engine.shard),
+                "request": _payload_tensor_summaries(
+                    {
+                        "input_ids": input_list,
+                        "attention_mask": mask_list,
+                    }
+                ),
+                "response": _payload_tensor_summaries(otoken_data),
+                "diagnostics": otoken_data.get("diagnostics") if isinstance(otoken_data, dict) else None,
+            },
         )
         transport_attention_mask = otoken_data.get("attention_mask", mask_list)
         transport_position_ids = otoken_data.get("position_ids", position_list)
@@ -449,11 +473,28 @@ def streaming_generate_with_peers(
                     "repetition_penalty": repetition_penalty,
                     "seen_tokens": seen_tokens,
                     "shard": _peer_shard_payload(peer),
+                    "trace": trace_enabled,
                 },
             }
             try:
                 request_tokens = _flow_token_count(payload)
                 _record_peer_flow(peer_client, local_peer_id or "local", peer_id, request_tokens, phase="request")
+                _emit_transfer(
+                    on_transfer,
+                    {
+                        "event": "request",
+                        "phase": "prefill" if prefill else "decode",
+                        "step": step,
+                        "peer": peer_id,
+                        "address": (
+                            f"{_peer_value(peer, 'ip_address', _peer_value(peer, 'address', '0.0.0.0'))}:"
+                            f"{_peer_value(peer, 'port', os.getenv('TC_TENSOR_PORT', 1045))}"
+                        ),
+                        "shard": _peer_shard_payload(peer),
+                        "bytes": _json_size_bytes(payload),
+                        "tensors": _payload_tensor_summaries(payload.get("payload", {})),
+                    },
+                )
                 logger.debug(
                     "Sending payload to peer %s",
                     peer_id,
@@ -472,6 +513,19 @@ def streaming_generate_with_peers(
                 _mark_peer_seen(peer_client, peer_id)
                 response_tokens = _flow_token_count(resp)
                 _record_peer_flow(peer_client, peer_id, local_peer_id or "local", response_tokens, phase="response")
+                _emit_transfer(
+                    on_transfer,
+                    {
+                        "event": "response",
+                        "phase": "prefill" if prefill else "decode",
+                        "step": step,
+                        "peer": peer_id,
+                        "shard": _peer_shard_payload(peer),
+                        "bytes": _json_size_bytes(resp),
+                        "tensors": _payload_tensor_summaries(resp),
+                        "diagnostics": resp.get("diagnostics") if isinstance(resp, dict) else None,
+                    },
+                )
                 otoken_data = resp
                 transport_attention_mask = resp.get("attention_mask", transport_attention_mask)
                 transport_position_ids = resp.get("position_ids", transport_position_ids)
@@ -979,6 +1033,104 @@ def _mark_peer_seen(peer_client: Any, peer_client_id: str) -> None:
     marker = getattr(peer_client, "mark_peer_seen", None)
     if callable(marker):
         marker(peer_client_id)
+
+
+def _emit_transfer(callback: TransferCallback | None, event: dict[str, Any]) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        logger.debug("Transfer trace callback failed", exc_info=True)
+
+
+def _json_size_bytes(value: Any) -> int:
+    try:
+        return len(json.dumps(value, default=str).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _payload_tensor_summaries(payload: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}
+    source = payload.get("payload", payload)
+    if not isinstance(source, dict):
+        return {}
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for key in ("input_ids", "attention_mask", "position_ids", "hidden_state", "token", "tensor"):
+        if key not in source:
+            continue
+        summary = _payload_value_summary(source.get(key))
+        if summary is not None:
+            summaries[key] = summary
+    return summaries
+
+
+def _payload_value_summary(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        shape = value.get("shape")
+        encoded = value.get("buffer")
+        return {
+            "shape": list(shape) if isinstance(shape, list) else shape,
+            "dtype": str(value.get("dtype", "")),
+            "bytes": len(encoded) if isinstance(encoded, str) else 0,
+            "encoded": True,
+        }
+    if isinstance(value, list):
+        return {
+            "shape": _nested_shape(value),
+            "dtype": "list",
+            "items": _nested_item_count(value),
+        }
+    try:
+        shape = tuple(getattr(value, "shape", ()) or ())
+    except Exception:
+        shape = ()
+    if shape:
+        return {
+            "shape": list(shape),
+            "dtype": str(getattr(value, "dtype", "")),
+            "device": str(getattr(value, "device", "")),
+        }
+    return {
+        "shape": [],
+        "dtype": type(value).__name__,
+    }
+
+
+def _nested_shape(value: Any) -> list[int]:
+    shape: list[int] = []
+    current = value
+    while isinstance(current, list):
+        shape.append(len(current))
+        if not current:
+            break
+        current = current[0]
+    return shape
+
+
+def _nested_item_count(value: Any) -> int:
+    if not isinstance(value, list):
+        return 1
+    return sum(_nested_item_count(item) for item in value)
+
+
+def _shard_payload_from_any(shard: Any) -> dict[str, int | str]:
+    if shard is None:
+        return {}
+    try:
+        return {
+            "model_name": str(getattr(shard, "model_name", "") or ""),
+            "start_layer": int(getattr(shard, "start_layer", 0) or 0),
+            "end_layer": int(getattr(shard, "end_layer", 0) or 0),
+            "total_layers": int(getattr(shard, "total_layers", 0) or 0),
+        }
+    except Exception:
+        return {}
 
 
 def _shard_matches_total(shard: Any, total_layers: int) -> bool:

@@ -41,8 +41,10 @@ class ModelEngine:
         alpha_p: float = 0.0,
         repetition_penalty: float = 1.0,
         seen_tokens: Sequence[int] | None = None,
+        trace: bool = False,
     ) -> Dict[str, Any]:
         """Generate the next token and return a JSON-serializable payload."""
+        phase = "prefill" if prefill else "decode"
         if prefill:
             reset_kv_cache = getattr(model, "reset_kv_cache", None)
             if callable(reset_kv_cache):
@@ -65,13 +67,10 @@ class ModelEngine:
             )
         else:
             if hidden_state is not None:
-                print(f"hidden_state len: {len(hidden_state)}")
                 curr_pos = int(attention_mask.shape[1] - 1)
+                _ensure_decode_cache_ready(model, curr_pos)
                 if position_ids is None:
                     position_ids = _position_ids_tensor(curr_pos, hidden_state)
-                print(f"curr_pos: {curr_pos}")
-                print(f"position_ids: {position_ids}")
-                # print(f"hidden_state: {hidden_state}")
                 model_output = _run_model_shard(
                     model,
                     None,
@@ -83,14 +82,10 @@ class ModelEngine:
                 )
             else:
                 curr_pos = int(attention_mask.shape[1])
-                print(f"curr_pos: {curr_pos}")
-                print(f"input_ids: {input_ids}")
+                _ensure_decode_cache_ready(model, curr_pos)
                 prev_token = _scalar_int(input_ids[:, -1], default=0)
                 next_tok = _next_token_tensor(prev_token, input_ids)
                 attention_mask = _append_attention_mask(attention_mask)
-                print("prev_token:", prev_token)
-                print("next_tok:", next_tok)
-                print("attention_mask:", attention_mask)
                 if position_ids is None:
                     position_ids = _position_ids_tensor(curr_pos, input_ids)
                 model_output = _run_model_shard(
@@ -112,8 +107,18 @@ class ModelEngine:
                 "shard": _shard_payload(self.shard),
                 "end_token": False,
             }
-
-            print(f"resp_data: {resp_data}")
+            if trace:
+                resp_data["diagnostics"] = _diagnostics_payload(
+                    model,
+                    phase=phase,
+                    prefill=prefill,
+                    shard=self.shard,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    hidden_state=hidden_state,
+                    output=model_output,
+                )
             return resp_data
 
         next_logit = model_output[:, -1, :].flatten()
@@ -138,8 +143,19 @@ class ModelEngine:
             "shard": _shard_payload(self.shard),
             "end_token": end_token,
         }
-
-        print(f"resp_data: {resp_data}")
+        if trace:
+            resp_data["diagnostics"] = _diagnostics_payload(
+                model,
+                phase=phase,
+                prefill=prefill,
+                shard=self.shard,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                hidden_state=hidden_state,
+                output=model_output,
+                token=tok,
+            )
         return resp_data
 
     def recv_tokens(
@@ -289,7 +305,7 @@ def _encode_tensor(tensor: Any) -> Dict[str, Any]:
         detached = tensor.detach().cpu().contiguous()
         if detached.dtype == torch.bfloat16:
             raw_view = detached.view(torch.float16).numpy()
-            print(f"raw_view: {raw_view}")
+            # print(f"raw_view: {raw_view}")
             return {
                 "buffer": base64.b64encode(raw_view.tobytes()).decode("ascii"),
                 "shape": list(detached.shape),
@@ -498,6 +514,121 @@ def _bfloat16_buffer_to_float32(raw: bytes, shape: Any) -> np.ndarray:
         raw_values = raw_values.reshape(shape)
     widened = raw_values.astype(np.uint32) << 16
     return np.array(widened.view(np.float32), copy=True)
+
+
+def _diagnostics_payload(
+    model: Any,
+    *,
+    phase: str,
+    prefill: bool,
+    shard: Shard,
+    input_ids: Any,
+    attention_mask: Any,
+    position_ids: Any,
+    hidden_state: Any,
+    output: Any,
+    token: int | None = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "phase": str(phase),
+        "prefill": bool(prefill),
+        "shard": _shard_payload(shard),
+        "input_ids": _tensor_meta(input_ids),
+        "attention_mask": _tensor_meta(attention_mask),
+        "position_ids": _tensor_meta(position_ids),
+        "hidden_state": _tensor_meta(hidden_state),
+        "output": _tensor_meta(output),
+        "kv_cache": _kv_cache_meta(model),
+    }
+    if token is not None:
+        payload["token"] = int(token)
+    return payload
+
+
+def _tensor_meta(value: Any) -> Dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        shape = value.get("shape")
+        dtype = value.get("dtype")
+        buf = value.get("buffer")
+        return {
+            "shape": list(shape) if isinstance(shape, list) else shape,
+            "dtype": str(dtype or ""),
+            "bytes": len(buf) if isinstance(buf, str) else 0,
+            "encoded": True,
+        }
+    try:
+        shape = tuple(getattr(value, "shape", ()) or ())
+    except Exception:
+        shape = ()
+    dtype = getattr(value, "dtype", None)
+    device = getattr(value, "device", None)
+    if shape:
+        return {
+            "shape": list(shape),
+            "dtype": str(dtype or ""),
+            "device": str(device or ""),
+        }
+    if isinstance(value, (list, tuple)):
+        return {
+            "shape": _nested_shape(value),
+            "dtype": type(value).__name__,
+        }
+    return {
+        "shape": [],
+        "dtype": type(value).__name__,
+    }
+
+
+def _nested_shape(value: Any) -> list[int]:
+    shape: list[int] = []
+    current = value
+    while isinstance(current, (list, tuple)):
+        shape.append(len(current))
+        if not current:
+            break
+        current = current[0]
+    return shape
+
+
+def _kv_cache_meta(model: Any) -> Dict[str, Any]:
+    layers = list(getattr(model, "layers", []) or [])
+    positions: list[int | None] = []
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        cache = getattr(attn, "kv_cache", None) if attn is not None else None
+        cache_pos = getattr(cache, "cache_pos", None) if cache is not None else None
+        try:
+            positions.append(int(cache_pos) if cache_pos is not None else None)
+        except (TypeError, ValueError):
+            positions.append(None)
+
+    populated = [pos for pos in positions if pos is not None]
+    return {
+        "layer_count": len(layers),
+        "cache_pos": positions,
+        "min_cache_pos": min(populated) if populated else None,
+        "max_cache_pos": max(populated) if populated else None,
+    }
+
+
+def _ensure_decode_cache_ready(model: Any, curr_pos: int) -> None:
+    if curr_pos <= 0:
+        return
+    meta = _kv_cache_meta(model)
+    if int(meta.get("layer_count", 0) or 0) <= 0:
+        return
+    positions = meta.get("cache_pos", [])
+    if not isinstance(positions, list) or not positions:
+        return
+    bad_positions = [pos for pos in positions if pos != curr_pos]
+    if bad_positions:
+        raise RuntimeError(
+            "Shard KV cache is not primed for decode: "
+            f"expected cache_pos={curr_pos}, actual={positions}. "
+            "The shard likely missed the prefill request or received a mismatched decode step."
+        )
 
 
 def _shard_payload(shard: Shard) -> Dict[str, Any]:
