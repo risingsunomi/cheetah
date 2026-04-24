@@ -65,10 +65,13 @@ class ModelEngine:
             )
         else:
             if hidden_state is not None:
-                print(f"hidden_state: {hidden_state}")
+                print(f"hidden_state len: {hidden_state.shape[1]}")
                 curr_pos = int(attention_mask.shape[1] - 1)
                 if position_ids is None:
                     position_ids = _position_ids_tensor(curr_pos, hidden_state)
+                print(f"curr_pos: {curr_pos}")
+                print(f"position_ids: {position_ids}")
+                print(f"hidden_state: {hidden_state}")
                 model_output = _run_model_shard(
                     model,
                     None,
