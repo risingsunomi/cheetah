@@ -65,17 +65,13 @@ class ModelEngine:
             )
         else:
             if hidden_state is not None:
-                print(f"hidden_state len: {hidden_state.shape[1]}")
+                print(f"hidden_state len: {len(hidden_state)}")
                 curr_pos = int(attention_mask.shape[1] - 1)
                 if position_ids is None:
-                    # position_ids = _position_ids_tensor(curr_pos, hidden_state)
-                    position_ids = _full_position_ids_tensor(
-                        attention_mask,
-                        like=input_ids if hidden_state is None else hidden_state,
-                    )
+                    position_ids = _position_ids_tensor(curr_pos, hidden_state)
                 print(f"curr_pos: {curr_pos}")
                 print(f"position_ids: {position_ids}")
-                print(f"hidden_state: {hidden_state}")
+                # print(f"hidden_state: {hidden_state}")
                 model_output = _run_model_shard(
                     model,
                     None,
@@ -426,9 +422,21 @@ def _full_position_ids_tensor(attention_mask: Any, *, like: Any) -> Any:
 
 
 def _position_ids_tensor(position: int, like: Any) -> Any:
+    batch = int(getattr(like, "shape", [1])[0]) if getattr(like, "shape", None) else 1
+
     if torch is not None and isinstance(like, torch.Tensor):
-        return torch.tensor([int(position)], device=like.device, dtype=torch.long)
-    return tg.Tensor([int(position)], device=getattr(like, "device", None), dtype=tg.dtypes.int32)
+        return torch.full(
+            (batch, 1),
+            int(position),
+            device=like.device,
+            dtype=torch.long,
+        )
+
+    return tg.Tensor(
+        [[int(position)] for _ in range(batch)],
+        device=getattr(like, "device", None),
+        dtype=tg.dtypes.int32,
+    )
 
 
 def _sequence_length(value: Any) -> int:
