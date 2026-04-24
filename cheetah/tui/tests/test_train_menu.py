@@ -32,7 +32,7 @@ from cheetah.tui.train_menu import (
     _stream_corpus_batches,
     default_training_settings,
 )
-from cheetah.tui.helpers import distributed_shard_plan_messages
+from cheetah.orchestration.distributed_inference import distributed_shard_plan_messages
 from cheetah.tui.training_path_screen import TrainingPathScreen
 from cheetah.tui.training_path_types import TrainingNode
 

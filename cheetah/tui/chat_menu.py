@@ -26,18 +26,21 @@ from cheetah.orchestration.peer_client import PeerClient
 from cheetah.tui.orchestration_screen import OrchestrationScreen
 from cheetah.tui.help_screen import HelpScreen
 from cheetah.tui.helpers import (
-    MemoryPressureError,
     apply_chat_template_with_thinking,
+    default_enable_thinking,
+    memory_abort_reason,
+    split_thinking_response,
+)
+from cheetah.orchestration.distributed_inference import (
+    MemoryPressureError,
     build_peer_load_plan,
     clear_model_shards_on_peers,
-    default_enable_thinking,
     distributed_shard_log_messages,
     format_shard_span,
     load_model_shards_on_peers,
-    validate_peer_runtime_fingerprints,
-    memory_abort_reason,
-    split_thinking_response,
+    streaming_generate_with_peers,
     total_layers_from_model_config,
+    validate_peer_runtime_fingerprints,
 )
 
 from textual.app import ComposeResult
@@ -1392,7 +1395,6 @@ class ChatScreen(Screen[None]):
         on_token: Optional[Callable[[int], None]] = None,
     ) -> tuple[list[int], float]:
         import tinygrad as tg
-        from cheetah.tui.helpers import streaming_generate_with_peers
 
         input_ids = tg.Tensor(enc["input_ids"])
         attention_mask = tg.Tensor(enc["attention_mask"])
@@ -1440,7 +1442,6 @@ class ChatScreen(Screen[None]):
         on_token: Optional[Callable[[int], None]] = None,
     ) -> tuple[list[int], float]:
         import torch
-        from cheetah.tui.helpers import streaming_generate_with_peers
 
         device = self._torch_runtime_device()
         input_ids = torch.tensor(enc["input_ids"], dtype=torch.long, device=device)

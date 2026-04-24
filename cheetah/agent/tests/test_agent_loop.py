@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cheetah.tui.agent_screen import AgentScreen
-from cheetah.tui.helpers import MemoryPressureError
+from cheetah.orchestration.distributed_inference import MemoryPressureError
 
 
 class TestAgentLoop(unittest.IsolatedAsyncioTestCase):

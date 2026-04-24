@@ -39,16 +39,18 @@ from cheetah.models.llm.backend import (
 from cheetah.orchestration.peer_client import PeerClient
 from cheetah.tui.help_screen import HelpScreen
 from cheetah.tui.helpers import (
-    MemoryPressureError,
     apply_chat_template_with_thinking,
+    default_enable_thinking,
+    memory_abort_reason,
+    relieve_memory_pressure,
+)
+from cheetah.orchestration.distributed_inference import (
+    MemoryPressureError,
     build_peer_load_plan,
     clear_model_shards_on_peers,
-    default_enable_thinking,
     distributed_shard_log_messages,
     format_shard_span,
-    memory_abort_reason,
     load_model_shards_on_peers,
-    relieve_memory_pressure,
     streaming_generate_with_peers,
     total_layers_from_model_config,
     validate_peer_runtime_fingerprints,

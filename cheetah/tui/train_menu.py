@@ -44,7 +44,8 @@ from cheetah.tui.help_screen import HelpScreen
 
 from cheetah.tui.training_path_types import TrainingNode, NODE_STATUS_STYLES, NODE_STATUS_SYMBOLS
 from cheetah.tui.training_path_screen import TrainingPathScreen
-from cheetah.tui.helpers import distributed_shard_plan_messages, memory_abort_reason, relieve_memory_pressure
+from cheetah.orchestration.distributed_inference import distributed_shard_plan_messages
+from cheetah.tui.helpers import memory_abort_reason, relieve_memory_pressure
 try:
     import psutil  # type: ignore
 except Exception:  # pragma: no cover - psutil is optional at runtime

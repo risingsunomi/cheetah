@@ -311,11 +311,8 @@ def _decode_tensor(tensor_payload: Any, backend: str | None = None) -> Any | Non
 
         if dtype == "bfloat16":
             if selected_backend == "torch" and torch is not None:
-                raw_values = np.frombuffer(raw, dtype=np.uint16)
-                if shape:
-                    raw_values = raw_values.reshape(shape)
-                raw_values = np.array(raw_values, copy=True)
-                tensor = torch.from_numpy(raw_values).view(torch.bfloat16)
+                arr = _bfloat16_buffer_to_float32(raw, shape)
+                tensor = torch.from_numpy(arr).to(dtype=torch.bfloat16)
                 target_device = _torch_target_device()
                 try:
                     tensor = tensor.to(device=target_device)
@@ -341,7 +338,8 @@ def _decode_tensor(tensor_payload: Any, backend: str | None = None) -> Any | Non
             except Exception:
                 pass
             return tensor
-        return tg.Tensor(arr)
+        target_device = get_backend_device("tinygrad", default="CPU")
+        return tg.Tensor(arr, device=target_device)
     except Exception:
         return None
 
@@ -444,8 +442,8 @@ def _torch_target_device() -> str:
 def _normalize_dtype(dtype: str) -> str:
     lower = dtype.lower()
     for candidate in (
-        "float16",
         "bfloat16",
+        "float16",
         "float32",
         "float64",
         "int64",

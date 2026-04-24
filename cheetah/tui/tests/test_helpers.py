@@ -10,6 +10,8 @@ from unittest.mock import patch
 import tinygrad as tg
 import numpy as np
 
+from cheetah.orchestration import distributed_inference
+from cheetah.models.shard import Shard
 from cheetah.tui import helpers
 
 
@@ -229,7 +231,7 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
         model = _StreamingDummyModel()
         tokenizer = _DummyTokenizer(chat_template="")
 
-        out, elapsed = helpers.streaming_generate(
+        out, elapsed = distributed_inference.streaming_generate(
             model,
             input_ids=tg.Tensor([[10, 11]]),
             attention_mask=tg.Tensor([[1, 1]]),
@@ -330,9 +332,9 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
         model = SimpleNamespace(config={"num_layers": 8}, shard=None)
         tokenizer = _DummyTokenizer(chat_template="")
 
-        with patch.object(helpers, "_local_engine", return_value=_FakeEngine()):
+        with patch.object(distributed_inference, "_local_engine", return_value=_FakeEngine()):
             with patch.dict(os.environ, {"TC_PEER_PREFILL_TIMEOUT_SECONDS": "45"}, clear=False):
-                out, _ = helpers.streaming_generate_with_peers(
+                out, _ = distributed_inference.streaming_generate_with_peers(
                     peer_client,
                     model,
                     input_ids=tg.Tensor([[10, 11]]),
@@ -460,8 +462,8 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
         model = SimpleNamespace(config={"num_layers": 8}, shard=None)
         tokenizer = _DummyTokenizer(chat_template="")
 
-        with patch.object(helpers, "_local_engine", return_value=fake_engine):
-            out, _ = helpers.streaming_generate_with_peers(
+        with patch.object(distributed_inference, "_local_engine", return_value=fake_engine):
+            out, _ = distributed_inference.streaming_generate_with_peers(
                 peer_client,
                 model,
                 input_ids=tg.Tensor([[10, 11]]),
@@ -481,6 +483,37 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
         self.assertEqual(second_payload["attention_mask"]["shape"], [1, 3])
         self.assertEqual(second_payload["position_ids"]["shape"], [1])
 
+    def test_streaming_generate_with_peers_uses_local_generation_for_full_local_shard(self) -> None:
+        class _PeerClientStub:
+            peer_client_id = "self"
+
+            def get_peers(self, include_self: bool = False):
+                self_peer = SimpleNamespace(peer_client_id="self", gpu_vram="8", cpu_ram="8", gpu_flops=0.0)
+                remote_peer = SimpleNamespace(peer_client_id="peer-1", gpu_vram="8", cpu_ram="8", gpu_flops=0.0)
+                return [self_peer, remote_peer] if include_self else [remote_peer]
+
+        model = SimpleNamespace(config={"num_layers": 8}, shard=Shard("demo", 0, 8, 9))
+        tokenizer = _DummyTokenizer(chat_template="")
+
+        with patch.object(distributed_inference, "streaming_generate", return_value=([5], 0.1)) as local_generate:
+            with patch.object(distributed_inference, "_local_engine") as local_engine:
+                out, elapsed = distributed_inference.streaming_generate_with_peers(
+                    _PeerClientStub(),
+                    model,
+                    input_ids=tg.Tensor([[10, 11]]),
+                    attention_mask=tg.Tensor([[1, 1]]),
+                    tokenizer=tokenizer,
+                    max_new_tokens=1,
+                    temp=0.0,
+                    top_k=0,
+                    top_p=1.0,
+                )
+
+        self.assertEqual(out, [5])
+        self.assertEqual(elapsed, 0.1)
+        local_generate.assert_called_once()
+        local_engine.assert_not_called()
+
 
 class TestDistributedShardLogging(unittest.TestCase):
     def test_distributed_shard_plan_messages_list_local_then_remote_peers(self) -> None:
@@ -490,7 +523,7 @@ class TestDistributedShardLogging(unittest.TestCase):
             SimpleNamespace(peer_client_id="peer-2", ip_address="192.168.0.30", gpu_vram="2", cpu_ram="4", gpu_flops=0.0),
         ]
 
-        lines = helpers.distributed_shard_plan_messages(
+        lines = distributed_inference.distributed_shard_plan_messages(
             peers,
             local_peer_id="self",
             model_name="demo",
@@ -522,7 +555,7 @@ class TestDistributedShardLogging(unittest.TestCase):
             get_peers=lambda include_self=True: [self_peer, remote_peer] if include_self else [remote_peer],
         )
 
-        plan = helpers.build_peer_load_plan(
+        plan = distributed_inference.build_peer_load_plan(
             peer_client,
             model_name="demo",
             total_layers=9,
@@ -544,7 +577,7 @@ class TestDistributedShardLogging(unittest.TestCase):
             SimpleNamespace(peer_client_id="peer-3", ip_address="192.168.0.40"),
         ]
 
-        planned = helpers.planned_peer_shards(
+        planned = distributed_inference.planned_peer_shards(
             peers,
             model_name="demo",
             total_layers=3,
@@ -560,14 +593,14 @@ class TestDistributedShardLogging(unittest.TestCase):
         remote_peer = SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20")
 
         with patch.object(
-            helpers,
+            distributed_inference,
             "local_runtime_fingerprints",
             return_value={
                 "config_fingerprint": "local-config",
                 "tokenizer_fingerprint": "local-tokenizer",
             },
         ):
-            mismatches = helpers.validate_peer_runtime_fingerprints(
+            mismatches = distributed_inference.validate_peer_runtime_fingerprints(
                 [
                     {
                         "peer": remote_peer,
@@ -589,14 +622,14 @@ class TestDistributedShardLogging(unittest.TestCase):
         remote_peer = SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20")
 
         with patch.object(
-            helpers,
+            distributed_inference,
             "local_runtime_fingerprints",
             return_value={
                 "config_fingerprint": "local-config",
                 "tokenizer_fingerprint": "local-tokenizer",
             },
         ):
-            mismatches = helpers.validate_peer_runtime_fingerprints(
+            mismatches = distributed_inference.validate_peer_runtime_fingerprints(
                 [
                     {
                         "peer": remote_peer,
