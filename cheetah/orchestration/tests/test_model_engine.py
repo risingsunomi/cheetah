@@ -148,7 +148,7 @@ class TestModelEngine(unittest.TestCase):
         call = model.calls[0]
         assert isinstance(call["position_ids"], torch.Tensor)
         assert isinstance(call["attention_mask"], torch.Tensor)
-        self.assertTrue(torch.equal(call["position_ids"].cpu(), torch.tensor([2], dtype=torch.long)))
+        self.assertTrue(torch.equal(call["position_ids"].cpu(), torch.tensor([[2]], dtype=torch.long)))
         self.assertEqual(tuple(call["attention_mask"].shape), (1, 3))
         self.assertEqual(call["start_pos"], 2)
 

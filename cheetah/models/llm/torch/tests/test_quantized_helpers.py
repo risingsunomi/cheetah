@@ -12,6 +12,7 @@ except ModuleNotFoundError:
     torch = None
 
 if torch is not None:
+    from cheetah.models.shard import Shard
     from cheetah.models.llm.torch.quantize import (
         _dequantize_bnb_nf4,
         _dequantize_bnb_nf4_simple,
@@ -33,6 +34,13 @@ if torch is not None:
         def __init__(self):
             super().__init__()
             self.q_proj = torch.nn.Linear(4, 8, bias=False)
+
+
+    class _DummyShardedLayerModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shard = Shard("demo", start_layer=1, end_layer=2, total_layers=3)
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
 
 
 def _pack_nibbles(nibble_values: np.ndarray) -> np.ndarray:
@@ -334,6 +342,42 @@ class TestQuantizedLoader(unittest.TestCase):
 
             expected = torch.from_numpy(raw_weight).to(dtype=model.q_proj.weight.dtype)
             torch.testing.assert_close(model.q_proj.weight.detach().cpu(), expected)
+
+    def test_load_quantized_safetensors_maps_shard_local_layer_index_to_global_weight_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            weight_file = "model.safetensors"
+            global_zero = np.zeros((2, 2), dtype=np.float32)
+            global_one = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+
+            save_file(
+                {
+                    "model.layers.0.weight": global_zero,
+                    "model.layers.1.weight": global_one,
+                },
+                str(model_dir / weight_file),
+            )
+            _write_model_index(
+                model_dir,
+                {
+                    "model.layers.0.weight": weight_file,
+                    "model.layers.1.weight": weight_file,
+                },
+            )
+
+            model = _DummyShardedLayerModel()
+            load_quantized_safetensors(
+                model,
+                model_dir,
+                model_config={},
+                weight_device="cpu",
+                use_tied=False,
+            )
+
+            torch.testing.assert_close(
+                model.layers[0].weight.detach().cpu(),
+                torch.from_numpy(global_one).to(dtype=model.layers[0].weight.dtype),
+            )
 
 
 if __name__ == "__main__":

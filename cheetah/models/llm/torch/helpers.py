@@ -96,10 +96,10 @@ def _global_layer_key(key: str, shard: Shard | None) -> str:
     return ".".join(parts)
 
 def _resolve_weight_key(key: str, weight_map: dict[str, str], prefix: str, shard: Shard | None = None) -> str | None:
-    candidates = [key]
     global_key = _global_layer_key(key, shard)
-    if global_key != key:
-        candidates.append(global_key)
+    candidates = [global_key]
+    if key not in candidates:
+        candidates.append(key)
 
     for candidate in candidates:
         if candidate in weight_map:

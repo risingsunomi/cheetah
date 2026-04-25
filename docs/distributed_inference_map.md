@@ -77,6 +77,7 @@ final remote applies norm + lm_head because end=16 == total-1
 ## Important Invariants
 
 - Generation should use the shard assignments loaded into memory, not silently re-plan around newly discovered peers.
+- Sharded model loading must map local layer keys to global checkpoint keys. For example, shard `12:24` local `layers.0.*` must load checkpoint `model.layers.12.*`.
 - Prefill resets KV cache on each shard.
 - Decode does not reset KV cache.
 - Attention mask is one token behind before the local shard processes the previous sampled token; the local shard appends it for decode.
@@ -84,6 +85,8 @@ final remote applies norm + lm_head because end=16 == total-1
 - `seen_tokens` is carried with the request so repetition penalties are applied at the final shard.
 
 ## No-TUI Probe
+
+`distributed_probe` loads `.env` like `main.py`, so `TC_LLM_BACKEND`, `TC_TORCH_DEVICE`, and `TC_TRACE_TENSOR_TRANSFERS` apply unless overridden by flags.
 
 Start a peer node:
 
@@ -133,6 +136,22 @@ python -m cheetah.orchestration.distributed_probe generate \
 ```
 
 With `--trace-tensors`, the driver prints each local shard step and each peer request/response. During `phase=prefill`, the remote peer should report `kv_cache min=<prompt_length> max=<prompt_length>`. During each decode step, that value should advance by one. If decode starts with the wrong cache position, distributed inference now raises a `Shard KV cache is not primed for decode` error instead of continuing into gibberish.
+
+Compare the shard path without networking:
+
+```bash
+python -m cheetah.orchestration.distributed_probe compare-local \
+  --backend torch \
+  --device cpu \
+  --model Qwen/Qwen2.5-0.5B \
+  --prompt "Say hello in five words." \
+  --max-new-tokens 8 \
+  --temperature 0 \
+  --offline \
+  --parts 2
+```
+
+`compare-local` first generates with the full model, then reloads the same model as local shards and runs the same hidden-state handoff in one process. If this fails, the bug is in shard loading or shard execution. If it passes but distributed generation fails, inspect peer runtime, tensor transport, stale serve processes, or cache traces.
 
 ## Files To Read
 

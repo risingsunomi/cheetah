@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import os
 import signal
 import sys
@@ -9,6 +10,10 @@ import time
 from typing import Any
 
 import numpy as np
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency
+    load_dotenv = None  # type: ignore[assignment]
 
 from cheetah.models.llm.backend import (
     get_backend_device,
@@ -23,14 +28,19 @@ from cheetah.orchestration.distributed_inference import (
     distributed_shard_log_messages,
     format_shard_span,
     load_model_shards_on_peers,
+    streaming_generate,
     streaming_generate_with_peers,
     total_layers_from_model_config,
     validate_peer_runtime_fingerprints,
 )
+from cheetah.orchestration.model_engine import ModelEngine
 from cheetah.orchestration.peer_client import PeerClient
 
 
 def main(argv: list[str] | None = None) -> int:
+    if load_dotenv is not None:
+        load_dotenv()
+
     parser = _build_parser()
     args = parser.parse_args(argv)
     _configure_runtime(args)
@@ -39,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.command == "generate":
         return _generate(args)
+    if args.command == "compare-local":
+        return _compare_local(args)
 
     parser.error("missing command")
     return 2
@@ -81,6 +93,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_env_flag("TC_TRACE_TENSOR_TRANSFERS"),
         help="print distributed tensor transfer shapes, sizes, and remote KV cache positions",
     )
+
+    compare = subparsers.add_parser(
+        "compare-local",
+        help="compare full-model generation against a local split-shard pipeline",
+    )
+    _add_runtime_args(compare, default_port=8766)
+    compare.add_argument("--model", required=True, help="Hugging Face model id or local model path")
+    compare.add_argument("--prompt", required=True, help="prompt or user message to generate from")
+    compare.add_argument("--system", default="", help="optional system message when using the chat template")
+    compare.add_argument("--no-chat-template", action="store_true", help="tokenize --prompt literally")
+    compare.add_argument("--offline", action="store_true", help="only use locally cached model files")
+    compare.add_argument("--parts", type=int, default=2, help="number of local shards to simulate")
+    compare.add_argument("--max-new-tokens", type=int, default=8)
+    compare.add_argument("--temperature", type=float, default=0.0)
+    compare.add_argument("--top-k", type=int, default=0)
+    compare.add_argument("--top-p", type=float, default=1.0)
+    compare.add_argument("--repetition-penalty", type=float, default=1.0)
     return parser
 
 
@@ -261,6 +290,212 @@ def _generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _compare_local(args: argparse.Namespace) -> int:
+    full_model, loaded_config, tokenizer, _ = asyncio.run(
+        load_model_for_backend(
+            model_id=args.model,
+            shard=None,
+            weight_device=None,
+            offline_mode=bool(args.offline),
+            backend=args.backend,
+        )
+    )
+    total_layers = total_layers_from_model_config(loaded_config)
+    if total_layers <= 1:
+        raise RuntimeError(f"model config does not expose transformer layers: total_layers={total_layers}")
+
+    input_ids, attention_mask = _tokenize_prompt(
+        tokenizer,
+        backend=args.backend,
+        prompt=args.prompt,
+        system=args.system,
+        use_chat_template=not bool(args.no_chat_template),
+    )
+
+    print(
+        f"full model ready: backend={args.backend} device={get_backend_device(args.backend)} "
+        f"layers={total_layers - 1}",
+        flush=True,
+    )
+    full_tokens, full_elapsed = streaming_generate(
+        full_model,
+        input_ids,
+        attention_mask,
+        tokenizer,
+        max_new_tokens=int(args.max_new_tokens),
+        temp=float(args.temperature),
+        top_k=int(args.top_k),
+        top_p=float(args.top_p),
+        repetition_penalty=float(args.repetition_penalty),
+    )
+    print(f"full tokens:  {full_tokens}", flush=True)
+    print(f"full text:    {tokenizer.decode(full_tokens, skip_special_tokens=False)!r}", flush=True)
+    print(f"full elapsed: {full_elapsed:.3f}s", flush=True)
+
+    del full_model
+    gc.collect()
+
+    shards = _build_local_compare_shards(
+        model_name=args.model,
+        total_layers=total_layers,
+        parts=int(args.parts),
+    )
+    split_models: list[Any] = []
+    for shard in shards:
+        model, _, _, _ = asyncio.run(
+            load_model_for_backend(
+                model_id=args.model,
+                shard=shard,
+                weight_device=None,
+                offline_mode=bool(args.offline),
+                backend=args.backend,
+            )
+        )
+        split_models.append(model)
+        print(f"split ready:  {format_shard_span(shard)}", flush=True)
+
+    split_input_ids, split_attention_mask = _tokenize_prompt(
+        tokenizer,
+        backend=args.backend,
+        prompt=args.prompt,
+        system=args.system,
+        use_chat_template=not bool(args.no_chat_template),
+    )
+    split_tokens, split_elapsed = _generate_local_split(
+        split_models,
+        split_input_ids,
+        split_attention_mask,
+        tokenizer,
+        max_new_tokens=int(args.max_new_tokens),
+        temp=float(args.temperature),
+        top_k=int(args.top_k),
+        top_p=float(args.top_p),
+        repetition_penalty=float(args.repetition_penalty),
+        backend=args.backend,
+    )
+    print(f"split tokens: {split_tokens}", flush=True)
+    print(f"split text:   {tokenizer.decode(split_tokens, skip_special_tokens=False)!r}", flush=True)
+    print(f"split elapsed: {split_elapsed:.3f}s", flush=True)
+
+    if full_tokens == split_tokens:
+        print("compare-local: PASS full and split token streams match", flush=True)
+        return 0
+
+    diff_at = next(
+        (idx for idx, pair in enumerate(zip(full_tokens, split_tokens)) if pair[0] != pair[1]),
+        min(len(full_tokens), len(split_tokens)),
+    )
+    full_at = full_tokens[diff_at] if diff_at < len(full_tokens) else None
+    split_at = split_tokens[diff_at] if diff_at < len(split_tokens) else None
+    print(
+        "compare-local: FAIL token streams diverged "
+        f"at generated index {diff_at}: full={full_at} split={split_at}",
+        flush=True,
+    )
+    return 1
+
+
+def _build_local_compare_shards(*, model_name: str, total_layers: int, parts: int) -> list[Shard]:
+    transformer_layers = max(int(total_layers) - 1, 0)
+    if transformer_layers <= 0:
+        return []
+    part_count = max(1, min(int(parts or 1), transformer_layers))
+    base_span, remainder = divmod(transformer_layers, part_count)
+    shards: list[Shard] = []
+    start = 0
+    for index in range(part_count):
+        span = base_span + (1 if index < remainder else 0)
+        end = min(start + span, transformer_layers)
+        shards.append(Shard(model_name, start, end, int(total_layers)))
+        start = end
+    return shards
+
+
+def _generate_local_split(
+    models: list[Any],
+    input_ids: Any,
+    attention_mask: Any,
+    tokenizer: Any,
+    *,
+    max_new_tokens: int,
+    temp: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+    backend: str,
+) -> tuple[list[int], float]:
+    if not models:
+        return [], 0.0
+
+    engines = [ModelEngine(shard=getattr(model, "shard", None)) for model in models]
+    input_list = _tensor_to_nested_list(input_ids)
+    mask_list = _tensor_to_nested_list(attention_mask)
+    seen_tokens = [int(v) for row in input_list for v in row]
+    out_tokens: list[int] = []
+
+    start_time = time.time()
+    for step in range(max_new_tokens):
+        prefill = step == 0
+        msg: dict[str, Any] | None = None
+        step_input_ids = _nested_list_to_tensor(input_list, like=input_ids, integer=True, backend=backend)
+        step_attention_mask = _nested_list_to_tensor(mask_list, like=attention_mask, integer=True, backend=backend)
+
+        for index, (engine, model) in enumerate(zip(engines, models)):
+            if index == 0:
+                msg = engine.get_tokens(
+                    model,
+                    step_input_ids,
+                    step_attention_mask,
+                    tokenizer,
+                    prefill=prefill,
+                    temp=temp,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    seen_tokens=seen_tokens,
+                )
+                continue
+
+            assert msg is not None
+            decoded = engine.recv_tokens(msg, tokenizer, backend=backend)
+            hidden_state = decoded.get("hidden_state")
+            next_attention_mask = decoded.get("attention_mask", step_attention_mask)
+            position_ids = decoded.get("position_ids")
+            msg = engine.get_tokens(
+                model,
+                step_input_ids,
+                next_attention_mask,
+                tokenizer,
+                hidden_state=hidden_state,
+                position_ids=position_ids,
+                prefill=prefill,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                seen_tokens=seen_tokens,
+            )
+
+        assert msg is not None
+        final_msg = engines[-1].recv_tokens(msg, tokenizer, backend=backend)
+        attention_mask_out = final_msg.get("attention_mask")
+        if attention_mask_out is not None:
+            mask_list = _tensor_to_nested_list(attention_mask_out)
+
+        token = final_msg.get("token")
+        if token is None:
+            raise RuntimeError(f"local split final shard did not return a token at step {step}")
+
+        tok = int(token)
+        out_tokens.append(tok)
+        seen_tokens.append(tok)
+        input_list[0].append(tok)
+        if final_msg.get("end_token", False):
+            break
+
+    return out_tokens, time.time() - start_time
+
+
 def _tokenize_prompt(
     tokenizer: Any,
     *,
@@ -297,6 +532,63 @@ def _tokenize_prompt(
         tg.Tensor(ids.astype(np.int32), device=device),
         tg.Tensor(mask.astype(np.int32), device=device),
     )
+
+
+def _tensor_to_nested_list(tensor: Any) -> list[list[Any]]:
+    if tensor is None:
+        return [[]]
+    if isinstance(tensor, list):
+        if not tensor:
+            return [[]]
+        if isinstance(tensor[0], list):
+            return tensor
+        return [tensor]
+    try:
+        import torch
+
+        if isinstance(tensor, torch.Tensor):
+            data = tensor.detach().cpu().tolist()
+        elif hasattr(tensor, "numpy"):
+            data = tensor.numpy().tolist()
+        elif hasattr(tensor, "tolist"):
+            data = tensor.tolist()
+        else:
+            data = []
+    except Exception:
+        if hasattr(tensor, "numpy"):
+            data = tensor.numpy().tolist()
+        elif hasattr(tensor, "tolist"):
+            data = tensor.tolist()
+        else:
+            data = []
+    if not data:
+        return [[]]
+    if isinstance(data[0], list):
+        return data
+    return [data]
+
+
+def _nested_list_to_tensor(
+    data: list[list[Any]],
+    *,
+    like: Any,
+    integer: bool,
+    backend: str,
+) -> Any:
+    if backend == "torch":
+        import torch
+
+        device = _torch_device_name()
+        dtype = torch.long if integer else getattr(like, "dtype", torch.float32)
+        return torch.tensor(data, dtype=dtype, device=device)
+
+    import tinygrad as tg
+
+    device = get_backend_device("tinygrad", default="CPU")
+    tensor = tg.Tensor(data, device=device)
+    if integer:
+        tensor = tensor.cast(tg.dtypes.int32)
+    return tensor
 
 
 def _torch_device_name() -> str:
@@ -364,6 +656,16 @@ def _format_tensor_summary(value: Any) -> str:
         extra.append(str(device))
     if bytes_count:
         extra.append(f"{bytes_count}B64")
+    if value.get("numel") is not None:
+        extra.append(f"n={value.get('numel')}")
+    if value.get("nan"):
+        extra.append(f"nan={value.get('nan')}")
+    if value.get("inf"):
+        extra.append(f"inf={value.get('inf')}")
+    for stat_name in ("min", "max", "mean"):
+        stat_value = value.get(stat_name)
+        if isinstance(stat_value, (int, float)):
+            extra.append(f"{stat_name}={float(stat_value):.4g}")
     suffix = f" ({', '.join(extra)})" if extra else ""
     return f" shape={shape}{suffix}"
 

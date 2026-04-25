@@ -15,6 +15,7 @@ import safetensors
 import tinygrad as tg
 
 from cheetah.logging_utils import get_logger
+from cheetah.models.shard import Shard
 
 logger = get_logger(__name__)
 
@@ -56,6 +57,56 @@ def _load_weight_map(model_path: Path) -> dict[str, str]:
         for key in weight_data.keys():
             weight_map[key] = model_files[0].name
     return weight_map
+
+
+def _infer_prefix(weight_map: Mapping[str, str]) -> str:
+    for candidate in ("model", "base_model", "transformer", "gpt_neox", "blk", "backbone"):
+        prefix = f"{candidate}."
+        if any(key.startswith(prefix) for key in weight_map):
+            return prefix
+    return ""
+
+
+def _global_layer_key(key: str, shard: Shard | None) -> str:
+    if shard is None:
+        return key
+    try:
+        start_layer = int(getattr(shard, "start_layer", 0) or 0)
+    except (TypeError, ValueError):
+        start_layer = 0
+    if start_layer <= 0:
+        return key
+
+    parts = key.split(".")
+    if len(parts) < 2 or parts[0] != "layers":
+        return key
+    try:
+        local_index = int(parts[1])
+    except (TypeError, ValueError):
+        return key
+    parts[1] = str(local_index + start_layer)
+    return ".".join(parts)
+
+
+def _resolve_weight_key(
+    key: str,
+    weight_map: Mapping[str, str],
+    prefix: str,
+    shard: Shard | None = None,
+) -> str | None:
+    global_key = _global_layer_key(key, shard)
+    candidates = [global_key]
+    if key not in candidates:
+        candidates.append(key)
+
+    for candidate in candidates:
+        if candidate in weight_map:
+            return candidate
+        prefixed = f"{prefix}{candidate}" if prefix else candidate
+        if prefixed in weight_map:
+            return prefixed
+    return None
+
 
 def _load_quant_state(raw_state: np.ndarray) -> dict[str, Any]:
     payload = raw_state.reshape(-1).astype(np.uint8, copy=False).tobytes()
@@ -228,16 +279,11 @@ def load_quantized_safetensors(
 ) -> None:
     weight_map = _load_weight_map(model_path)
     model_state_dict = tg.nn.state.get_state_dict(model)
-
-    first_weight_key = next(iter(weight_map.keys()))
-    prefix_check = first_weight_key.split(".")[0]
-    if prefix_check in {"model", "base_model", "transformer", "gpt_neox", "blk"}:
-        prefix = prefix_check + "."
-    else:
-        prefix = ""
+    prefix = _infer_prefix(weight_map)
+    shard = getattr(model, "shard", None)
 
     for key in model_state_dict.keys():
-        model_weight_key = prefix + key
+        model_weight_key = _resolve_weight_key(key, weight_map, prefix, shard)
         if model_weight_key not in weight_map:
             if use_tied and key == "output.weight":
                 embed_weight_key = "model.embed_tokens.weight"

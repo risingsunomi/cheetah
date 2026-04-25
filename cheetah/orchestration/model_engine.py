@@ -565,20 +565,91 @@ def _tensor_meta(value: Any) -> Dict[str, Any] | None:
     dtype = getattr(value, "dtype", None)
     device = getattr(value, "device", None)
     if shape:
-        return {
+        meta = {
             "shape": list(shape),
             "dtype": str(dtype or ""),
             "device": str(device or ""),
         }
+        meta.update(_tensor_numeric_stats(value))
+        return meta
     if isinstance(value, (list, tuple)):
-        return {
+        meta = {
             "shape": _nested_shape(value),
             "dtype": type(value).__name__,
         }
+        meta.update(_tensor_numeric_stats(value))
+        return meta
     return {
         "shape": [],
         "dtype": type(value).__name__,
     }
+
+
+def _tensor_numeric_stats(value: Any) -> Dict[str, Any]:
+    try:
+        if torch is not None and isinstance(value, torch.Tensor):
+            detached = value.detach()
+            numel = int(detached.numel())
+            if numel == 0:
+                return {"numel": 0}
+            if detached.is_complex():
+                return {"numel": numel}
+            data = detached.to(device="cpu", dtype=torch.float32)
+            finite = torch.isfinite(data)
+            finite_count = int(finite.sum().item())
+            stats: Dict[str, Any] = {
+                "numel": numel,
+                "finite": finite_count,
+                "nan": int(torch.isnan(data).sum().item()),
+                "inf": int(torch.isinf(data).sum().item()),
+            }
+            if finite_count > 0:
+                finite_values = data[finite]
+                stats.update(
+                    {
+                        "min": float(finite_values.min().item()),
+                        "max": float(finite_values.max().item()),
+                        "mean": float(finite_values.mean().item()),
+                    }
+                )
+            return stats
+
+        if isinstance(value, tg.Tensor):
+            arr = value.numpy()
+        elif hasattr(value, "numpy"):
+            arr = value.numpy()
+        elif isinstance(value, (list, tuple)):
+            arr = np.asarray(value)
+        else:
+            return {}
+
+        arr = np.asarray(arr)
+        numel = int(arr.size)
+        if numel == 0 or not np.issubdtype(arr.dtype, np.number):
+            return {"numel": numel}
+        if np.iscomplexobj(arr):
+            return {"numel": numel}
+        data = arr.astype(np.float32, copy=False)
+        finite = np.isfinite(data)
+        finite_count = int(finite.sum())
+        stats = {
+            "numel": numel,
+            "finite": finite_count,
+            "nan": int(np.isnan(data).sum()),
+            "inf": int(np.isinf(data).sum()),
+        }
+        if finite_count > 0:
+            finite_values = data[finite]
+            stats.update(
+                {
+                    "min": float(finite_values.min()),
+                    "max": float(finite_values.max()),
+                    "mean": float(finite_values.mean()),
+                }
+            )
+        return stats
+    except Exception:
+        return {}
 
 
 def _nested_shape(value: Any) -> list[int]:
