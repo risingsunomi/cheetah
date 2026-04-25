@@ -80,6 +80,14 @@ class TestChatScreenGenerationLimits(unittest.TestCase):
             self.assertEqual(screen._context_window_tokens(), 1024)
             self.assertEqual(screen._response_reserve_tokens(512), 96)
 
+    def test_max_response_env_overrides_model_generation_limit(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._model_config = {"max_new_tokens": 2048, "max_seq_len": 2048}
+
+        with patch.dict("os.environ", {"TC_MAX_RESP_LEN": "192"}):
+            self.assertEqual(screen._effective_gen_config()["max_new_tokens"], 192)
+            self.assertEqual(screen._response_reserve_tokens(2048), 192)
+
     def test_response_reserve_tokens_prefers_chat_gen_override(self) -> None:
         screen = ChatScreen(peer_client=object())
         screen._model_config = {"max_new_tokens": 192, "max_seq_len": 2048}

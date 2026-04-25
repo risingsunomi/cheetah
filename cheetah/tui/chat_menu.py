@@ -349,10 +349,13 @@ class ChatScreen(Screen[None]):
 
     def _default_max_new_tokens(self) -> int:
         config = self._model_config if isinstance(self._model_config, dict) else {}
+        env_limit = os.getenv("TC_MAX_RESP_LEN")
+        if env_limit is not None and env_limit.strip():
+            return max(1, _env_int("TC_MAX_RESP_LEN", MAX_RESP_LEN))
         try:
-            reserve_int = int(config.get("max_new_tokens", _env_int("TC_MAX_RESP_LEN", MAX_RESP_LEN)))
+            reserve_int = int(config.get("max_new_tokens", MAX_RESP_LEN))
         except (TypeError, ValueError):
-            reserve_int = _env_int("TC_MAX_RESP_LEN", MAX_RESP_LEN)
+            reserve_int = MAX_RESP_LEN
         return max(1, reserve_int)
 
     def _response_reserve_tokens(self, context_window: int) -> int:
