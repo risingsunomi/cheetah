@@ -54,6 +54,32 @@ class TestChatScreenGenerationLimits(unittest.TestCase):
 
         self.assertEqual(screen._effective_gen_config()["max_new_tokens"], 320)
 
+    def test_effective_gen_config_uses_env_sampler_defaults(self) -> None:
+        screen = ChatScreen(peer_client=object())
+
+        with patch.dict(
+            "os.environ",
+            {
+                "TC_TEMP": "0",
+                "TC_TOP_K": "0",
+                "TC_TOP_P": "1",
+                "TC_REPETITION_PENALTY": "1.05",
+            },
+        ):
+            effective = screen._effective_gen_config()
+
+        self.assertEqual(effective["temperature"], 0.0)
+        self.assertEqual(effective["top_k"], 0)
+        self.assertEqual(effective["top_p"], 1.0)
+        self.assertEqual(effective["repetition_penalty"], 1.05)
+
+    def test_generation_limits_use_env_defaults(self) -> None:
+        screen = ChatScreen(peer_client=object())
+
+        with patch.dict("os.environ", {"TC_MAX_SEQ_LEN": "1024", "TC_MAX_RESP_LEN": "96"}):
+            self.assertEqual(screen._context_window_tokens(), 1024)
+            self.assertEqual(screen._response_reserve_tokens(512), 96)
+
     def test_response_reserve_tokens_prefers_chat_gen_override(self) -> None:
         screen = ChatScreen(peer_client=object())
         screen._model_config = {"max_new_tokens": 192, "max_seq_len": 2048}

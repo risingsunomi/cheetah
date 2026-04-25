@@ -71,6 +71,26 @@ MAX_RESTORED_MESSAGES = 20
 MAX_SEQ_LEN = 2048
 MAX_RESP_LEN = 400
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
 class ChatModelSelected(Message):
     def __init__(self, sender: MessagePump, model_id: str) -> None:
         super().__init__(sender)
@@ -262,7 +282,7 @@ class ChatScreen(Screen[None]):
             persist=False,
         )
 
-    def _effective_gen_config(self) -> dict[str, float | int]:
+    def _effective_gen_config(self) -> dict[str, float | int | bool]:
         config = self._model_config if isinstance(self._model_config, dict) else {}
 
         def _as_float(value: Any, default: float) -> float:
@@ -292,12 +312,21 @@ class ChatScreen(Screen[None]):
 
         return {
             "max_new_tokens": _as_int(self._gen_overrides.get("max_new_tokens"), self._default_max_new_tokens()),
-            "temperature": _as_float(self._gen_overrides.get("temperature", config.get("temperature")), 1.0),
-            "top_k": _as_int(self._gen_overrides.get("top_k", config.get("top_k")), 0),
-            "top_p": _as_float(self._gen_overrides.get("top_p", config.get("top_p")), 0.8),
+            "temperature": _as_float(
+                self._gen_overrides.get("temperature", config.get("temperature")),
+                _env_float("TC_TEMP", 1.0),
+            ),
+            "top_k": _as_int(
+                self._gen_overrides.get("top_k", config.get("top_k")),
+                _env_int("TC_TOP_K", 35),
+            ),
+            "top_p": _as_float(
+                self._gen_overrides.get("top_p", config.get("top_p")),
+                _env_float("TC_TOP_P", 0.95),
+            ),
             "repetition_penalty": _as_float(
                 self._gen_overrides.get("repetition_penalty", config.get("repetition_penalty")),
-                1.0,
+                _env_float("TC_REPETITION_PENALTY", 1.0),
             ),
             "alpha_f": _as_float(self._gen_overrides.get("alpha_f", 0.0), 0.0),
             "alpha_p": _as_float(self._gen_overrides.get("alpha_p", 0.0), 0.0),
@@ -306,7 +335,7 @@ class ChatScreen(Screen[None]):
 
     def _context_window_tokens(self) -> int:
         config = self._model_config if isinstance(self._model_config, dict) else {}
-        configured = config.get("max_seq_len", MAX_SEQ_LEN)
+        configured = config.get("max_seq_len", _env_int("TC_MAX_SEQ_LEN", MAX_SEQ_LEN))
         
         try:
             context_window = int(configured)
@@ -321,9 +350,9 @@ class ChatScreen(Screen[None]):
     def _default_max_new_tokens(self) -> int:
         config = self._model_config if isinstance(self._model_config, dict) else {}
         try:
-            reserve_int = int(config.get("max_new_tokens", MAX_RESP_LEN))
+            reserve_int = int(config.get("max_new_tokens", _env_int("TC_MAX_RESP_LEN", MAX_RESP_LEN)))
         except (TypeError, ValueError):
-            reserve_int = MAX_RESP_LEN
+            reserve_int = _env_int("TC_MAX_RESP_LEN", MAX_RESP_LEN)
         return max(1, reserve_int)
 
     def _response_reserve_tokens(self, context_window: int) -> int:
@@ -1397,8 +1426,9 @@ class ChatScreen(Screen[None]):
     ) -> tuple[list[int], float]:
         import tinygrad as tg
 
-        input_ids = tg.Tensor(enc["input_ids"])
-        attention_mask = tg.Tensor(enc["attention_mask"])
+        device = get_backend_device("tinygrad", default="CPU")
+        input_ids = tg.Tensor(enc["input_ids"], device=device)
+        attention_mask = tg.Tensor(enc["attention_mask"], device=device)
 
         if hasattr(self._model, "reset_kv_cache"):
             self._model.reset_kv_cache()

@@ -88,6 +88,8 @@ final remote applies norm + lm_head because end=16 == total-1
 
 `distributed_probe` loads `.env` like `main.py`, so `TC_LLM_BACKEND`, `TC_TORCH_DEVICE`, and `TC_TRACE_TENSOR_TRANSFERS` apply unless overridden by flags.
 
+Probe generation defaults are deterministic: `temperature=0`, `top_k=0`, and `top_p=1`. The TUI uses the model/env generation config and includes the active system prompt plus chat history. To compare TUI behavior against a passing probe, use a fresh chat log and set the TUI Gen Config to the same sampler values.
+
 Start a peer node:
 
 ```bash
