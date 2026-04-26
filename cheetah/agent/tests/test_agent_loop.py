@@ -84,7 +84,8 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(
                 any(
-                    message["role"] == "assistant" and "ability=write_file" in message["content"]
+                    message["role"] == "assistant"
+                    and json.loads(message["content"])["ability"]["name"] == "write_file"
                     for message in screen._agent_messages
                 )
             )

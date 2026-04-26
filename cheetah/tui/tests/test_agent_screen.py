@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,8 +30,9 @@ class TestAgentScreen(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(screen._functions_summary)
             self.assertEqual(
                 set(screen._gen_inputs),
-                {"temperature", "top_k", "top_p", "repetition_penalty", "alpha_f", "alpha_p"},
+                {"temperature", "top_k", "top_p", "repetition_penalty", "alpha_f", "alpha_p", "max_steps"},
             )
+            self.assertIsNotNone(screen.query_one("#agent-gen-max_steps", Input))
             self.assertIsNotNone(screen.query_one("#agent-gen-enable-thinking", Checkbox))
             self.assertIsNotNone(screen.query_one("#agent-gen-endless-mode", Checkbox))
             self.assertIsNotNone(screen.query_one("#agent-instructions", TextArea))
@@ -193,7 +195,7 @@ class TestAgentScreenPrompt(unittest.TestCase):
             ("write_file", {"path": "notes.txt", "content": "hello"}),
         )
 
-    def test_compact_agent_reply_for_memory_drops_verbose_thoughts(self) -> None:
+    def test_compact_agent_reply_for_memory_keeps_json_shape(self) -> None:
         screen = AgentScreen(peer_client=object())
 
         compact = screen._compact_agent_reply_for_memory(
@@ -218,9 +220,30 @@ class TestAgentScreenPrompt(unittest.TestCase):
         self.assertIsNotNone(compact)
         assert compact is not None
         self.assertEqual(compact["role"], "assistant")
-        self.assertIn("ability=write_file", compact["content"])
-        self.assertIn("speak=Writing the file now", compact["content"])
+        content = json.loads(compact["content"])
+        self.assertEqual(content["ability"]["name"], "write_file")
+        self.assertEqual(content["ability"]["args"]["path"], "notes.txt")
+        self.assertEqual(content["thoughts"]["speak"], "Writing the file now")
         self.assertNotIn("reasoning", compact["content"])
+
+    def test_extract_function_call_reads_legacy_compact_agent_line(self) -> None:
+        screen = AgentScreen(peer_client=object())
+
+        result = screen._extract_function_call(
+            'ability=web_search | args={"query":"US gas prices"} | speak=Searching reliable sources.'
+        )
+
+        self.assertEqual(result, ("web_search", {"query": "US gas prices"}))
+
+    def test_agent_max_steps_reads_env_and_input(self) -> None:
+        with patch.dict("os.environ", {"TC_AGENT_MAX_STEPS": "4"}):
+            screen = AgentScreen(peer_client=object())
+
+        self.assertEqual(screen._agent_max_steps, 4)
+        screen._gen_inputs["max_steps"] = SimpleNamespace(value="7")
+
+        self.assertEqual(screen._effective_gen_config()["max_steps"], 7)
+        self.assertEqual(screen._agent_max_steps, 7)
 
     def test_apply_agent_config_updates_prompt_name(self) -> None:
         screen = AgentScreen(peer_client=object())
