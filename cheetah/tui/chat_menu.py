@@ -38,6 +38,7 @@ from cheetah.orchestration.distributed_inference import (
     distributed_shard_log_messages,
     format_shard_span,
     load_model_shards_on_peers,
+    shard_plan_budget_errors,
     streaming_generate_with_peers,
     total_layers_from_model_config,
     validate_peer_runtime_fingerprints,
@@ -1263,7 +1264,7 @@ class ChatScreen(Screen[None]):
     async def _start_model_load(self) -> None:
         peer_plan: dict[str, Any] | None = None
         try:
-            preview_config, _ = await resolve_model_assets_for_backend(
+            preview_config, preview_model_path = await resolve_model_assets_for_backend(
                 model_id=self._model_id,
                 offline_mode=self._offline,
                 backend=self._llm_backend,
@@ -1274,13 +1275,22 @@ class ChatScreen(Screen[None]):
                 self._peer_client,
                 model_name=self._model_id or "model",
                 total_layers=total_layers,
+                model_path=preview_model_path,
+                model_config=preview_config,
+                backend=self._llm_backend,
             )
             for line in distributed_shard_log_messages(
                 self._peer_client,
                 model_name=self._model_id or "model",
                 total_layers=total_layers,
+                model_path=preview_model_path,
+                model_config=preview_config,
+                backend=self._llm_backend,
             ):
                 self._log_sys_msg(line)
+            budget_errors = peer_plan.get("budget_errors") or shard_plan_budget_errors(peer_plan.get("peers", []))
+            if budget_errors:
+                raise RuntimeError("Shard plan exceeds reported memory: " + "; ".join(budget_errors))
 
             local_shard = peer_plan.get("local_shard") if peer_plan else None
             self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model(
@@ -1342,6 +1352,8 @@ class ChatScreen(Screen[None]):
                         offline_mode=self._offline,
                         total_layers=total_layers_from_model_config(self._model_config),
                         peers=peer_plan.get("peers"),
+                        model_path=self._model_cache_path,
+                        model_config=self._model_config,
                     )
                     mismatches = validate_peer_runtime_fingerprints(
                         peer_load_plan.get("remote_results", []),

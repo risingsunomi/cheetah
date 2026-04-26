@@ -28,6 +28,7 @@ from cheetah.orchestration.distributed_inference import (
     distributed_shard_log_messages,
     format_shard_span,
     load_model_shards_on_peers,
+    shard_plan_budget_errors,
     streaming_generate,
     streaming_generate_with_peers,
     total_layers_from_model_config,
@@ -186,7 +187,7 @@ def _generate(args: argparse.Namespace) -> int:
     for peer_spec in args.peer:
         _add_manual_peer(client, peer_spec, backend=args.backend)
 
-    model_config, _ = asyncio.run(
+    model_config, preview_model_path = asyncio.run(
         resolve_model_assets_for_backend(
             args.model,
             offline_mode=bool(args.offline),
@@ -198,10 +199,23 @@ def _generate(args: argparse.Namespace) -> int:
         client,
         model_name=args.model,
         total_layers=total_layers,
+        model_path=preview_model_path,
+        model_config=model_config,
+        backend=args.backend,
     )
 
-    for line in distributed_shard_log_messages(client, model_name=args.model, total_layers=total_layers):
+    for line in distributed_shard_log_messages(
+        client,
+        model_name=args.model,
+        total_layers=total_layers,
+        model_path=preview_model_path,
+        model_config=model_config,
+        backend=args.backend,
+    ):
         print(line, flush=True)
+    budget_errors = peer_plan.get("budget_errors") or shard_plan_budget_errors(peer_plan.get("peers", []))
+    if budget_errors:
+        raise RuntimeError("Shard plan exceeds reported memory: " + "; ".join(budget_errors))
 
     local_shard = peer_plan.get("local_shard") if peer_plan.get("distributed") else None
     model, loaded_config, tokenizer, model_path = asyncio.run(
@@ -235,6 +249,8 @@ def _generate(args: argparse.Namespace) -> int:
             offline_mode=bool(args.offline),
             total_layers=total_layers,
             peers=peer_plan.get("peers"),
+            model_path=model_path,
+            model_config=loaded_config,
         )
         mismatches = validate_peer_runtime_fingerprints(
             peer_load_plan.get("remote_results", []),
@@ -685,24 +701,37 @@ def _env_flag(name: str) -> bool:
 
 def _add_manual_peer(client: PeerClient, peer_spec: str, *, backend: str) -> None:
     peer_id, host, port = _parse_peer(peer_spec)
-    client.add_peer(
-        {
+    peer_data = {
+        "peer_client_id": peer_id,
+        "address": host,
+        "ip_address": host,
+        "port": port,
+        "peer_device": {
             "peer_client_id": peer_id,
-            "address": host,
             "ip_address": host,
             "port": port,
-            "peer_device": {
-                "peer_client_id": peer_id,
-                "ip_address": host,
-                "port": port,
-                "tg_device": get_backend_device(backend, default="CPU") or "CPU",
-                "cpu_ram": "1",
-                "gpu_vram": "",
-                "gpu_flops": 0.0,
-            },
+            "tg_device": get_backend_device(backend, default="CPU") or "CPU",
+            "cpu_ram": "",
+            "gpu_vram": "",
+            "gpu_flops": 0.0,
         },
-        source_address=host,
-    )
+    }
+    try:
+        response = client.send_payload(
+            {"command": "peer_info", "payload": {"sender_peer_id": client.peer_client_id}},
+            expect_reply=True,
+            address=(host, port),
+            timeout=3.0,
+        )
+    except Exception:
+        response = {}
+    if isinstance(response, dict) and not response.get("error") and isinstance(response.get("peer_device"), dict):
+        peer_data = response
+        peer_data.setdefault("peer_client_id", peer_id)
+        peer_data.setdefault("address", host)
+        peer_data.setdefault("ip_address", host)
+        peer_data.setdefault("port", port)
+    client.add_peer(peer_data, source_address=host)
 
 
 def _parse_peer(value: str) -> tuple[str, str, int]:

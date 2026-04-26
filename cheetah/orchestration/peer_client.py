@@ -229,6 +229,10 @@ class PeerClient:
                         elif command == "clear_model":
                             response = self._handle_clear_model_request(msg)
                             self._send_reply(conn, response)
+                        elif command == "peer_info":
+                            response = self.as_dict()
+                            response["ok"] = True
+                            self._send_reply(conn, response)
                         else:
                             self._send_reply(conn, {"error": f"unknown command {command}"})
                     except Exception:

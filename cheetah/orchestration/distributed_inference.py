@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -32,6 +34,18 @@ TransferCallback = Callable[[dict[str, Any]], None]
 
 class MemoryPressureError(RuntimeError):
     """Raised when memory guard thresholds are exceeded during long-running loops."""
+
+
+@dataclass(frozen=True)
+class ModelWeightProfile:
+    """Estimated loaded model weight bytes split by replicated and layer-local tensors."""
+
+    layer_bytes: tuple[int, ...]
+    shared_bytes: int
+    total_bytes: int
+    source: str
+    context_bytes_per_layer: int = 0
+    context_window: int = 0
 
 
 def _raise_if_abort(abort_check: AbortCheck | None) -> None:
@@ -580,6 +594,9 @@ def distributed_shard_log_messages(
     *,
     model_name: str,
     total_layers: int,
+    model_path: str | Path | None = None,
+    model_config: Any | None = None,
+    backend: str | None = None,
 ) -> list[str]:
     get_peers = getattr(peer_client, "get_peers", None)
     if not callable(get_peers):
@@ -590,6 +607,9 @@ def distributed_shard_log_messages(
         local_peer_id=local_peer_id,
         model_name=model_name,
         total_layers=total_layers,
+        model_path=model_path,
+        model_config=model_config,
+        backend=backend,
     )
 
 
@@ -599,11 +619,17 @@ def distributed_shard_plan_messages(
     local_peer_id: str,
     model_name: str,
     total_layers: int,
+    model_path: str | Path | None = None,
+    model_config: Any | None = None,
+    backend: str | None = None,
 ) -> list[str]:
     normalized = planned_peer_shards(
         peers,
         model_name=model_name,
         total_layers=total_layers,
+        model_path=model_path,
+        model_config=model_config,
+        backend=backend,
     )
     if len(normalized) <= 1 or int(total_layers or 0) <= 1:
         return []
@@ -616,7 +642,8 @@ def distributed_shard_plan_messages(
         if shard is None:
             continue
         scope = "local shard" if str(peer_id) == str(local_peer_id) else "shard on peer"
-        lines.append(f"Loading {scope} {label}: {format_shard_span(shard)}.")
+        weight_note = _shard_weight_note(peer)
+        lines.append(f"Loading {scope} {label}: {format_shard_span(shard)}{weight_note}.")
     return lines
 
 
@@ -630,11 +657,95 @@ def total_layers_from_model_config(model_config: Any) -> int:
     return num_layers + 1 if num_layers > 0 else 0
 
 
+def estimate_model_weight_profile(
+    model_path: str | Path | None,
+    *,
+    total_layers: int,
+    model_config: Any | None = None,
+    backend: str | None = None,
+) -> ModelWeightProfile | None:
+    """Estimate loaded weight memory from safetensors metadata without loading tensors."""
+    transformer_layers = max(int(total_layers or 0) - 1, 0)
+    if transformer_layers <= 0 or model_path is None:
+        return None
+
+    root = Path(model_path).expanduser()
+    if not root.exists():
+        return None
+
+    try:
+        import safetensors
+    except Exception:
+        logger.debug("safetensors is unavailable; cannot estimate model weight profile", exc_info=True)
+        return None
+
+    model_files = _model_safetensor_files(root)
+    if not model_files:
+        return None
+
+    layer_bytes = [0 for _ in range(transformer_layers)]
+    shared_bytes = 0
+    total_bytes = 0
+    loaded_float_nbytes = _loaded_float_nbytes(model_config, backend=backend)
+    context_bytes_per_layer = _context_cache_bytes_per_layer(
+        model_config,
+        dtype_nbytes=loaded_float_nbytes,
+    )
+    context_window = _context_cache_window(model_config)
+    seen_keys: set[str] = set()
+
+    for model_file in model_files:
+        try:
+            with safetensors.safe_open(str(model_file), framework="numpy") as weights:
+                keys = list(weights.keys())
+                quantized_shapes = _bnb_quantized_weight_shapes(weights, keys)
+                for key in keys:
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    if _is_bnb_quant_metadata_key(key, quantized_shapes):
+                        continue
+
+                    if key in quantized_shapes:
+                        tensor_bytes = _shape_nbytes(quantized_shapes[key], loaded_float_nbytes)
+                    else:
+                        tensor_slice = weights.get_slice(key)
+                        tensor_bytes = _estimated_loaded_tensor_nbytes(
+                            tensor_slice.get_shape(),
+                            tensor_slice.get_dtype(),
+                            loaded_float_nbytes=loaded_float_nbytes,
+                        )
+
+                    layer_index = _layer_index_from_weight_key(key)
+                    if layer_index is not None and 0 <= layer_index < transformer_layers:
+                        layer_bytes[layer_index] += tensor_bytes
+                    else:
+                        shared_bytes += tensor_bytes
+                    total_bytes += tensor_bytes
+        except Exception:
+            logger.debug("Failed to inspect safetensors file %s", model_file, exc_info=True)
+            return None
+
+    if total_bytes <= 0 or not any(layer_bytes):
+        return None
+    return ModelWeightProfile(
+        layer_bytes=tuple(layer_bytes),
+        shared_bytes=int(shared_bytes),
+        total_bytes=int(total_bytes),
+        source=str(root),
+        context_bytes_per_layer=int(context_bytes_per_layer),
+        context_window=int(context_window),
+    )
+
+
 def planned_peer_shards(
     peers: Any,
     *,
     model_name: str,
     total_layers: int,
+    model_path: str | Path | None = None,
+    model_config: Any | None = None,
+    backend: str | None = None,
 ) -> list[Any]:
     normalized = _normalize_peer_entries(peers)
     total_layers_int = int(total_layers or 0)
@@ -642,11 +753,20 @@ def planned_peer_shards(
     if len(normalized) <= 1 or transformer_layers <= 1:
         return normalized[:1] if normalized else []
 
-    usable_count = min(len(normalized), transformer_layers)
-    normalized = normalized[:usable_count]
+    weight_profile = estimate_model_weight_profile(
+        model_path,
+        total_layers=total_layers_int,
+        model_config=model_config,
+        backend=backend,
+    )
+    usable_peers = _memory_planning_peers(
+        normalized,
+        transformer_layers=transformer_layers,
+        weight_profile=weight_profile,
+    )
 
     planning_peers: list[Any] = []
-    for index, peer in enumerate(normalized):
+    for index, peer in enumerate(usable_peers):
         peer_id = str(_peer_value(peer, "peer_client_id", "") or f"peer-{index + 1}")
         planning_peer = peer
         if isinstance(peer, dict) or not hasattr(peer, "gpu_vram") or not hasattr(peer, "cpu_ram") or not hasattr(peer, "gpu_flops"):
@@ -664,8 +784,362 @@ def planned_peer_shards(
                     setattr(planning_peer, attr, value)
         planning_peers.append(planning_peer)
 
-    ModelEngine.plan_shards(planning_peers, model_name or "model", total_layers_int)
+    _assign_memory_weighted_shards(
+        planning_peers,
+        model_name=model_name or "model",
+        total_layers=total_layers_int,
+        weight_profile=weight_profile,
+    )
     return planning_peers
+
+
+def _model_safetensor_files(root: Path) -> list[Path]:
+    weight_map_json = root / "model.safetensors.index.json"
+    if weight_map_json.exists():
+        try:
+            payload = json.loads(weight_map_json.read_text(encoding="utf-8"))
+            weight_map = payload.get("weight_map", {})
+            if isinstance(weight_map, dict):
+                names = sorted({str(name) for name in weight_map.values() if str(name).strip()})
+                return [root / name for name in names if (root / name).exists()]
+        except Exception:
+            logger.debug("Failed to read safetensors index %s", weight_map_json, exc_info=True)
+    return sorted(root.glob("*.safetensors"))
+
+
+def _layer_index_from_weight_key(key: str) -> int | None:
+    match = re.search(r"(?:^|\.)(?:layers|h|blocks|blk)\.(\d+)\.", str(key))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _shape_nbytes(shape: Any, dtype_nbytes: int) -> int:
+    count = 1
+    for dim in shape or []:
+        try:
+            count *= max(0, int(dim))
+        except (TypeError, ValueError):
+            return 0
+    return int(count * max(1, int(dtype_nbytes)))
+
+
+def _safetensor_dtype_nbytes(dtype: str) -> int:
+    normalized = str(dtype).upper()
+    if normalized in {"F64", "I64", "U64"}:
+        return 8
+    if normalized in {"F32", "I32", "U32"}:
+        return 4
+    if normalized in {"F16", "BF16", "I16", "U16"}:
+        return 2
+    return 1
+
+
+def _loaded_float_nbytes(model_config: Any | None, *, backend: str | None = None) -> int:
+    if str(backend or "").strip().lower() == "tinygrad":
+        return 2
+    device = str(get_backend_device("torch", default="cpu") or "cpu").strip().lower()
+    torch_dtype = model_config.get("torch_dtype") if isinstance(model_config, dict) else None
+    dtype_text = str(torch_dtype or "").lower()
+    if "float64" in dtype_text:
+        return 8
+    if "float32" in dtype_text:
+        return 4
+    if device == "cpu" and "float16" in dtype_text and "bfloat16" not in dtype_text:
+        return 4
+    return 2
+
+
+def _model_config_int(model_config: Any | None, *keys: str, default: int = 0) -> int:
+    if not isinstance(model_config, dict):
+        return default
+    for key in keys:
+        value = model_config.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _context_cache_window(model_config: Any | None) -> int:
+    return max(
+        0,
+        _model_config_int(
+            model_config,
+            "max_seq_len",
+            "max_position_embeddings",
+            "context_window",
+            default=0,
+        ),
+    )
+
+
+def _context_cache_bytes_per_layer(model_config: Any | None, *, dtype_nbytes: int) -> int:
+    context_window = _context_cache_window(model_config)
+    if context_window <= 0:
+        return 0
+
+    num_kv_heads = _model_config_int(model_config, "num_kv_heads", "num_key_value_heads", default=0)
+    num_heads = _model_config_int(model_config, "num_heads", "num_attention_heads", default=0)
+    head_dim = _model_config_int(model_config, "head_dim", "attention_head_dim", default=0)
+    embed_dim = _model_config_int(model_config, "embed_dim", "hidden_size", default=0)
+    if num_kv_heads <= 0:
+        num_kv_heads = num_heads
+    if head_dim <= 0 and num_heads > 0 and embed_dim > 0:
+        head_dim = max(1, embed_dim // num_heads)
+    if num_kv_heads <= 0 or head_dim <= 0:
+        return 0
+
+    batch_size = 1
+    return int(2 * batch_size * context_window * num_kv_heads * head_dim * max(1, dtype_nbytes))
+
+
+def _estimated_loaded_tensor_nbytes(shape: Any, dtype: str, *, loaded_float_nbytes: int) -> int:
+    dtype_text = str(dtype).upper()
+    if dtype_text.startswith("F") or dtype_text == "BF16":
+        return _shape_nbytes(shape, loaded_float_nbytes)
+    return _shape_nbytes(shape, _safetensor_dtype_nbytes(dtype_text))
+
+
+def _bnb_quantized_weight_shapes(weights: Any, keys: list[str]) -> dict[str, tuple[int, ...]]:
+    shapes: dict[str, tuple[int, ...]] = {}
+    suffix = ".quant_state.bitsandbytes__nf4"
+    for key in keys:
+        if not key.endswith(suffix):
+            continue
+        base_key = key[: -len(suffix)]
+        try:
+            raw = weights.get_tensor(key)
+            payload = raw.reshape(-1).astype("uint8", copy=False).tobytes()
+            state = json.loads(payload.decode("utf-8"))
+            shape = tuple(int(dim) for dim in state.get("shape", []) if int(dim) >= 0)
+        except Exception:
+            logger.debug("Failed to inspect bitsandbytes quantization state for %s", base_key, exc_info=True)
+            continue
+        if shape:
+            shapes[base_key] = shape
+    return shapes
+
+
+def _is_bnb_quant_metadata_key(key: str, quantized_shapes: dict[str, tuple[int, ...]]) -> bool:
+    for suffix in (
+        ".absmax",
+        ".quant_map",
+        ".nested_absmax",
+        ".nested_quant_map",
+        ".quant_state.bitsandbytes__nf4",
+    ):
+        if key.endswith(suffix) and key[: -len(suffix)] in quantized_shapes:
+            return True
+    return False
+
+
+def _parse_memory_bytes(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(float(value) * (1024 ** 3)) if float(value) > 0 else 0
+
+    text = str(value).strip()
+    if not text:
+        return 0
+    match = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$", text)
+    if not match:
+        return 0
+
+    amount = float(match.group(1))
+    unit = match.group(2).lower()
+    if not unit:
+        return int(amount * (1024 ** 3))
+
+    multipliers = {
+        "b": 1,
+        "kb": 1000,
+        "kib": 1024,
+        "mb": 1000 ** 2,
+        "mib": 1024 ** 2,
+        "gb": 1000 ** 3,
+        "gib": 1024 ** 3,
+        "tb": 1000 ** 4,
+        "tib": 1024 ** 4,
+    }
+    return int(amount * multipliers.get(unit, 0))
+
+
+def _shard_memory_fraction() -> float:
+    raw = os.getenv("TC_SHARD_MEMORY_FRACTION", "0.85")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.85
+    return min(1.0, max(0.05, value))
+
+
+def _peer_memory_bytes(peer: Any) -> tuple[int, str]:
+    device = str(_peer_value(peer, "tg_device", "") or "").strip().lower()
+    if device == "cpu":
+        return _parse_memory_bytes(_peer_value(peer, "cpu_ram", 0)), "RAM"
+    gpu_bytes = _parse_memory_bytes(_peer_value(peer, "gpu_vram", 0))
+    if gpu_bytes > 0:
+        return gpu_bytes, "VRAM"
+    return _parse_memory_bytes(_peer_value(peer, "cpu_ram", 0)), "RAM"
+
+
+def _memory_planning_peers(
+    peers: list[Any],
+    *,
+    transformer_layers: int,
+    weight_profile: ModelWeightProfile | None,
+) -> list[Any]:
+    candidates = list(peers[: min(len(peers), transformer_layers)])
+    if not candidates:
+        return []
+
+    if weight_profile is None:
+        return candidates
+
+    min_layer_bytes = min(
+        (
+            value + int(weight_profile.context_bytes_per_layer)
+            for value in weight_profile.layer_bytes
+            if value > 0
+        ),
+        default=max(1, int(weight_profile.context_bytes_per_layer)),
+    )
+    fraction = _shard_memory_fraction()
+    usable = []
+    for index, peer in enumerate(candidates):
+        raw_bytes, _kind = _peer_memory_bytes(peer)
+        if raw_bytes <= 0:
+            usable.append(peer)
+            continue
+        usable_bytes = int(raw_bytes * fraction)
+        layer_budget = max(0, usable_bytes - int(weight_profile.shared_bytes))
+        if layer_budget >= min_layer_bytes or index == 0:
+            usable.append(peer)
+    return usable[:transformer_layers] if usable else candidates[:1]
+
+
+def _assign_memory_weighted_shards(
+    peers: list[Any],
+    *,
+    model_name: str,
+    total_layers: int,
+    weight_profile: ModelWeightProfile | None,
+) -> list[Shard]:
+    transformer_layers = max(int(total_layers or 0) - 1, 0)
+    if transformer_layers <= 0 or not peers:
+        return []
+
+    usable_peers = peers[: min(len(peers), transformer_layers)]
+    if weight_profile is not None and len(weight_profile.layer_bytes) >= transformer_layers:
+        layer_weight_bytes = [max(1, int(value)) for value in weight_profile.layer_bytes[:transformer_layers]]
+        layer_runtime_bytes = [
+            max(1, int(value) + int(weight_profile.context_bytes_per_layer))
+            for value in layer_weight_bytes
+        ]
+    else:
+        layer_weight_bytes = [1 for _ in range(transformer_layers)]
+        layer_runtime_bytes = [1 for _ in range(transformer_layers)]
+
+    fraction = _shard_memory_fraction()
+    raw_budget_values: list[int] = []
+    capacities: list[int] = []
+    memory_kinds: list[str] = []
+    for peer in usable_peers:
+        raw_bytes, kind = _peer_memory_bytes(peer)
+        usable_bytes = int(raw_bytes * fraction)
+        layer_budget = usable_bytes
+        if weight_profile is not None:
+            layer_budget = max(0, usable_bytes - int(weight_profile.shared_bytes))
+        raw_budget_values.append(layer_budget if raw_bytes > 0 and layer_budget > 0 else 0)
+        capacities.append(usable_bytes)
+        memory_kinds.append(kind)
+
+    known_budgets = [value for value in raw_budget_values if value > 0]
+    fallback_budget = int(sum(known_budgets) / len(known_budgets)) if known_budgets else 1
+    budgets = [value if value > 0 else fallback_budget for value in raw_budget_values]
+
+    ranges = _allocate_layer_ranges(layer_runtime_bytes, budgets, len(usable_peers))
+    shards: list[Shard] = []
+    for index, (peer, layer_range) in enumerate(zip(usable_peers, ranges)):
+        start, end = layer_range
+        shard = Shard(model_name=model_name, start_layer=start, end_layer=end, total_layers=total_layers)
+        shards.append(shard)
+        try:
+            peer.shard = shard
+            if weight_profile is not None:
+                shard_layer_weight_bytes = sum(layer_weight_bytes[start:end])
+                shard_context_bytes = int(weight_profile.context_bytes_per_layer) * max(0, end - start)
+                total_weight_bytes = int(weight_profile.shared_bytes) + shard_layer_weight_bytes
+                total_runtime_bytes = total_weight_bytes + shard_context_bytes
+                peer.shard_layer_weight_bytes = shard_layer_weight_bytes
+                peer.shard_weight_bytes = total_weight_bytes
+                peer.shard_context_bytes = shard_context_bytes
+                peer.shard_estimated_bytes = total_runtime_bytes
+                peer.shard_shared_weight_bytes = int(weight_profile.shared_bytes)
+                peer.shard_memory_capacity_bytes = capacities[index]
+                peer.shard_memory_kind = memory_kinds[index]
+                peer.shard_context_window = int(weight_profile.context_window)
+                peer.shard_weight_over_budget = bool(capacities[index] and total_runtime_bytes > capacities[index])
+        except Exception:
+            pass
+    return shards
+
+
+def _allocate_layer_ranges(layer_bytes: list[int], budgets: list[int], peer_count: int) -> list[tuple[int, int]]:
+    total_layers = len(layer_bytes)
+    peer_count = min(max(1, peer_count), total_layers)
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    remaining_bytes = sum(layer_bytes)
+    remaining_budget = sum(max(1, int(value)) for value in budgets[:peer_count])
+
+    for index in range(peer_count):
+        remaining_peers = peer_count - index
+        if remaining_peers <= 1:
+            ranges.append((start, total_layers))
+            break
+
+        max_end = total_layers - (remaining_peers - 1)
+        peer_budget = max(1, int(budgets[index]))
+        if remaining_budget > 0:
+            target_bytes = max(1.0, remaining_bytes * (peer_budget / remaining_budget))
+        else:
+            target_bytes = max(1.0, remaining_bytes / remaining_peers)
+
+        end = start
+        current_bytes = 0
+        while end < max_end:
+            next_bytes = current_bytes + layer_bytes[end]
+            if end > start and next_bytes > target_bytes:
+                break
+            current_bytes = next_bytes
+            end += 1
+
+        if end <= start:
+            end = start + 1
+            current_bytes = layer_bytes[start]
+
+        ranges.append((start, end))
+        start = end
+        remaining_bytes = max(0, remaining_bytes - current_bytes)
+        remaining_budget = max(0, remaining_budget - peer_budget)
+
+    return ranges
+
+
+def _peers_have_valid_shards(peers: Any, total_layers: int) -> bool:
+    normalized = _normalize_peer_entries(peers)
+    if not normalized:
+        return False
+    return all(_shard_matches_total(_peer_value(peer, "shard", None), total_layers) for peer in normalized)
 
 
 def build_peer_load_plan(
@@ -673,6 +1147,9 @@ def build_peer_load_plan(
     *,
     model_name: str,
     total_layers: int,
+    model_path: str | Path | None = None,
+    model_config: Any | None = None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     get_peers = getattr(peer_client, "get_peers", None)
     if not callable(get_peers):
@@ -688,6 +1165,9 @@ def build_peer_load_plan(
         get_peers(include_self=True),
         model_name=model_name,
         total_layers=total_layers,
+        model_path=model_path,
+        model_config=model_config,
+        backend=backend,
     )
     local_peer_id = str(getattr(peer_client, "peer_client_id", "") or "")
     local_peer = next(
@@ -708,6 +1188,7 @@ def build_peer_load_plan(
         "remote_peers": remote_peers,
         "local_peer": local_peer,
         "local_shard": local_shard,
+        "budget_errors": shard_plan_budget_errors(peers),
     }
 
 
@@ -719,15 +1200,36 @@ def load_model_shards_on_peers(
     offline_mode: bool,
     total_layers: int,
     peers: Any | None = None,
+    model_path: str | Path | None = None,
+    model_config: Any | None = None,
     timeout: float | None = None,
 ) -> dict[str, Any]:
     if peers is None:
-        plan = build_peer_load_plan(peer_client, model_name=model_id, total_layers=total_layers)
+        plan = build_peer_load_plan(
+            peer_client,
+            model_name=model_id,
+            total_layers=total_layers,
+            model_path=model_path,
+            model_config=model_config,
+            backend=backend,
+        )
     else:
-        planned = planned_peer_shards(peers, model_name=model_id, total_layers=total_layers)
+        planned = (
+            _normalize_peer_entries(peers)
+            if _peers_have_valid_shards(peers, total_layers)
+            else planned_peer_shards(
+                peers,
+                model_name=model_id,
+                total_layers=total_layers,
+                model_path=model_path,
+                model_config=model_config,
+                backend=backend,
+            )
+        )
         plan = {
             "distributed": len(planned) > 1 and int(total_layers or 0) > 1,
             "peers": planned,
+            "budget_errors": shard_plan_budget_errors(planned),
         }
     if "remote_peers" not in plan:
         planned = plan.get("peers", [])
@@ -827,6 +1329,60 @@ def format_shard_span(shard: Any) -> str:
     total_layers = int(getattr(shard, "total_layers", end_layer + 1) or (end_layer + 1))
     transformer_layers = max(total_layers - 1, 1)
     return f"transformer layers {start_layer}:{end_layer} of {transformer_layers}"
+
+
+def _format_bytes(value: Any) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if size < 1024:
+        return f"{int(size)} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        size /= 1024.0
+        if abs(size) < 1024.0:
+            return f"{size:.1f} {unit}"
+    return f"{size:.1f} PiB"
+
+
+def _shard_weight_note(peer: Any) -> str:
+    estimated_bytes = _peer_value(peer, "shard_estimated_bytes", None)
+    weight_bytes = _peer_value(peer, "shard_weight_bytes", None)
+    context_bytes = _peer_value(peer, "shard_context_bytes", None)
+    if estimated_bytes in (None, "") and weight_bytes in (None, ""):
+        return ""
+    display_bytes = estimated_bytes if estimated_bytes not in (None, "") else weight_bytes
+    capacity_bytes = _peer_value(peer, "shard_memory_capacity_bytes", None)
+    memory_kind = str(_peer_value(peer, "shard_memory_kind", "memory") or "memory")
+    over_budget = bool(_peer_value(peer, "shard_weight_over_budget", False))
+    context_note = ""
+    if context_bytes not in (None, "", 0):
+        context_note = f", cache {_format_bytes(context_bytes)}"
+    if capacity_bytes not in (None, "", 0):
+        suffix = " over budget" if over_budget else ""
+        return (
+            f" (est. load {_format_bytes(display_bytes)}"
+            f" incl. weights {_format_bytes(weight_bytes)}{context_note}"
+            f" / usable {memory_kind} {_format_bytes(capacity_bytes)}{suffix})"
+        )
+    return f" (est. load {_format_bytes(display_bytes)} incl. weights {_format_bytes(weight_bytes)}{context_note})"
+
+
+def shard_plan_budget_errors(peers: Any) -> list[str]:
+    errors: list[str] = []
+    for peer in _normalize_peer_entries(peers):
+        if not bool(_peer_value(peer, "shard_weight_over_budget", False)):
+            continue
+        peer_id = str(_peer_value(peer, "peer_client_id", "") or "peer")
+        shard = _peer_value(peer, "shard", None)
+        estimated = _peer_value(peer, "shard_estimated_bytes", _peer_value(peer, "shard_weight_bytes", 0))
+        capacity = _peer_value(peer, "shard_memory_capacity_bytes", 0)
+        kind = str(_peer_value(peer, "shard_memory_kind", "memory") or "memory")
+        errors.append(
+            f"{peer_id} {format_shard_span(shard)} needs about {_format_bytes(estimated)} "
+            f"but usable {kind} is {_format_bytes(capacity)}"
+        )
+    return errors
 
 
 def local_runtime_fingerprints(*, model_config: Any, model_path: str | Path | None) -> dict[str, str]:

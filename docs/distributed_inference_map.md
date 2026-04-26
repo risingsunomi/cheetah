@@ -15,6 +15,8 @@ User prompt
   -> TUI or distributed_probe tokenizes prompt
   -> build_peer_load_plan()
       -> planned_peer_shards()
+      -> estimate_model_weight_profile() from safetensors metadata when model files are local
+      -> weight-aware contiguous layer split by usable peer RAM/VRAM
       -> local shard + remote shard assignments
   -> local load_model_for_backend(..., shard=local_shard)
   -> remote load_model command per peer
@@ -57,6 +59,16 @@ step > 0: prefill=false
 - The extra virtual layer is the final norm/lm_head stage.
 - A final transformer shard has `end_layer >= total_layers - 1`.
 - Full local model load uses `Shard(model, 0, num_layers, num_layers + 1)`.
+
+## Shard Planning
+
+- When safetensors files are available locally, orchestration estimates loaded weight bytes before assigning shards.
+- Transformer layer tensors are counted per layer; non-layer tensors such as embeddings, final norm, and lm_head are treated as shared replicated weight cost for every used node.
+- Planning also reserves KV/context cache per transformer layer using the model's configured `max_seq_len`, `num_kv_heads`, and `head_dim`, matching the cache buffers allocated by the runtime today.
+- Peer capacity uses reported `gpu_vram` when present, otherwise `cpu_ram`.
+- `distributed_probe --peer` asks the peer for `peer_info` so manual peers use real RAM/VRAM instead of a placeholder.
+- `TC_SHARD_MEMORY_FRACTION` reserves headroom from reported memory; default is `0.85`.
+- If weight metadata is unavailable, planning falls back to memory-proportional layer counts.
 
 Example for 16 transformer layers on two nodes:
 

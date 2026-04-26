@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 import tinygrad as tg
 import numpy as np
+from safetensors.numpy import save_file
 
-from cheetah.orchestration import distributed_inference
+from cheetah.orchestration import distributed_inference, distributed_probe
 from cheetah.models.shard import Shard
 from cheetah.tui import helpers
 
@@ -516,6 +517,147 @@ class TestStreamingGenerateTinygrad(unittest.TestCase):
 
 
 class TestDistributedShardLogging(unittest.TestCase):
+    def test_distributed_probe_manual_peer_uses_peer_info_memory(self) -> None:
+        class FakeClient:
+            peer_client_id = "self"
+
+            def __init__(self) -> None:
+                self.added: list[dict[str, object]] = []
+
+            def send_payload(self, *_args, **_kwargs):
+                return {
+                    "peer_client_id": "node-b",
+                    "address": "192.168.0.5",
+                    "port": 8765,
+                    "peer_device": {
+                        "peer_client_id": "node-b",
+                        "ip_address": "192.168.0.5",
+                        "port": 8765,
+                        "tg_device": "cpu",
+                        "cpu_ram": "32",
+                        "gpu_vram": "",
+                        "gpu_flops": 0.0,
+                    },
+                }
+
+            def add_peer(self, peer_data, source_address=None):
+                self.added.append({"peer_data": peer_data, "source_address": source_address})
+
+        client = FakeClient()
+
+        distributed_probe._add_manual_peer(client, "node-b@192.168.0.5:8765", backend="torch")
+
+        self.assertEqual(client.added[0]["source_address"], "192.168.0.5")
+        peer_data = client.added[0]["peer_data"]
+        self.assertEqual(peer_data["peer_device"]["cpu_ram"], "32")
+
+    def test_distributed_probe_manual_peer_fallback_keeps_memory_unknown(self) -> None:
+        class FakeClient:
+            peer_client_id = "self"
+
+            def __init__(self) -> None:
+                self.added: list[dict[str, object]] = []
+
+            def send_payload(self, *_args, **_kwargs):
+                raise TimeoutError("offline")
+
+            def add_peer(self, peer_data, source_address=None):
+                self.added.append({"peer_data": peer_data, "source_address": source_address})
+
+        client = FakeClient()
+
+        distributed_probe._add_manual_peer(client, "node-b@192.168.0.5:8765", backend="torch")
+
+        peer_data = client.added[0]["peer_data"]
+        self.assertEqual(peer_data["peer_device"]["cpu_ram"], "")
+
+    def test_estimate_model_weight_profile_uses_safetensor_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp)
+            save_file(
+                {
+                    "model.embed_tokens.weight": np.zeros((5,), dtype=np.float16),
+                    "model.layers.0.self_attn.q_proj.weight": np.zeros((4,), dtype=np.float16),
+                    "model.layers.1.self_attn.q_proj.weight": np.zeros((6,), dtype=np.float16),
+                    "model.layers.2.self_attn.q_proj.weight": np.zeros((8,), dtype=np.float16),
+                    "lm_head.weight": np.zeros((7,), dtype=np.float16),
+                },
+                str(model_path / "model.safetensors"),
+            )
+
+            profile = distributed_inference.estimate_model_weight_profile(
+                model_path,
+                total_layers=4,
+                model_config={"torch_dtype": "float16"},
+                backend="tinygrad",
+            )
+
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile.layer_bytes, (8, 12, 16))
+        self.assertEqual(profile.shared_bytes, 24)
+        self.assertEqual(profile.total_bytes, 60)
+        self.assertEqual(profile.context_bytes_per_layer, 0)
+
+    def test_estimate_model_weight_profile_includes_context_cache_per_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp)
+            save_file(
+                {
+                    "model.layers.0.self_attn.q_proj.weight": np.zeros((4,), dtype=np.float16),
+                    "model.layers.1.self_attn.q_proj.weight": np.zeros((4,), dtype=np.float16),
+                },
+                str(model_path / "model.safetensors"),
+            )
+
+            profile = distributed_inference.estimate_model_weight_profile(
+                model_path,
+                total_layers=3,
+                model_config={
+                    "torch_dtype": "float16",
+                    "max_seq_len": 10,
+                    "num_kv_heads": 1,
+                    "head_dim": 2,
+                },
+                backend="tinygrad",
+            )
+
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile.context_bytes_per_layer, 80)
+        self.assertEqual(profile.context_window, 10)
+
+    def test_planned_peer_shards_uses_weight_profile_and_memory_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp)
+            tensors = {
+                f"model.layers.{idx}.self_attn.q_proj.weight": np.zeros((5,), dtype=np.float16)
+                for idx in range(6)
+            }
+            save_file(tensors, str(model_path / "model.safetensors"))
+            peers = [
+                SimpleNamespace(peer_client_id="self", ip_address="192.168.0.10", gpu_vram="40B", cpu_ram="0"),
+                SimpleNamespace(peer_client_id="peer-1", ip_address="192.168.0.20", gpu_vram="20B", cpu_ram="0"),
+                SimpleNamespace(peer_client_id="peer-2", ip_address="192.168.0.30", gpu_vram="10B", cpu_ram="0"),
+            ]
+
+            with patch.dict(os.environ, {"TC_SHARD_MEMORY_FRACTION": "1.0"}):
+                planned = distributed_inference.planned_peer_shards(
+                    peers,
+                    model_name="demo",
+                    total_layers=7,
+                    model_path=model_path,
+                    model_config={"torch_dtype": "float16"},
+                    backend="tinygrad",
+                )
+
+        self.assertEqual(len(planned), 3)
+        self.assertEqual((planned[0].shard.start_layer, planned[0].shard.end_layer), (0, 3))
+        self.assertEqual((planned[1].shard.start_layer, planned[1].shard.end_layer), (3, 5))
+        self.assertEqual((planned[2].shard.start_layer, planned[2].shard.end_layer), (5, 6))
+        self.assertEqual(planned[0].shard_weight_bytes, 30)
+        self.assertEqual(planned[0].shard_memory_capacity_bytes, 40)
+
     def test_distributed_shard_plan_messages_list_local_then_remote_peers(self) -> None:
         peers = [
             SimpleNamespace(peer_client_id="self", ip_address="192.168.0.10", gpu_vram="8", cpu_ram="16", gpu_flops=0.0),
