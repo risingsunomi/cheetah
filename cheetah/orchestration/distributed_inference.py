@@ -459,17 +459,7 @@ def streaming_generate_with_peers(
 
         for peer in remote_peers:
             peer_id = _peer_identifier(peer)
-            request_timeout = _peer_generation_timeout_seconds(
-                prefill=prefill,
-                token_count=_flow_token_count(
-                    {
-                        "input_ids": input_list,
-                        "attention_mask": transport_attention_mask,
-                        "position_ids": transport_position_ids,
-                        "hidden_state": transport_hidden_state,
-                    }
-                ),
-            )
+            request_timeout = os.getenv("TC_PEER_PREFILL_TIMEOUT_SECONDS", 1000.0) if prefill else os.getenv("TC_PEER_DECODE_TIMEOUT_SECONDS", 1000.0)
             payload = {
                 "command": "generate_token",
                 "payload": {
