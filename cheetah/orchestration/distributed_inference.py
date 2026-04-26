@@ -1251,7 +1251,7 @@ def load_model_shards_on_peers(
     if not plan.get("distributed"):
         return plan
 
-    load_timeout = _peer_model_load_timeout_seconds() if timeout is None else timeout
+    load_timeout = os.getenv("TC_PEER_MODEL_LOAD_TIMEOUT_SECONDS") or 1000.0
     remote_results: list[dict[str, Any]] = []
     for peer in plan["remote_peers"]:
         peer_id = _peer_identifier(peer)
@@ -1302,7 +1302,7 @@ def clear_model_shards_on_peers(
     if not remote_peers:
         return
 
-    clear_timeout = _peer_model_load_timeout_seconds() if timeout is None else timeout
+    clear_timeout = os.getenv("TC_PEER_MODEL_LOAD_TIMEOUT_SECONDS") or 1000.0
     for peer in remote_peers:
         host = str(_peer_value(peer, "ip_address", "") or _peer_value(peer, "address", "0.0.0.0"))
         port = int(_peer_value(peer, "port", os.getenv("TC_TENSOR_PORT", 1045)))
@@ -1435,17 +1435,6 @@ def validate_peer_runtime_fingerprints(
         elif local["tokenizer_fingerprint"] and remote_tokenizer_fp != local["tokenizer_fingerprint"]:
             mismatches.append(f"{label} tokenizer fingerprint mismatch")
     return mismatches
-
-
-def _peer_model_load_timeout_seconds() -> float:
-    raw = (os.getenv("TC_PEER_MODEL_LOAD_TIMEOUT_SECONDS") or "").strip()
-    if not raw:
-        return 180.0
-    try:
-        return max(float(raw), 1.0)
-    except ValueError:
-        return 180.0
-
 
 def _peer_generation_timeout_seconds(*, prefill: bool, token_count: int = 0) -> float:
     env_name = "TC_PEER_PREFILL_TIMEOUT_SECONDS" if prefill else "TC_PEER_DECODE_TIMEOUT_SECONDS"

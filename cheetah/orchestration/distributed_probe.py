@@ -721,7 +721,7 @@ def _add_manual_peer(client: PeerClient, peer_spec: str, *, backend: str) -> Non
             {"command": "peer_info", "payload": {"sender_peer_id": client.peer_client_id}},
             expect_reply=True,
             address=(host, port),
-            timeout=3.0,
+            timeout=os.getenv("TC_PAYLOAD_TIMEOUT_SECONDS") or 1000.0,
         )
     except Exception:
         response = {}
