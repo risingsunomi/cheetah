@@ -89,7 +89,8 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--repetition-penalty", type=float, default=1.0)
     generate.add_argument("--stream", action="store_true", help="stream decoded text as tokens arrive")
     generate.add_argument(
-        "--trace-tens_true",
+        "--trace-tensors",
+        action="store_true",
         default=_env_flag("TC_TRACE_TENSOR_TRANSFERS"),
         help="print distributed tensor transfer shapes, sizes, and remote KV cache positions",
     )
