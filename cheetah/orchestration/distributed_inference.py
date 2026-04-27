@@ -459,7 +459,6 @@ def streaming_generate_with_peers(
 
         for peer in remote_peers:
             peer_id = _peer_identifier(peer)
-            request_timeout = os.getenv("TC_PEER_PREFILL_TIMEOUT_SECONDS", 1000.0) if prefill else os.getenv("TC_PEER_DECODE_TIMEOUT_SECONDS", 1000.0)
             payload = {
                 "command": "generate_token",
                 "payload": {
@@ -482,6 +481,10 @@ def streaming_generate_with_peers(
             }
             try:
                 request_tokens = _flow_token_count(payload)
+                request_timeout = _peer_generation_timeout_seconds(
+                    prefill=prefill,
+                    token_count=request_tokens,
+                )
                 _record_peer_flow(peer_client, local_peer_id or "local", peer_id, request_tokens, phase="request")
                 _emit_transfer(
                     on_transfer,
@@ -971,14 +974,38 @@ def _shard_memory_fraction() -> float:
     return min(1.0, max(0.05, value))
 
 
+def _shard_runtime_overhead_factor() -> float:
+    raw = os.getenv("TC_SHARD_RUNTIME_OVERHEAD_FACTOR", "1.30")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 1.30
+    return min(4.0, max(1.0, value))
+
+
+def _peer_info_timeout_seconds() -> float:
+    raw = os.getenv("TC_PEER_INFO_TIMEOUT_SECONDS") or os.getenv("TC_PAYLOAD_TIMEOUT_SECONDS") or "3.0"
+    try:
+        return max(0.1, float(raw))
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def _preferred_memory_bytes(peer: Any, available_name: str, total_name: str) -> int:
+    available_bytes = _parse_memory_bytes(_peer_value(peer, available_name, 0))
+    if available_bytes > 0:
+        return available_bytes
+    return _parse_memory_bytes(_peer_value(peer, total_name, 0))
+
+
 def _peer_memory_bytes(peer: Any) -> tuple[int, str]:
     device = str(_peer_value(peer, "tg_device", "") or "").strip().lower()
     if device == "cpu":
-        return _parse_memory_bytes(_peer_value(peer, "cpu_ram", 0)), "RAM"
-    gpu_bytes = _parse_memory_bytes(_peer_value(peer, "gpu_vram", 0))
+        return _preferred_memory_bytes(peer, "cpu_ram_available", "cpu_ram"), "RAM"
+    gpu_bytes = _preferred_memory_bytes(peer, "gpu_vram_available", "gpu_vram")
     if gpu_bytes > 0:
         return gpu_bytes, "VRAM"
-    return _parse_memory_bytes(_peer_value(peer, "cpu_ram", 0)), "RAM"
+    return _preferred_memory_bytes(peer, "cpu_ram_available", "cpu_ram"), "RAM"
 
 
 def _memory_planning_peers(
@@ -994,9 +1021,10 @@ def _memory_planning_peers(
     if weight_profile is None:
         return candidates
 
+    overhead_factor = _shard_runtime_overhead_factor()
     min_layer_bytes = min(
         (
-            value + int(weight_profile.context_bytes_per_layer)
+            int(value * overhead_factor) + int(weight_profile.context_bytes_per_layer)
             for value in weight_profile.layer_bytes
             if value > 0
         ),
@@ -1010,7 +1038,7 @@ def _memory_planning_peers(
             usable.append(peer)
             continue
         usable_bytes = int(raw_bytes * fraction)
-        layer_budget = max(0, usable_bytes - int(weight_profile.shared_bytes))
+        layer_budget = max(0, usable_bytes - int(weight_profile.shared_bytes * overhead_factor))
         if layer_budget >= min_layer_bytes or index == 0:
             usable.append(peer)
     return usable[:transformer_layers] if usable else candidates[:1]
@@ -1030,11 +1058,13 @@ def _assign_memory_weighted_shards(
     usable_peers = peers[: min(len(peers), transformer_layers)]
     if weight_profile is not None and len(weight_profile.layer_bytes) >= transformer_layers:
         layer_weight_bytes = [max(1, int(value)) for value in weight_profile.layer_bytes[:transformer_layers]]
+        overhead_factor = _shard_runtime_overhead_factor()
         layer_runtime_bytes = [
-            max(1, int(value) + int(weight_profile.context_bytes_per_layer))
+            max(1, int(value * overhead_factor) + int(weight_profile.context_bytes_per_layer))
             for value in layer_weight_bytes
         ]
     else:
+        overhead_factor = 1.0
         layer_weight_bytes = [1 for _ in range(transformer_layers)]
         layer_runtime_bytes = [1 for _ in range(transformer_layers)]
 
@@ -1047,7 +1077,7 @@ def _assign_memory_weighted_shards(
         usable_bytes = int(raw_bytes * fraction)
         layer_budget = usable_bytes
         if weight_profile is not None:
-            layer_budget = max(0, usable_bytes - int(weight_profile.shared_bytes))
+            layer_budget = max(0, usable_bytes - int(weight_profile.shared_bytes * overhead_factor))
         raw_budget_values.append(layer_budget if raw_bytes > 0 and layer_budget > 0 else 0)
         capacities.append(usable_bytes)
         memory_kinds.append(kind)
@@ -1068,11 +1098,12 @@ def _assign_memory_weighted_shards(
                 shard_layer_weight_bytes = sum(layer_weight_bytes[start:end])
                 shard_context_bytes = int(weight_profile.context_bytes_per_layer) * max(0, end - start)
                 total_weight_bytes = int(weight_profile.shared_bytes) + shard_layer_weight_bytes
-                total_runtime_bytes = total_weight_bytes + shard_context_bytes
+                total_runtime_bytes = int(total_weight_bytes * overhead_factor) + shard_context_bytes
                 peer.shard_layer_weight_bytes = shard_layer_weight_bytes
                 peer.shard_weight_bytes = total_weight_bytes
                 peer.shard_context_bytes = shard_context_bytes
                 peer.shard_estimated_bytes = total_runtime_bytes
+                peer.shard_runtime_overhead_factor = overhead_factor
                 peer.shard_shared_weight_bytes = int(weight_profile.shared_bytes)
                 peer.shard_memory_capacity_bytes = capacities[index]
                 peer.shard_memory_kind = memory_kinds[index]
@@ -1132,6 +1163,98 @@ def _peers_have_valid_shards(peers: Any, total_layers: int) -> bool:
     return all(_shard_matches_total(_peer_value(peer, "shard", None), total_layers) for peer in normalized)
 
 
+def _refresh_peer_resource_info(peer_client: Any) -> None:
+    peer_device = getattr(peer_client, "peer_device", None)
+    refresh = getattr(peer_device, "refresh_host_info", None)
+    if callable(refresh):
+        try:
+            refresh()
+        except Exception:
+            logger.debug("Failed to refresh local resource info", exc_info=True)
+
+    get_peers = getattr(peer_client, "get_peers", None)
+    send_payload = getattr(peer_client, "send_payload", None)
+    if not callable(get_peers) or not callable(send_payload):
+        return
+
+    timeout = _peer_info_timeout_seconds()
+    try:
+        remote_peers = list(get_peers(include_self=False))
+    except Exception:
+        logger.debug("Failed to list peers for resource refresh", exc_info=True)
+        return
+
+    for peer in remote_peers:
+        host = str(_peer_value(peer, "ip_address", "") or _peer_value(peer, "address", "") or "").strip()
+        if not host:
+            continue
+        try:
+            port = int(_peer_value(peer, "port", os.getenv("TC_TENSOR_PORT", 1045)))
+        except (TypeError, ValueError):
+            continue
+        try:
+            response = send_payload(
+                {"command": "peer_info", "payload": {"sender_peer_id": getattr(peer_client, "peer_client_id", "")}},
+                expect_reply=True,
+                address=(host, port),
+                timeout=timeout,
+            )
+        except Exception:
+            logger.debug("Failed to refresh resource info for %s", _peer_log_label(peer), exc_info=True)
+            continue
+        _record_peer_resource_info(peer_client, response, source_address=host)
+
+
+def _record_peer_resource_info(peer_client: Any, response: Any, *, source_address: str | None = None) -> None:
+    if not isinstance(response, dict) or response.get("error") or not isinstance(response.get("peer_device"), dict):
+        return
+    add_peer = getattr(peer_client, "add_peer", None)
+    if callable(add_peer):
+        try:
+            add_peer(response, source_address=source_address)
+            return
+        except TypeError:
+            try:
+                add_peer(response)
+                return
+            except Exception:
+                logger.debug("Failed to record peer resource info", exc_info=True)
+        except Exception:
+            logger.debug("Failed to record peer resource info", exc_info=True)
+
+    peer_device = response.get("peer_device", {})
+    peer_id = str(response.get("peer_client_id") or peer_device.get("peer_client_id") or "")
+    get_peers = getattr(peer_client, "get_peers", None)
+    if not peer_id or not callable(get_peers):
+        return
+    try:
+        peers = list(get_peers(include_self=True))
+    except Exception:
+        return
+    for peer in peers:
+        if str(_peer_value(peer, "peer_client_id", "") or "") != peer_id:
+            continue
+        for attr in (
+            "cpu_model",
+            "cpu_proc_speed",
+            "cpu_cores",
+            "cpu_ram",
+            "cpu_ram_available",
+            "gpu_model",
+            "gpu_vram",
+            "gpu_vram_available",
+            "gpu_flops",
+            "devices",
+            "tg_device",
+        ):
+            if attr in peer_device:
+                try:
+                    setattr(peer, attr, peer_device[attr])
+                except Exception:
+                    pass
+        break
+
+
 def build_peer_load_plan(
     peer_client: Any,
     *,
@@ -1151,6 +1274,7 @@ def build_peer_load_plan(
             "local_shard": None,
         }
 
+    _refresh_peer_resource_info(peer_client)
     peers = planned_peer_shards(
         get_peers(include_self=True),
         model_name=model_name,
@@ -1339,6 +1463,7 @@ def _shard_weight_note(peer: Any) -> str:
     estimated_bytes = _peer_value(peer, "shard_estimated_bytes", None)
     weight_bytes = _peer_value(peer, "shard_weight_bytes", None)
     context_bytes = _peer_value(peer, "shard_context_bytes", None)
+    overhead_factor = _peer_value(peer, "shard_runtime_overhead_factor", None)
     if estimated_bytes in (None, "") and weight_bytes in (None, ""):
         return ""
     display_bytes = estimated_bytes if estimated_bytes not in (None, "") else weight_bytes
@@ -1348,14 +1473,23 @@ def _shard_weight_note(peer: Any) -> str:
     context_note = ""
     if context_bytes not in (None, "", 0):
         context_note = f", cache {_format_bytes(context_bytes)}"
+    overhead_note = ""
+    try:
+        if overhead_factor not in (None, "") and float(overhead_factor) > 1.0:
+            overhead_note = f", runtime x{float(overhead_factor):.2f}"
+    except (TypeError, ValueError):
+        overhead_note = ""
     if capacity_bytes not in (None, "", 0):
         suffix = " over budget" if over_budget else ""
         return (
-            f" (est. load {_format_bytes(display_bytes)}"
-            f" incl. weights {_format_bytes(weight_bytes)}{context_note}"
+            f" (est. runtime {_format_bytes(display_bytes)}"
+            f" incl. weights {_format_bytes(weight_bytes)}{context_note}{overhead_note}"
             f" / usable {memory_kind} {_format_bytes(capacity_bytes)}{suffix})"
         )
-    return f" (est. load {_format_bytes(display_bytes)} incl. weights {_format_bytes(weight_bytes)}{context_note})"
+    return (
+        f" (est. runtime {_format_bytes(display_bytes)}"
+        f" incl. weights {_format_bytes(weight_bytes)}{context_note}{overhead_note})"
+    )
 
 
 def shard_plan_budget_errors(peers: Any) -> list[str]:

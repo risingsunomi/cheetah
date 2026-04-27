@@ -230,6 +230,9 @@ class PeerClient:
                             response = self._handle_clear_model_request(msg)
                             self._send_reply(conn, response)
                         elif command == "peer_info":
+                            refresh = getattr(self.peer_device, "refresh_host_info", None)
+                            if callable(refresh):
+                                refresh()
                             response = self.as_dict()
                             response["ok"] = True
                             self._send_reply(conn, response)
@@ -778,8 +781,8 @@ class PeerClient:
         peers = [p for p in self._peers.values() if p.peer_client_id != self.peer_client_id]
 
         def capacity(peer: CDevice) -> float:
-            vram = _to_float(peer.gpu_vram)
-            ram = _to_float(peer.cpu_ram)
+            vram = _to_float(peer.gpu_vram_available) or _to_float(peer.gpu_vram)
+            ram = _to_float(peer.cpu_ram_available) or _to_float(peer.cpu_ram)
             return max(vram, ram, 1.0)
 
         return sorted(peers, key=capacity, reverse=True)
@@ -795,6 +798,7 @@ class PeerClient:
             info.get("ip_address", info.get("address", "")),
             int(info.get("port", self.port)),
             tg_device=str(info.get("tg_device", "CPU")),
+            get_self_info=False,
         )
         peer.shard = Shard(
             shard_info.get("model_name", ""),
@@ -803,9 +807,13 @@ class PeerClient:
             int(shard_info.get("total_layers", shard_info.get("end_layer", 0)) or 0),
         )
         peer.cpu_model = str(info.get("cpu_model", ""))
+        peer.cpu_ram = str(info.get("cpu_ram", ""))
+        peer.cpu_ram_available = str(info.get("cpu_ram_available", ""))
         peer.gpu_model = str(info.get("gpu_model", ""))
         peer.gpu_vram = str(info.get("gpu_vram", ""))
+        peer.gpu_vram_available = str(info.get("gpu_vram_available", ""))
         peer.gpu_flops = float(info.get("gpu_flops", 0.0) or 0.0)
+        peer.devices = list(info.get("devices", [])) if isinstance(info.get("devices"), list) else []
 
         return peer
 
@@ -971,7 +979,8 @@ class PeerClient:
                 cdevice = CDevice(
                     peer_client_id,
                     _peer_host_from_payload(peer_data, source_address=source_address),
-                    peer_data.get("port", self.port)
+                    peer_data.get("port", self.port),
+                    get_self_info=False,
                 )
             else:
                 cdevice = CDevice(
@@ -979,15 +988,19 @@ class PeerClient:
                     _peer_host_from_payload(peer_data, source_address=source_address),
                     peer_device.get("port", peer_data.get("port", self.port)),
                     peer_device.get("tg_device", "CPU"),
+                    get_self_info=False,
                 )
 
                 cdevice.cpu_model = peer_device.get("cpu_model", "")
                 cdevice.cpu_proc_speed = peer_device.get("cpu_proc_speed", "")
                 cdevice.cpu_cores = peer_device.get("cpu_cores", 0)
                 cdevice.cpu_ram = peer_device.get("cpu_ram", "")
+                cdevice.cpu_ram_available = peer_device.get("cpu_ram_available", "")
                 cdevice.gpu_model = peer_device.get("gpu_model", "")
                 cdevice.gpu_vram = peer_device.get("gpu_vram", "")
+                cdevice.gpu_vram_available = peer_device.get("gpu_vram_available", "")
                 cdevice.gpu_flops = float(peer_device.get("gpu_flops", 0.0) or 0.0)
+                cdevice.devices = list(peer_device.get("devices", [])) if isinstance(peer_device.get("devices"), list) else []
 
             shard_data = peer_data.get("shard", {}) if isinstance(peer_data.get("shard"), dict) else {}
             cdevice.shard = Shard(

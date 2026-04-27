@@ -535,7 +535,9 @@ class TestDistributedShardLogging(unittest.TestCase):
                         "port": 8765,
                         "tg_device": "cpu",
                         "cpu_ram": "32",
+                        "cpu_ram_available": "20",
                         "gpu_vram": "",
+                        "gpu_vram_available": "",
                         "gpu_flops": 0.0,
                     },
                 }
@@ -550,6 +552,7 @@ class TestDistributedShardLogging(unittest.TestCase):
         self.assertEqual(client.added[0]["source_address"], "192.168.0.5")
         peer_data = client.added[0]["peer_data"]
         self.assertEqual(peer_data["peer_device"]["cpu_ram"], "32")
+        self.assertEqual(peer_data["peer_device"]["cpu_ram_available"], "20")
 
     def test_distributed_probe_manual_peer_fallback_keeps_memory_unknown(self) -> None:
         class FakeClient:
@@ -570,6 +573,14 @@ class TestDistributedShardLogging(unittest.TestCase):
 
         peer_data = client.added[0]["peer_data"]
         self.assertEqual(peer_data["peer_device"]["cpu_ram"], "")
+        self.assertEqual(peer_data["peer_device"]["cpu_ram_available"], "")
+
+    def test_peer_memory_bytes_prefers_available_memory(self) -> None:
+        cpu_peer = SimpleNamespace(tg_device="cpu", cpu_ram="64", cpu_ram_available="5")
+        gpu_peer = SimpleNamespace(tg_device="cuda", gpu_vram="24", gpu_vram_available="8", cpu_ram="64")
+
+        self.assertEqual(distributed_inference._peer_memory_bytes(cpu_peer), (_gib(5), "RAM"))
+        self.assertEqual(distributed_inference._peer_memory_bytes(gpu_peer), (_gib(8), "VRAM"))
 
     def test_estimate_model_weight_profile_uses_safetensor_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -641,7 +652,10 @@ class TestDistributedShardLogging(unittest.TestCase):
                 SimpleNamespace(peer_client_id="peer-2", ip_address="192.168.0.30", gpu_vram="10B", cpu_ram="0"),
             ]
 
-            with patch.dict(os.environ, {"TC_SHARD_MEMORY_FRACTION": "1.0"}):
+            with patch.dict(
+                os.environ,
+                {"TC_SHARD_MEMORY_FRACTION": "1.0", "TC_SHARD_RUNTIME_OVERHEAD_FACTOR": "1.0"},
+            ):
                 planned = distributed_inference.planned_peer_shards(
                     peers,
                     model_name="demo",
@@ -710,6 +724,90 @@ class TestDistributedShardLogging(unittest.TestCase):
         self.assertEqual(plan["local_shard"].end_layer, 4)
         self.assertEqual(plan["remote_peers"][0].shard.start_layer, 4)
         self.assertEqual(plan["remote_peers"][0].shard.end_layer, 8)
+
+    def test_build_peer_load_plan_refreshes_remote_available_memory(self) -> None:
+        class FakeLocalPeer(SimpleNamespace):
+            def refresh_host_info(self):
+                self.cpu_ram_available = "10"
+
+        self_peer = FakeLocalPeer(
+            peer_client_id="self",
+            ip_address="192.168.0.10",
+            port=8765,
+            tg_device="cpu",
+            gpu_vram="",
+            cpu_ram="64",
+            cpu_ram_available="1",
+            gpu_flops=0.0,
+        )
+        remote_peer = SimpleNamespace(
+            peer_client_id="peer-1",
+            ip_address="192.168.0.20",
+            port=8765,
+            tg_device="cpu",
+            gpu_vram="",
+            cpu_ram="64",
+            cpu_ram_available="1",
+            gpu_flops=0.0,
+        )
+
+        class FakePeerClient:
+            peer_client_id = "self"
+
+            def __init__(self) -> None:
+                self.peer_device = self_peer
+                self.calls: list[dict[str, object]] = []
+                self.peers = [self_peer, remote_peer]
+
+            def get_peers(self, include_self=True):
+                return list(self.peers if include_self else self.peers[1:])
+
+            def send_payload(self, message, *, expect_reply=True, address=None, timeout=None):
+                self.calls.append(
+                    {
+                        "message": message,
+                        "expect_reply": expect_reply,
+                        "address": address,
+                        "timeout": timeout,
+                    }
+                )
+                return {
+                    "peer_client_id": "peer-1",
+                    "address": "192.168.0.20",
+                    "port": 8765,
+                    "peer_device": {
+                        "peer_client_id": "peer-1",
+                        "ip_address": "192.168.0.20",
+                        "port": 8765,
+                        "tg_device": "cpu",
+                        "cpu_ram": "64",
+                        "cpu_ram_available": "12",
+                        "gpu_vram": "",
+                        "gpu_vram_available": "",
+                        "gpu_flops": 0.0,
+                    },
+                }
+
+            def add_peer(self, peer_data, source_address=None):
+                del source_address
+                peer_device = peer_data["peer_device"]
+                remote_peer.cpu_ram = peer_device["cpu_ram"]
+                remote_peer.cpu_ram_available = peer_device["cpu_ram_available"]
+
+        client = FakePeerClient()
+
+        with patch.dict(os.environ, {"TC_PEER_INFO_TIMEOUT_SECONDS": "2.5"}, clear=False):
+            plan = distributed_inference.build_peer_load_plan(
+                client,
+                model_name="demo",
+                total_layers=9,
+            )
+
+        self.assertTrue(plan["distributed"])
+        self.assertEqual(self_peer.cpu_ram_available, "10")
+        self.assertEqual(remote_peer.cpu_ram_available, "12")
+        self.assertEqual(client.calls[0]["message"]["command"], "peer_info")
+        self.assertEqual(client.calls[0]["timeout"], 2.5)
 
     def test_planned_peer_shards_limits_distribution_to_transformer_layer_count(self) -> None:
         peers = [

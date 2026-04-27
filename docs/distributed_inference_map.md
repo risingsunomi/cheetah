@@ -14,9 +14,10 @@
 User prompt
   -> TUI or distributed_probe tokenizes prompt
   -> build_peer_load_plan()
+      -> refresh local and remote peer_info resource snapshots
       -> planned_peer_shards()
       -> estimate_model_weight_profile() from safetensors metadata when model files are local
-      -> weight-aware contiguous layer split by usable peer RAM/VRAM
+      -> weight-aware contiguous layer split by available peer RAM/VRAM
       -> local shard + remote shard assignments
   -> local load_model_for_backend(..., shard=local_shard)
   -> remote load_model command per peer
@@ -65,9 +66,11 @@ step > 0: prefill=false
 - When safetensors files are available locally, orchestration estimates loaded weight bytes before assigning shards.
 - Transformer layer tensors are counted per layer; non-layer tensors such as embeddings, final norm, and lm_head are treated as shared replicated weight cost for every used node.
 - Planning also reserves KV/context cache per transformer layer using the model's configured `max_seq_len`, `num_kv_heads`, and `head_dim`, matching the cache buffers allocated by the runtime today.
-- Peer capacity uses reported `gpu_vram` when present, otherwise `cpu_ram`.
+- Before planning, orchestration asks each peer for fresh `peer_info` so shard decisions use current available RAM/VRAM instead of stale startup totals.
+- Peer capacity uses reported available `gpu_vram` when present, otherwise available `cpu_ram`; if available values are missing it falls back to total reported memory.
 - `distributed_probe --peer` asks the peer for `peer_info` so manual peers use real RAM/VRAM instead of a placeholder.
 - `TC_SHARD_MEMORY_FRACTION` reserves headroom from reported memory; default is `0.85`.
+- `TC_SHARD_RUNTIME_OVERHEAD_FACTOR` adds decode-time headroom on top of weights and KV cache; default is `1.30`.
 - If weight metadata is unavailable, planning falls back to memory-proportional layer counts.
 
 Example for 16 transformer layers on two nodes:

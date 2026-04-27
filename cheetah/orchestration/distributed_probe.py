@@ -89,8 +89,7 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--repetition-penalty", type=float, default=1.0)
     generate.add_argument("--stream", action="store_true", help="stream decoded text as tokens arrive")
     generate.add_argument(
-        "--trace-tensors",
-        action="store_true",
+        "--trace-tens_true",
         default=_env_flag("TC_TRACE_TENSOR_TRANSFERS"),
         help="print distributed tensor transfer shapes, sizes, and remote KV cache positions",
     )
@@ -712,7 +711,9 @@ def _add_manual_peer(client: PeerClient, peer_spec: str, *, backend: str) -> Non
             "port": port,
             "tg_device": get_backend_device(backend, default="CPU") or "CPU",
             "cpu_ram": "",
+            "cpu_ram_available": "",
             "gpu_vram": "",
+            "gpu_vram_available": "",
             "gpu_flops": 0.0,
         },
     }
@@ -721,7 +722,7 @@ def _add_manual_peer(client: PeerClient, peer_spec: str, *, backend: str) -> Non
             {"command": "peer_info", "payload": {"sender_peer_id": client.peer_client_id}},
             expect_reply=True,
             address=(host, port),
-            timeout=os.getenv("TC_PAYLOAD_TIMEOUT_SECONDS") or 1000.0,
+            timeout=os.getenv("TC_PEER_INFO_TIMEOUT_SECONDS") or os.getenv("TC_PAYLOAD_TIMEOUT_SECONDS") or 3.0,
         )
     except Exception:
         response = {}
