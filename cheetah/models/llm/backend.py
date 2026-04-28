@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
 import os
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 LLM_BACKEND_ENV = "TC_LLM_BACKEND"
@@ -17,6 +20,22 @@ _BACKEND_DEVICE_ENVS = {
 _BACKEND_DEFAULT_DEVICES = {
     "tinygrad": "CPU",
     "torch": "cpu",
+}
+_TOKENIZER_FINGERPRINT_FILES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "merges.txt",
+    "vocab.json",
+)
+RUNTIME_FINGERPRINT_PROTOCOL = 2
+_MODEL_CONFIG_RUNTIME_ONLY_KEYS = {
+    "temperature",
+    "max_new_tokens",
+    "top_k",
+    "top_p",
+    "repetition_penalty",
 }
 
 
@@ -133,6 +152,67 @@ def backend_model_config_class(backend: str | None = None):
     return backend_model_config_module(backend=backend).ModelConfig
 
 
+def model_config_fingerprint(model_config: Any) -> str:
+    normalized = _json_safe_value(_stable_model_config_view(model_config))
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def model_config_file_fingerprint(model_path: str | Path | None) -> str:
+    return _asset_fingerprint(model_path, ("config.json",))
+
+
+def tokenizer_assets_fingerprint(model_path: str | Path | None) -> str:
+    return _asset_fingerprint(model_path, _TOKENIZER_FINGERPRINT_FILES)
+
+
+def runtime_asset_fingerprints(
+    *,
+    model_config: Any,
+    model_path: str | Path | None,
+) -> dict[str, str]:
+    config_fingerprint = model_config_file_fingerprint(model_path)
+    if not config_fingerprint:
+        config_fingerprint = model_config_fingerprint(model_config)
+    return {
+        "config_fingerprint": config_fingerprint,
+        "tokenizer_fingerprint": tokenizer_assets_fingerprint(model_path),
+    }
+
+
+async def resolve_model_assets_for_backend(
+    model_id: str,
+    *,
+    offline_mode: bool = False,
+    backend: str | None = None,
+    progress_callback: Callable[[str], Awaitable[None] | None] | None = None,
+) -> tuple[dict[str, Any], Path]:
+    from cheetah.repos import RepoCustom
+
+    selected_backend = normalize_llm_backend(backend or os.getenv(LLM_BACKEND_ENV))
+    sanitized = model_id.replace("/", "__")
+    cache_path = (Path.home() / ".cache" / "cheetah_models") / sanitized
+    candidate_path = Path(model_id).expanduser()
+
+    resolved_path: Path | None = None
+    if candidate_path.exists():
+        resolved_path = candidate_path
+    elif cache_path.exists():
+        resolved_path = cache_path
+
+    helpers = backend_helpers_module(backend=selected_backend)
+    if resolved_path is not None and any(resolved_path.glob("*.*")):
+        model_config = helpers.load_model_config(resolved_path)
+        return model_config, resolved_path
+
+    if offline_mode:
+        raise FileNotFoundError(f"Model {model_id} not found in offline mode")
+
+    model_repo = RepoCustom(model_id, backend=selected_backend)
+    model_path, model_config, _ = await model_repo.download(progress_callback=progress_callback)
+    return model_config, model_path
+
+
 async def load_model_for_backend(
     model_id: str,
     shard: Any = None,
@@ -175,3 +255,43 @@ def detect_quantization_mode(model_config: Any, backend: str | None = None) -> t
     if quant_type:
         parts.append(quant_type)
     return True, " ".join(parts)
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(val) for key, val in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _asset_fingerprint(model_path: str | Path | None, filenames: tuple[str, ...]) -> str:
+    if model_path is None:
+        return ""
+    root = Path(model_path).expanduser()
+    if not root.exists():
+        return ""
+
+    digest = hashlib.sha256()
+    found = False
+    for filename in filenames:
+        candidate = root / filename
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        digest.update(filename.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(candidate.read_bytes())
+        found = True
+    return digest.hexdigest() if found else ""
+
+
+def _stable_model_config_view(model_config: Any) -> Any:
+    if not isinstance(model_config, dict):
+        return model_config
+    return {
+        key: value
+        for key, value in model_config.items()
+        if str(key) not in _MODEL_CONFIG_RUNTIME_ONLY_KEYS
+    }

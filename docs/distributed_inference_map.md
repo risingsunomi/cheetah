@@ -1,0 +1,180 @@
+# Distributed Inference Map
+
+## Entry Points
+
+- TUI chat and agent screens prepare prompts, tokenize, and render streamed tokens.
+- `cheetah.orchestration.distributed_inference` owns shard planning, peer model loading, peer RPC generation, and local fallback generation.
+- `cheetah.orchestration.model_engine.ModelEngine` owns one shard step: run local layers, serialize hidden state, or sample from final logits.
+- `cheetah.orchestration.peer_client.PeerClient` owns TCP commands: `load_model`, `generate_token`, and `clear_model`.
+- `cheetah.orchestration.distributed_probe` is the no-TUI test runner.
+
+## Runtime Flow
+
+```text
+User prompt
+  -> TUI or distributed_probe tokenizes prompt
+  -> build_peer_load_plan()
+      -> refresh local and remote peer_info resource snapshots
+      -> planned_peer_shards()
+      -> estimate_model_weight_profile() from safetensors metadata when model files are local
+      -> weight-aware contiguous layer split by available peer RAM/VRAM
+      -> local shard + remote shard assignments
+  -> local load_model_for_backend(..., shard=local_shard)
+  -> remote load_model command per peer
+      -> PeerClient._handle_load_model_request()
+      -> load_model_for_backend(..., shard=remote_shard)
+      -> register_generation_runtime()
+  -> validate_peer_runtime_fingerprints()
+  -> streaming_generate_with_peers()
+```
+
+## Per Token Flow
+
+```text
+step 0: prefill=true
+  local ModelEngine.get_tokens()
+    -> run local shard over full prompt
+    -> if non-final: return encoded hidden_state + mask + positions
+    -> if final: sample token locally
+
+  for each remote peer in order
+    -> generate_token RPC
+    -> PeerClient decodes tensors for selected backend
+    -> remote ModelEngine.get_tokens()
+    -> run remote shard
+    -> non-final peer returns hidden_state
+    -> final peer samples token
+
+step > 0: prefill=false
+  local shard receives previous generated token
+  local appends attention_mask for that token
+  remote final shard samples the next token
+  sampled token is appended to input_list and seen_tokens
+```
+
+## Shard Convention
+
+- `start_layer` is inclusive.
+- `end_layer` is exclusive for transformer layers.
+- `total_layers = num_transformer_layers + 1`.
+- The extra virtual layer is the final norm/lm_head stage.
+- A final transformer shard has `end_layer >= total_layers - 1`.
+- Full local model load uses `Shard(model, 0, num_layers, num_layers + 1)`.
+
+## Shard Planning
+
+- When safetensors files are available locally, orchestration estimates loaded weight bytes before assigning shards.
+- Transformer layer tensors are counted per layer; non-layer tensors such as embeddings, final norm, and lm_head are treated as shared replicated weight cost for every used node.
+- Planning also reserves KV/context cache per transformer layer using the model's configured `max_seq_len`, `num_kv_heads`, and `head_dim`, matching the cache buffers allocated by the runtime today.
+- Before planning, orchestration asks each peer for fresh `peer_info` so shard decisions use current available RAM/VRAM instead of stale startup totals.
+- Peer capacity uses reported available `gpu_vram` when present, otherwise available `cpu_ram`; if available values are missing it falls back to total reported memory.
+- `distributed_probe --peer` asks the peer for `peer_info` so manual peers use real RAM/VRAM instead of a placeholder.
+- `TC_SHARD_MEMORY_FRACTION` reserves headroom from reported memory; default is `0.85`.
+- `TC_SHARD_RUNTIME_OVERHEAD_FACTOR` adds decode-time headroom on top of weights and KV cache; default is `1.30`.
+- If weight metadata is unavailable, planning falls back to memory-proportional layer counts.
+
+Example for 16 transformer layers on two nodes:
+
+```text
+local:  start=0  end=8   total=17
+remote: start=8  end=16  total=17
+final remote applies norm + lm_head because end=16 == total-1
+```
+
+## Tensor Transport
+
+- `ModelEngine._encode_tensor()` serializes tensors as base64 + shape + dtype.
+- `ModelEngine._decode_tensor()` reconstructs tensors for the requested backend.
+- Tinygrad decoded tensors are placed on `TC_TINYGRAD_DEVICE` or CPU.
+- Torch bfloat16 payloads are reconstructed from raw bf16 bits through float32, then cast to `torch.bfloat16`.
+- Peer runtime fingerprints check config and tokenizer assets before generation.
+
+## Important Invariants
+
+- Generation should use the shard assignments loaded into memory, not silently re-plan around newly discovered peers.
+- Sharded model loading must map local layer keys to global checkpoint keys. For example, shard `12:24` local `layers.0.*` must load checkpoint `model.layers.12.*`.
+- Prefill resets KV cache on each shard.
+- Decode does not reset KV cache.
+- Attention mask is one token behind before the local shard processes the previous sampled token; the local shard appends it for decode.
+- Sampling happens only on the final shard.
+- `seen_tokens` is carried with the request so repetition penalties are applied at the final shard.
+
+## No-TUI Probe
+
+`distributed_probe` loads `.env` like `main.py`, so `TC_LLM_BACKEND`, `TC_TORCH_DEVICE`, and `TC_TRACE_TENSOR_TRANSFERS` apply unless overridden by flags.
+
+Probe generation defaults are deterministic: `temperature=0`, `top_k=0`, and `top_p=1`. The TUI uses the model/env generation config and includes the active system prompt plus chat history. To compare TUI behavior against a passing probe, use a fresh chat log and set the TUI Gen Config to the same sampler values.
+
+Start a peer node:
+
+```bash
+python -m cheetah.orchestration.distributed_probe serve \
+  --backend tinygrad \
+  --device CPU \
+  --bind 0.0.0.0 \
+  --port 8765 \
+  --peer-id node-b
+```
+
+Run generation from the driver node:
+
+```bash
+python -m cheetah.orchestration.distributed_probe generate \
+  --backend tinygrad \
+  --device CPU \
+  --port 8766 \
+  --peer node-b@192.168.0.5:8765 \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --prompt "Explain why the sky is blue in one paragraph." \
+  --max-new-tokens 64 \
+  --temperature 0 \
+  --trace-tensors
+```
+
+Torch uses the same script:
+
+```bash
+python -m cheetah.orchestration.distributed_probe serve \
+  --backend torch \
+  --device cpu \
+  --port 8765 \
+  --peer-id node-b
+
+python -m cheetah.orchestration.distributed_probe generate \
+  --backend torch \
+  --device cpu \
+  --port 8766 \
+  --peer node-b@192.168.0.5:8765 \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --prompt "Write a concise test sentence." \
+  --max-new-tokens 32 \
+  --temperature 0 \
+  --trace-tensors
+```
+
+With `--trace-tensors`, the driver prints each local shard step and each peer request/response. During `phase=prefill`, the remote peer should report `kv_cache min=<prompt_length> max=<prompt_length>`. During each decode step, that value should advance by one. If decode starts with the wrong cache position, distributed inference now raises a `Shard KV cache is not primed for decode` error instead of continuing into gibberish.
+
+Compare the shard path without networking:
+
+```bash
+python -m cheetah.orchestration.distributed_probe compare-local \
+  --backend torch \
+  --device cpu \
+  --model Qwen/Qwen2.5-0.5B \
+  --prompt "Say hello in five words." \
+  --max-new-tokens 8 \
+  --temperature 0 \
+  --offline \
+  --parts 2
+```
+
+`compare-local` first generates with the full model, then reloads the same model as local shards and runs the same hidden-state handoff in one process. If this fails, the bug is in shard loading or shard execution. If it passes but distributed generation fails, inspect peer runtime, tensor transport, stale serve processes, or cache traces.
+
+## Files To Read
+
+- `cheetah/orchestration/distributed_inference.py`
+- `cheetah/orchestration/model_engine.py`
+- `cheetah/orchestration/peer_client.py`
+- `cheetah/orchestration/distributed_probe.py`
+- `cheetah/models/llm/tinygrad/model.py`
+- `cheetah/models/llm/torch/model.py`

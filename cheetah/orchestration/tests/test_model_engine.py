@@ -1,12 +1,22 @@
 import asyncio
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
 
-from cheetah.orchestration.model_engine import ModelEngine
+from cheetah.orchestration.model_engine import ModelEngine, _decode_tensor, _encode_tensor
 from cheetah.orchestration.cdevice import CDevice
 from cheetah.models.shard import Shard
 from cheetah.models.llm.backend import backend_helpers_module, backend_model_class, get_backend_device
 from cheetah.repos import RepoCustom
+
+try:
+    import tinygrad as tg
+except Exception:
+    tg = None
+try:
+    import torch
+except Exception:
+    torch = None
 
 
 class TestModelEngine(unittest.TestCase):
@@ -20,9 +30,143 @@ class TestModelEngine(unittest.TestCase):
         shards = ModelEngine.plan_shards(peers, "demo", total_layers=12)
         self.assertEqual(len(shards), 3)
         self.assertEqual(shards[0].start_layer, 0)
-        self.assertEqual(shards[-1].end_layer, 12)
+        self.assertEqual(shards[0].end_layer, 4)
+        self.assertEqual(shards[1].start_layer, 4)
+        self.assertEqual(shards[1].end_layer, 8)
+        self.assertEqual(shards[2].start_layer, 8)
+        self.assertEqual(shards[-1].end_layer, 11)
+        self.assertEqual(shards[-1].total_layers, 12)
         for peer in peers:
             self.assertIsNotNone(peer.shard)
+
+    def test_get_tokens_prefill_runs_requested_shard_without_sampling(self):
+        if tg is None:
+            self.skipTest("tinygrad is required for this test.")
+
+        class FakeShardModel:
+            def __init__(self) -> None:
+                self.reset_calls = 0
+                self.calls: list[dict[str, object]] = []
+
+            def reset_kv_cache(self) -> None:
+                self.reset_calls += 1
+
+            def run_shard(
+                self,
+                x,
+                *,
+                attention_mask=None,
+                position_ids=None,
+                hidden_state=None,
+                shard=None,
+                start_pos=None,
+            ):
+                self.calls.append(
+                    {
+                        "x": x,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "hidden_state": hidden_state,
+                        "shard": shard,
+                        "start_pos": start_pos,
+                    }
+                )
+                return tg.Tensor.ones((1, attention_mask.shape[1], 4))
+
+        engine = ModelEngine(shard=Shard("demo", start_layer=0, end_layer=2, total_layers=5))
+        model = FakeShardModel()
+        input_ids = tg.Tensor([[1, 2, 3]], dtype=tg.dtypes.int32)
+        attention_mask = tg.Tensor([[1, 1, 1]], dtype=tg.dtypes.int32)
+
+        payload = engine.get_tokens(
+            model,
+            input_ids,
+            attention_mask,
+            SimpleNamespace(eos_token_id=99),
+            prefill=True,
+        )
+
+        self.assertEqual(model.reset_calls, 1)
+        self.assertIn("hidden_state", payload)
+        self.assertFalse(payload["end_token"])
+        self.assertEqual(len(model.calls), 1)
+        call = model.calls[0]
+        assert isinstance(call["position_ids"], tg.Tensor)
+        self.assertEqual(tuple(call["position_ids"].shape), (1, 3))
+        self.assertIsNone(call["start_pos"])
+        shard = call["shard"]
+        self.assertIsNotNone(shard)
+        assert shard is not None
+        self.assertEqual(shard.start_layer, 0)
+        self.assertEqual(shard.end_layer, 2)
+
+    def test_get_tokens_decode_uses_next_absolute_position_for_new_token(self):
+        if torch is None:
+            self.skipTest("torch is required for this test.")
+
+        class FakeShardModel:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def run_shard(
+                self,
+                x,
+                *,
+                attention_mask=None,
+                position_ids=None,
+                hidden_state=None,
+                shard=None,
+                start_pos=None,
+            ):
+                self.calls.append(
+                    {
+                        "x": x,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "hidden_state": hidden_state,
+                        "shard": shard,
+                        "start_pos": start_pos,
+                    }
+                )
+                return torch.ones((1, 1, 4), dtype=torch.float32)
+
+        engine = ModelEngine(shard=Shard("demo", start_layer=0, end_layer=1, total_layers=4))
+        model = FakeShardModel()
+        input_ids = torch.tensor([[10, 11, 12]], dtype=torch.long)
+        attention_mask = torch.tensor([[1, 1]], dtype=torch.long)
+
+        payload = engine.get_tokens(
+            model,
+            input_ids,
+            attention_mask,
+            SimpleNamespace(eos_token_id=99),
+            prefill=False,
+        )
+
+        self.assertIn("hidden_state", payload)
+        self.assertEqual(len(model.calls), 1)
+        call = model.calls[0]
+        assert isinstance(call["position_ids"], torch.Tensor)
+        assert isinstance(call["attention_mask"], torch.Tensor)
+        self.assertTrue(torch.equal(call["position_ids"].cpu(), torch.tensor([[2]], dtype=torch.long)))
+        self.assertEqual(tuple(call["attention_mask"].shape), (1, 3))
+        self.assertEqual(call["start_pos"], 2)
+
+    def test_encode_tensor_preserves_torch_bfloat16_for_network(self):
+        if torch is None:
+            self.skipTest("torch is required for this test.")
+
+        tensor = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3).to(dtype=torch.bfloat16)
+
+        payload = _encode_tensor(tensor)
+        self.assertEqual(payload["dtype"], "bfloat16")
+
+        decoded = _decode_tensor(payload, backend="torch")
+        self.assertIsNotNone(decoded)
+        assert decoded is not None
+        self.assertIsInstance(decoded, torch.Tensor)
+        self.assertEqual(decoded.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(decoded.cpu(), tensor.cpu()))
 
     def test_model_engine_loads_llama_3_2_1b(self):
         model_name = "unsloth/Llama-3.2-1B-Instruct"

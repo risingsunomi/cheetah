@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cheetah.tui.agent_screen import AgentScreen
-from cheetah.tui.helpers import MemoryPressureError
+from cheetah.orchestration.distributed_inference import MemoryPressureError
 
 
 class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
@@ -84,7 +84,8 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(
                 any(
-                    message["role"] == "assistant" and "ability=write_file" in message["content"]
+                    message["role"] == "assistant"
+                    and json.loads(message["content"])["ability"]["name"] == "write_file"
                     for message in screen._agent_messages
                 )
             )

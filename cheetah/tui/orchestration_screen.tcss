@@ -36,6 +36,7 @@
 
 #orch-hostmap,
 #orch-network,
+#orch-flow,
 #orch-help {
     border: round $primary;
     padding: 1;
@@ -43,4 +44,9 @@
 
 #orch-hostmap {
     height: 60%;
+}
+
+#orch-network,
+#orch-flow {
+    height: 1fr;
 }

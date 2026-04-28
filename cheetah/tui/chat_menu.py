@@ -18,6 +18,7 @@ from cheetah.models.llm.backend import (
     get_backend_device,
     get_llm_backend,
     load_model_for_backend,
+    resolve_model_assets_for_backend,
 )
 from cheetah.tui.widget.model_picker_screen import ModelPickerScreen
 from cheetah.tui.chat_log_storage import ChatLogStorage, ChatLogSummary, ChatMessage
@@ -25,11 +26,22 @@ from cheetah.orchestration.peer_client import PeerClient
 from cheetah.tui.orchestration_screen import OrchestrationScreen
 from cheetah.tui.help_screen import HelpScreen
 from cheetah.tui.helpers import (
-    MemoryPressureError,
     apply_chat_template_with_thinking,
     default_enable_thinking,
     memory_abort_reason,
     split_thinking_response,
+)
+from cheetah.orchestration.distributed_inference import (
+    MemoryPressureError,
+    build_peer_load_plan,
+    clear_model_shards_on_peers,
+    distributed_shard_log_messages,
+    format_shard_span,
+    load_model_shards_on_peers,
+    shard_plan_budget_errors,
+    streaming_generate_with_peers,
+    total_layers_from_model_config,
+    validate_peer_runtime_fingerprints,
 )
 
 from textual.app import ComposeResult
@@ -59,6 +71,26 @@ logger = get_logger(__name__)
 MAX_RESTORED_MESSAGES = 20
 MAX_SEQ_LEN = 2048
 MAX_RESP_LEN = 400
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 class ChatModelSelected(Message):
     def __init__(self, sender: MessagePump, model_id: str) -> None:
@@ -159,7 +191,6 @@ class ChatScreen(Screen[None]):
         if self._model_label is not None:
             self._model_label.update(self._model_id or "<select>")
         await self._initialize_chat_logs()
-        self._peer_client.set_generate_handler(self._handle_peer_generate_token_request)
         # Slow down peer discovery to avoid UI pauses while typing.
         await asyncio.to_thread(self._get_peer_count)
         self.set_interval(5.0, self._get_peer_count)
@@ -252,7 +283,7 @@ class ChatScreen(Screen[None]):
             persist=False,
         )
 
-    def _effective_gen_config(self) -> dict[str, float | int]:
+    def _effective_gen_config(self) -> dict[str, float | int | bool]:
         config = self._model_config if isinstance(self._model_config, dict) else {}
 
         def _as_float(value: Any, default: float) -> float:
@@ -282,12 +313,21 @@ class ChatScreen(Screen[None]):
 
         return {
             "max_new_tokens": _as_int(self._gen_overrides.get("max_new_tokens"), self._default_max_new_tokens()),
-            "temperature": _as_float(self._gen_overrides.get("temperature", config.get("temperature")), 1.0),
-            "top_k": _as_int(self._gen_overrides.get("top_k", config.get("top_k")), 0),
-            "top_p": _as_float(self._gen_overrides.get("top_p", config.get("top_p")), 0.8),
+            "temperature": _as_float(
+                self._gen_overrides.get("temperature", config.get("temperature")),
+                _env_float("TC_TEMP", 1.0),
+            ),
+            "top_k": _as_int(
+                self._gen_overrides.get("top_k", config.get("top_k")),
+                _env_int("TC_TOP_K", 35),
+            ),
+            "top_p": _as_float(
+                self._gen_overrides.get("top_p", config.get("top_p")),
+                _env_float("TC_TOP_P", 0.95),
+            ),
             "repetition_penalty": _as_float(
                 self._gen_overrides.get("repetition_penalty", config.get("repetition_penalty")),
-                1.0,
+                _env_float("TC_REPETITION_PENALTY", 1.0),
             ),
             "alpha_f": _as_float(self._gen_overrides.get("alpha_f", 0.0), 0.0),
             "alpha_p": _as_float(self._gen_overrides.get("alpha_p", 0.0), 0.0),
@@ -296,7 +336,7 @@ class ChatScreen(Screen[None]):
 
     def _context_window_tokens(self) -> int:
         config = self._model_config if isinstance(self._model_config, dict) else {}
-        configured = config.get("max_seq_len", MAX_SEQ_LEN)
+        configured = config.get("max_seq_len", _env_int("TC_MAX_SEQ_LEN", MAX_SEQ_LEN))
         
         try:
             context_window = int(configured)
@@ -310,6 +350,9 @@ class ChatScreen(Screen[None]):
 
     def _default_max_new_tokens(self) -> int:
         config = self._model_config if isinstance(self._model_config, dict) else {}
+        env_limit = os.getenv("TC_MAX_RESP_LEN")
+        if env_limit is not None and env_limit.strip():
+            return max(1, _env_int("TC_MAX_RESP_LEN", MAX_RESP_LEN))
         try:
             reserve_int = int(config.get("max_new_tokens", MAX_RESP_LEN))
         except (TypeError, ValueError):
@@ -431,11 +474,7 @@ class ChatScreen(Screen[None]):
         if self.app is None:
             return
         count = self._peer_client.peer_count()
-        if count > 1:
-            current = getattr(self.app, "sub_title", "")
-            new_title = f"[Nodes: {count}]"
-            if new_title != current:
-                self.app.title = new_title
+        self.app.title = f"[Nodes: {count}]"
     
     def _instruct_begin_chat(self) -> None:
         for history in self._history:
@@ -773,15 +812,26 @@ class ChatScreen(Screen[None]):
         from cheetah.orchestration.model_engine import ModelEngine
 
         backend = "torch" if self._llm_backend == "torch" else "tinygrad"
+        sender_peer_id = str(payload.get("sender_peer_id", "") or "").strip()
+        request_tokens = self._flow_token_count(payload)
+        if sender_peer_id:
+            self._record_peer_flow(sender_peer_id, self._peer_client.peer_client_id, request_tokens, phase="request")
+            self._mark_peer_seen(sender_peer_id)
 
         try:
             input_ids_data = self._payload_to_2d_list(payload.get("input_ids"))
             attention_mask_data = self._payload_to_2d_list(payload.get("attention_mask"))
+            position_ids_data = self._payload_to_2d_list(payload.get("position_ids"))
             hidden_state_data = self._payload_to_2d_list(payload.get("hidden_state"))
             hidden_state = None if hidden_state_data in ([], [[]]) else self._payload_to_tensor(
                 hidden_state_data,
                 backend=backend,
                 integer=False,
+            )
+            position_ids = None if position_ids_data in ([], [[]]) else self._payload_to_tensor(
+                position_ids_data,
+                backend=backend,
+                integer=True,
             )
 
             input_ids = self._payload_to_tensor(input_ids_data, backend=backend, integer=True)
@@ -804,12 +854,14 @@ class ChatScreen(Screen[None]):
                 shard = Shard(model_name, start_layer, end_layer, total_layers)
 
             engine = ModelEngine(shard=shard) if shard is not None else ModelEngine()
-            return engine.get_tokens(
+            response = engine.get_tokens(
                 self._model,
                 input_ids,
                 attention_mask,
                 self._tokenizer,
                 hidden_state=hidden_state,
+                position_ids=position_ids,
+                prefill=bool(payload.get("prefill", False)),
                 temp=float(payload.get("temp", 1.0) or 1.0),
                 top_k=int(payload.get("top_k", 0) or 0),
                 top_p=float(payload.get("top_p", 0.8) or 0.8),
@@ -817,7 +869,12 @@ class ChatScreen(Screen[None]):
                 alpha_p=float(payload.get("alpha_p", 0.0) or 0.0),
                 repetition_penalty=float(payload.get("repetition_penalty", 1.0) or 1.0),
                 seen_tokens=[int(tok) for tok in payload.get("seen_tokens", []) or []],
+                trace=bool(payload.get("trace", False)),
             )
+            if sender_peer_id:
+                response_tokens = self._flow_token_count(response)
+                self._record_peer_flow(self._peer_client.peer_client_id, sender_peer_id, response_tokens, phase="response")
+            return response
         except Exception as exc:
             logger.exception("Peer token generation failed: %s", exc)
             return {"error": str(exc)}
@@ -833,6 +890,63 @@ class ChatScreen(Screen[None]):
                 return value
             return [value]
         return [[]]
+
+    @staticmethod
+    def _flow_token_count(message: Any) -> int:
+        payload = message.get("payload", message) if isinstance(message, dict) else message
+        if not isinstance(payload, dict):
+            return 0
+        for key in ("attention_mask", "position_ids", "input_ids", "hidden_state"):
+            count = ChatScreen._token_count_from_payload_value(payload.get(key))
+            if count > 0:
+                return count
+        if payload.get("token") is not None or payload.get("tensor") is not None:
+            return 1
+        return 0
+
+    @staticmethod
+    def _token_count_from_payload_value(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, list):
+            if not value:
+                return 0
+            if isinstance(value[0], list):
+                return max((len(row) for row in value if isinstance(row, list)), default=0)
+            return len(value)
+        if isinstance(value, dict):
+            shape = value.get("shape")
+            if isinstance(shape, list) and shape:
+                index = 1 if len(shape) >= 2 else 0
+                try:
+                    return max(int(shape[index]), 0)
+                except (TypeError, ValueError):
+                    return 0
+        try:
+            shape = tuple(getattr(value, "shape", ()) or ())
+        except Exception:
+            shape = ()
+        if len(shape) >= 2:
+            try:
+                return max(int(shape[1]), 0)
+            except (TypeError, ValueError):
+                return 0
+        if len(shape) == 1:
+            try:
+                return max(int(shape[0]), 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _record_peer_flow(self, source: str, target: str, tokens: int, *, phase: str) -> None:
+        recorder = getattr(self._peer_client, "record_flow", None)
+        if callable(recorder):
+            recorder(source, target, tokens, phase=phase)
+
+    def _mark_peer_seen(self, peer_client_id: str) -> None:
+        marker = getattr(self._peer_client, "mark_peer_seen", None)
+        if callable(marker):
+            marker(peer_client_id)
 
     def _payload_to_tensor(self, data: list[list[Any]], *, backend: str, integer: bool) -> Any:
         if backend == "torch":
@@ -1148,28 +1262,135 @@ class ChatScreen(Screen[None]):
         return self._parse_log_item_id(getattr(widget, "id", None))
 
     async def _start_model_load(self) -> None:
-        # loaded_model = self._load_model()
+        peer_plan: dict[str, Any] | None = None
         try:
-            self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model()
+            preview_config, preview_model_path = await resolve_model_assets_for_backend(
+                model_id=self._model_id,
+                offline_mode=self._offline,
+                backend=self._llm_backend,
+                progress_callback=self._log_model_download_progress,
+            )
+            total_layers = total_layers_from_model_config(preview_config)
+            peer_plan = build_peer_load_plan(
+                self._peer_client,
+                model_name=self._model_id or "model",
+                total_layers=total_layers,
+                model_path=preview_model_path,
+                model_config=preview_config,
+                backend=self._llm_backend,
+            )
+            for line in distributed_shard_log_messages(
+                self._peer_client,
+                model_name=self._model_id or "model",
+                total_layers=total_layers,
+                model_path=preview_model_path,
+                model_config=preview_config,
+                backend=self._llm_backend,
+            ):
+                self._log_sys_msg(line)
+            budget_errors = peer_plan.get("budget_errors") or shard_plan_budget_errors(peer_plan.get("peers", []))
+            if budget_errors:
+                raise RuntimeError("Shard plan exceeds reported memory: " + "; ".join(budget_errors))
+
+            local_shard = peer_plan.get("local_shard") if peer_plan else None
+            self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model(
+                shard=local_shard,
+            )
         except Exception as exc:
+            self._clear_model(persist=False, clear_remote=False)
+            if peer_plan is not None and peer_plan.get("distributed"):
+                await asyncio.to_thread(
+                    clear_model_shards_on_peers,
+                    self._peer_client,
+                    peers=peer_plan.get("remote_peers"),
+                    model_id=self._model_id or "",
+                )
             self._log_sys_msg(f"Model load failed: {exc}\n traceback: {traceback.format_exc()}")
             self._set_load_button_enabled(True)
             if self._chat_input is not None:
                 self._chat_input.focus()
         else:
-            self._gen_overrides.pop("max_new_tokens", None)
-            self._model_is_quantized, quant_mode = detect_quantization_mode(
-                self._model_config,
-                backend=self._llm_backend,
-            )
-            mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
-            ready_msg = (
-                f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}."
-            )
-            self._log_sys_msg(ready_msg)
-            self._log_effective_gen_config()
-            self._model_loaded = True
-            self._set_load_button_enabled(True)
+            try:
+                self._gen_overrides.pop("max_new_tokens", None)
+                self._model_is_quantized, quant_mode = detect_quantization_mode(
+                    self._model_config,
+                    backend=self._llm_backend,
+                )
+                mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
+                local_shard = getattr(self._model, "shard", None)
+                if peer_plan is not None and peer_plan.get("distributed") and local_shard is not None:
+                    ready_msg = (
+                        f"Local shard ready in {elapsed:.1f}s. Backend: {self._llm_backend}. "
+                        f"Mode: {mode_label}. {format_shard_span(local_shard)}."
+                    )
+                else:
+                    ready_msg = (
+                        f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}."
+                    )
+                self._log_sys_msg(ready_msg)
+                self._log_effective_gen_config()
+                register_runtime = getattr(self._peer_client, "register_generation_runtime", None)
+                if callable(register_runtime):
+                    register_runtime(
+                        model=self._model,
+                        tokenizer=self._tokenizer,
+                        backend=self._llm_backend,
+                        model_id=self._model_id or "",
+                        model_config=self._model_config,
+                        model_path=str(self._model_cache_path or ""),
+                        shard=getattr(self._model, "shard", None),
+                    )
+                if peer_plan is not None and peer_plan.get("distributed"):
+                    remote_peer_count = len(peer_plan.get("remote_peers", []))
+                    if remote_peer_count > 0:
+                        self._log_sys_msg(f"Waiting for {remote_peer_count} peer shard(s) to finish loading...")
+                    peer_load_plan = await asyncio.to_thread(
+                        load_model_shards_on_peers,
+                        self._peer_client,
+                        model_id=self._model_id or "",
+                        backend=self._llm_backend,
+                        offline_mode=self._offline,
+                        total_layers=total_layers_from_model_config(self._model_config),
+                        peers=peer_plan.get("peers"),
+                        model_path=self._model_cache_path,
+                        model_config=self._model_config,
+                    )
+                    mismatches = validate_peer_runtime_fingerprints(
+                        peer_load_plan.get("remote_results", []),
+                        local_model_config=self._model_config,
+                        local_model_path=self._model_cache_path,
+                    )
+                    if mismatches:
+                        raise RuntimeError("; ".join(mismatches))
+                    for entry in peer_load_plan.get("remote_results", []):
+                        peer = entry.get("peer")
+                        response = entry.get("response", {}) if isinstance(entry.get("response"), dict) else {}
+                        label = self._peer_label_for_log(peer)
+                        status = "already ready" if response.get("already_loaded") else "ready"
+                        try:
+                            peer_elapsed = float(response.get("elapsed", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            peer_elapsed = 0.0
+                        shard = getattr(peer, "shard", None)
+                        self._log_sys_msg(f"{label} {status} in {peer_elapsed:.1f}s: {format_shard_span(shard)}.")
+                    self._log_sys_msg(
+                        f"Shard-aware model ready on {len(peer_plan.get('peers', []))} nodes."
+                    )
+                self._model_loaded = True
+                self._set_load_button_enabled(True)
+            except Exception as exc:
+                self._clear_model(persist=False, clear_remote=False)
+                if peer_plan is not None and peer_plan.get("distributed"):
+                    await asyncio.to_thread(
+                        clear_model_shards_on_peers,
+                        self._peer_client,
+                        peers=peer_plan.get("remote_peers"),
+                        model_id=self._model_id or "",
+                    )
+                self._log_sys_msg(f"Model load failed: {exc}\n traceback: {traceback.format_exc()}")
+                self._set_load_button_enabled(True)
+                if self._chat_input is not None:
+                    self._chat_input.focus()
 
     def _log_sys_msg(self, message: str, *, persist: bool = False) -> None:
         self._append_system(message, persist=persist)
@@ -1177,13 +1398,13 @@ class ChatScreen(Screen[None]):
     async def _log_model_download_progress(self, message: str) -> None:
         self._log_sys_msg(f"[download] {message}", persist=False)
 
-    async def _load_model(self) -> tuple[Any, object, AutoTokenizer, Path, float]:
+    async def _load_model(self, *, shard: Any = None) -> tuple[Any, object, AutoTokenizer, Path, float]:
         try:
             self._llm_backend = get_llm_backend()
             start = time.time()
             model, model_config, tokenizer, model_path = await load_model_for_backend(
                 model_id=self._model_id,
-                shard=None,
+                shard=shard,
                 weight_device=None,
                 offline_mode=self._offline,
                 backend=self._llm_backend,
@@ -1219,10 +1440,10 @@ class ChatScreen(Screen[None]):
         on_token: Optional[Callable[[int], None]] = None,
     ) -> tuple[list[int], float]:
         import tinygrad as tg
-        from cheetah.tui.helpers import streaming_generate_with_peers
 
-        input_ids = tg.Tensor(enc["input_ids"])
-        attention_mask = tg.Tensor(enc["attention_mask"])
+        device = get_backend_device("tinygrad", default="CPU")
+        input_ids = tg.Tensor(enc["input_ids"], device=device)
+        attention_mask = tg.Tensor(enc["attention_mask"], device=device)
 
         if hasattr(self._model, "reset_kv_cache"):
             self._model.reset_kv_cache()
@@ -1267,7 +1488,6 @@ class ChatScreen(Screen[None]):
         on_token: Optional[Callable[[int], None]] = None,
     ) -> tuple[list[int], float]:
         import torch
-        from cheetah.tui.helpers import streaming_generate_with_peers
 
         device = self._torch_runtime_device()
         input_ids = torch.tensor(enc["input_ids"], dtype=torch.long, device=device)
@@ -1312,7 +1532,23 @@ class ChatScreen(Screen[None]):
     def _memory_abort_reason(self) -> str | None:
         return memory_abort_reason("chat generation")
 
-    def _clear_model(self, *, persist: bool = False, reset_kv_cache: bool = False) -> None:
+    def _peer_label_for_log(self, peer: Any) -> str:
+        if peer is None:
+            return "peer"
+        peer_id = str(getattr(peer, "peer_client_id", "") or "peer").strip()
+        host = str(getattr(peer, "ip_address", "") or getattr(peer, "address", "")).strip()
+        if not host or host == peer_id:
+            return peer_id
+        return f"{peer_id} ({host})"
+
+    def _clear_model(
+        self,
+        *,
+        persist: bool = False,
+        reset_kv_cache: bool = False,
+        clear_remote: bool = True,
+    ) -> None:
+        existing_model = getattr(self, "_model", None)
         if persist:
             self._log_sys_msg("Clearing loaded model.", persist=True)
         if (
@@ -1322,6 +1558,25 @@ class ChatScreen(Screen[None]):
             and hasattr(self._model, "reset_kv_cache")
         ):
             self._model.reset_kv_cache()
+        clear_runtime = getattr(self._peer_client, "clear_generation_runtime", None)
+        if callable(clear_runtime):
+            clear_runtime(model=existing_model)
+        if clear_remote:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                clear_model_shards_on_peers(
+                    self._peer_client,
+                    model_id=self._model_id or "",
+                )
+            else:
+                loop.create_task(
+                    asyncio.to_thread(
+                        clear_model_shards_on_peers,
+                        self._peer_client,
+                        model_id=self._model_id or "",
+                    )
+                )
         self._model = None
         self._model_config = None
         self._tokenizer = None

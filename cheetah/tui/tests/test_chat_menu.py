@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from cheetah.tui.chat_menu import ChatScreen
 
@@ -53,6 +54,40 @@ class TestChatScreenGenerationLimits(unittest.TestCase):
 
         self.assertEqual(screen._effective_gen_config()["max_new_tokens"], 320)
 
+    def test_effective_gen_config_uses_env_sampler_defaults(self) -> None:
+        screen = ChatScreen(peer_client=object())
+
+        with patch.dict(
+            "os.environ",
+            {
+                "TC_TEMP": "0",
+                "TC_TOP_K": "0",
+                "TC_TOP_P": "1",
+                "TC_REPETITION_PENALTY": "1.05",
+            },
+        ):
+            effective = screen._effective_gen_config()
+
+        self.assertEqual(effective["temperature"], 0.0)
+        self.assertEqual(effective["top_k"], 0)
+        self.assertEqual(effective["top_p"], 1.0)
+        self.assertEqual(effective["repetition_penalty"], 1.05)
+
+    def test_generation_limits_use_env_defaults(self) -> None:
+        screen = ChatScreen(peer_client=object())
+
+        with patch.dict("os.environ", {"TC_MAX_SEQ_LEN": "1024", "TC_MAX_RESP_LEN": "96"}):
+            self.assertEqual(screen._context_window_tokens(), 1024)
+            self.assertEqual(screen._response_reserve_tokens(512), 96)
+
+    def test_max_response_env_overrides_model_generation_limit(self) -> None:
+        screen = ChatScreen(peer_client=object())
+        screen._model_config = {"max_new_tokens": 2048, "max_seq_len": 2048}
+
+        with patch.dict("os.environ", {"TC_MAX_RESP_LEN": "192"}):
+            self.assertEqual(screen._effective_gen_config()["max_new_tokens"], 192)
+            self.assertEqual(screen._response_reserve_tokens(2048), 192)
+
     def test_response_reserve_tokens_prefers_chat_gen_override(self) -> None:
         screen = ChatScreen(peer_client=object())
         screen._model_config = {"max_new_tokens": 192, "max_seq_len": 2048}
@@ -89,12 +124,19 @@ class TestChatScreenModelLoad(unittest.IsolatedAsyncioTestCase):
         log_messages: list[str] = []
         screen._log_sys_msg = lambda message, **kwargs: log_messages.append(message)
 
-        async def fake_load_model():
+        async def fake_load_model(*, shard=None):
+            self.assertIsNone(shard)
             return object(), {"max_seq_len": 640}, object(), "/tmp/model", 0.5
 
         screen._load_model = fake_load_model
 
-        with patch("cheetah.tui.chat_menu.detect_quantization_mode", return_value=(False, "standard")):
+        with (
+            patch(
+                "cheetah.tui.chat_menu.resolve_model_assets_for_backend",
+                new=AsyncMock(return_value=({"max_seq_len": 640}, Path("/tmp/model"))),
+            ),
+            patch("cheetah.tui.chat_menu.detect_quantization_mode", return_value=(False, "standard")),
+        ):
             await screen._start_model_load()
 
         self.assertNotIn("max_new_tokens", screen._gen_overrides)
@@ -102,6 +144,92 @@ class TestChatScreenModelLoad(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(screen._effective_gen_config()["max_new_tokens"], 400)
         self.assertIn("Model ready in 0.5s. Backend: tinygrad. Mode: standard.", log_messages)
         self.assertIn("Gen config updated: context_window=640, max_new_tokens=400, temp=0.3", log_messages[1])
+
+    async def test_start_model_load_uses_local_shard_and_waits_for_peers(self) -> None:
+        self_peer = SimpleNamespace(
+            peer_client_id="self",
+            ip_address="192.168.0.10",
+            port=8765,
+            gpu_vram="8",
+            cpu_ram="8",
+            gpu_flops=0.0,
+        )
+        remote_peer = SimpleNamespace(
+            peer_client_id="peer-1",
+            ip_address="192.168.0.20",
+            port=8765,
+            gpu_vram="8",
+            cpu_ram="8",
+            gpu_flops=0.0,
+        )
+        runtime_calls: list[dict[str, object]] = []
+        peer_client = SimpleNamespace(
+            peer_client_id="self",
+            get_peers=lambda include_self=True: [self_peer, remote_peer] if include_self else [remote_peer],
+            register_generation_runtime=lambda **kwargs: runtime_calls.append(kwargs),
+            clear_generation_runtime=lambda **kwargs: None,
+        )
+        screen = ChatScreen(peer_client=peer_client)
+        screen._model_id = "demo/model"
+        screen._set_load_button_enabled = lambda enabled: None
+        log_messages: list[str] = []
+        screen._log_sys_msg = lambda message, **kwargs: log_messages.append(message)
+
+        captured: dict[str, object] = {}
+
+        async def fake_load_model(*, shard=None):
+            captured["shard"] = shard
+            return (
+                SimpleNamespace(shard=shard),
+                {"num_layers": 8, "max_seq_len": 640},
+                object(),
+                Path("/tmp/model"),
+                0.5,
+            )
+
+        screen._load_model = fake_load_model
+
+        with (
+            patch(
+                "cheetah.tui.chat_menu.resolve_model_assets_for_backend",
+                new=AsyncMock(return_value=({"num_layers": 8, "max_seq_len": 640}, Path("/tmp/model"))),
+            ),
+            patch("cheetah.tui.chat_menu.detect_quantization_mode", return_value=(False, "standard")),
+            patch(
+                "cheetah.tui.chat_menu.load_model_shards_on_peers",
+                return_value={
+                    "remote_results": [
+                        {
+                            "peer": remote_peer,
+                            "response": {
+                                "elapsed": 1.2,
+                                "already_loaded": False,
+                                "config_fingerprint": "match-config",
+                                "tokenizer_fingerprint": "match-tokenizer",
+                            },
+                        }
+                    ]
+                },
+            ) as load_peers,
+            patch(
+                "cheetah.tui.chat_menu.validate_peer_runtime_fingerprints",
+                return_value=[],
+            ) as validate_fingerprints,
+        ):
+            await screen._start_model_load()
+
+        shard = captured.get("shard")
+        self.assertIsNotNone(shard)
+        assert shard is not None
+        self.assertEqual(shard.start_layer, 0)
+        self.assertEqual(shard.end_layer, 4)
+        self.assertTrue(screen._model_loaded)
+        load_peers.assert_called_once()
+        validate_fingerprints.assert_called_once()
+        self.assertEqual(runtime_calls[0]["model_id"], "demo/model")
+        self.assertEqual(runtime_calls[0]["shard"].start_layer, 0)
+        self.assertIn("Waiting for 1 peer shard(s) to finish loading...", log_messages)
+        self.assertIn("Shard-aware model ready on 2 nodes.", log_messages)
 
 
 class TestChatScreenLogSelection(unittest.IsolatedAsyncioTestCase):

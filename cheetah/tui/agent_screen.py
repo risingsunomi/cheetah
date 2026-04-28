@@ -34,16 +34,27 @@ from cheetah.models.llm.backend import (
     get_backend_device,
     get_llm_backend,
     load_model_for_backend,
+    resolve_model_assets_for_backend,
 )
 from cheetah.orchestration.peer_client import PeerClient
 from cheetah.tui.help_screen import HelpScreen
 from cheetah.tui.helpers import (
-    MemoryPressureError,
     apply_chat_template_with_thinking,
     default_enable_thinking,
     memory_abort_reason,
     relieve_memory_pressure,
+)
+from cheetah.orchestration.distributed_inference import (
+    MemoryPressureError,
+    build_peer_load_plan,
+    clear_model_shards_on_peers,
+    distributed_shard_log_messages,
+    format_shard_span,
+    load_model_shards_on_peers,
+    shard_plan_budget_errors,
     streaming_generate_with_peers,
+    total_layers_from_model_config,
+    validate_peer_runtime_fingerprints,
 )
 from cheetah.tui.widget.model_picker_screen import ModelPickerScreen
 
@@ -88,6 +99,7 @@ class AgentScreen(Screen[None]):
         self._agent_name: str = (os.getenv("TC_AGENT_NAME") or "cot-agent").strip() or "cot-agent"
         self._agent_instructions: str = (os.getenv("TC_AGENT_INSTRUCTIONS") or "").strip()
         self._endless_mode: bool = self._env_flag("TC_AGENT_ENDLESS_MODE", False)
+        self._agent_max_steps: int = self._env_int("TC_AGENT_MAX_STEPS", 10, minimum=1)
         prompt_name = os.getenv("TC_AGENT_SYSTEM_PROMPT") or PROMPT_TEMPLATE_NAME
         try:
             self._agent_prompt_name: str = normalize_prompt_name(prompt_name)
@@ -182,6 +194,9 @@ class AgentScreen(Screen[None]):
                         with Container(classes="agent-gen-row"):
                             yield Label("Alpha P", classes="agent-gen-label")
                             yield self._make_gen_input("alpha_p", effective["alpha_p"])
+                        with Container(classes="agent-gen-row"):
+                            yield Label("Max Steps", classes="agent-gen-label")
+                            yield self._make_gen_input("max_steps", effective["max_steps"])
                         thinking_checkbox = Checkbox("Enable Thinking", id="agent-gen-enable-thinking")
                         thinking_checkbox.value = bool(effective["enable_thinking"])
                         self._thinking_checkbox = thinking_checkbox
@@ -244,6 +259,7 @@ class AgentScreen(Screen[None]):
                 "Agent Screen",
                 "- Start/Stop controls run looping agent execution.",
                 "- Agent Config opens the name and system prompt editor.",
+                "- Max Steps controls non-endless loop length.",
                 "- Builtin tools are loaded from agent/functions.json and code handlers.",
                 "- CLI Access runs one-off shell commands.",
                 "- Endless Mode ignores end_run and loops until manual Stop.",
@@ -338,7 +354,7 @@ class AgentScreen(Screen[None]):
             self._log(f"[CLI][stderr] {err_text[:3000]}")
         self._log(f"[CLI] Exit code: {rc}")
 
-    def _resolved_gen_config(self) -> dict[str, float | int]:
+    def _resolved_gen_config(self) -> dict[str, float | int | bool]:
         config = self._model_config if isinstance(self._model_config, dict) else {}
 
         def _as_float(value: Any, default: float) -> float:
@@ -363,6 +379,7 @@ class AgentScreen(Screen[None]):
             ),
             "alpha_f": _as_float(self._gen_overrides.get("alpha_f", 0.0), 0.0),
             "alpha_p": _as_float(self._gen_overrides.get("alpha_p", 0.0), 0.0),
+            "max_steps": _as_int(self._gen_overrides.get("max_steps", self._agent_max_steps), self._agent_max_steps),
             "enable_thinking": bool(
                 self._gen_overrides.get(
                     "enable_thinking",
@@ -374,7 +391,7 @@ class AgentScreen(Screen[None]):
             ),
         }
 
-    def _effective_gen_config(self) -> dict[str, float | int]:
+    def _effective_gen_config(self) -> dict[str, float | int | bool]:
         effective = self._resolved_gen_config()
         parsers = {
             "temperature": float,
@@ -383,6 +400,7 @@ class AgentScreen(Screen[None]):
             "repetition_penalty": float,
             "alpha_f": float,
             "alpha_p": float,
+            "max_steps": int,
         }
         for key, parser in parsers.items():
             widget = self._gen_inputs.get(key)
@@ -395,6 +413,12 @@ class AgentScreen(Screen[None]):
                 effective[key] = parser(raw)
             except ValueError:
                 continue
+        try:
+            max_steps = int(effective.get("max_steps", self._agent_max_steps))
+        except (TypeError, ValueError):
+            max_steps = self._agent_max_steps
+        self._agent_max_steps = max(1, max_steps)
+        effective["max_steps"] = self._agent_max_steps
         if self._thinking_checkbox is not None:
             effective["enable_thinking"] = bool(self._thinking_checkbox.value)
         return effective
@@ -410,34 +434,136 @@ class AgentScreen(Screen[None]):
         self._llm_backend = get_llm_backend()
         self._refresh_backend_label()
         self._log(f"Loading model '{self._model_id}' with backend '{self._llm_backend}'...")
+        peer_plan: dict[str, Any] | None = None
         try:
-            self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model()
+            preview_config, preview_model_path = await resolve_model_assets_for_backend(
+                model_id=self._model_id,
+                offline_mode=self._offline,
+                backend=self._llm_backend,
+            )
+            total_layers = total_layers_from_model_config(preview_config)
+            peer_plan = build_peer_load_plan(
+                self._peer_client,
+                model_name=self._model_id or "model",
+                total_layers=total_layers,
+                model_path=preview_model_path,
+                model_config=preview_config,
+                backend=self._llm_backend,
+            )
+            for line in distributed_shard_log_messages(
+                self._peer_client,
+                model_name=self._model_id or "model",
+                total_layers=total_layers,
+                model_path=preview_model_path,
+                model_config=preview_config,
+                backend=self._llm_backend,
+            ):
+                self._log(line)
+            budget_errors = peer_plan.get("budget_errors") or shard_plan_budget_errors(peer_plan.get("peers", []))
+            if budget_errors:
+                raise RuntimeError("Shard plan exceeds reported memory: " + "; ".join(budget_errors))
+            local_shard = peer_plan.get("local_shard") if peer_plan else None
+            self._model, self._model_config, self._tokenizer, self._model_cache_path, elapsed = await self._load_model(
+                shard=local_shard,
+            )
         except Exception as exc:
+            self._clear_model(update_log=False, clear_remote=False)
+            if peer_plan is not None and peer_plan.get("distributed"):
+                await asyncio.to_thread(
+                    clear_model_shards_on_peers,
+                    self._peer_client,
+                    peers=peer_plan.get("remote_peers"),
+                    model_id=self._model_id or "",
+                )
             self._log(f"Model load failed: {exc}")
             logger.exception("Agent model load failed")
         else:
-            self._model_is_quantized, quant_mode = detect_quantization_mode(
-                self._model_config,
-                backend=self._llm_backend,
-            )
-            mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
-            self._model_loaded = True
-            if self._thinking_checkbox is not None and "enable_thinking" not in self._gen_overrides:
-                self._thinking_checkbox.value = default_enable_thinking(
-                    model_path=self._model_cache_path,
-                    tokenizer=self._tokenizer,
+            try:
+                self._model_is_quantized, quant_mode = detect_quantization_mode(
+                    self._model_config,
+                    backend=self._llm_backend,
                 )
-            self._log(f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}.")
+                mode_label = f"quantized ({quant_mode})" if self._model_is_quantized else "standard"
+                local_shard = getattr(self._model, "shard", None)
+                register_runtime = getattr(self._peer_client, "register_generation_runtime", None)
+                if callable(register_runtime):
+                    register_runtime(
+                        model=self._model,
+                        tokenizer=self._tokenizer,
+                        backend=self._llm_backend,
+                        model_id=self._model_id or "",
+                        model_config=self._model_config,
+                        model_path=str(self._model_cache_path or ""),
+                        shard=getattr(self._model, "shard", None),
+                    )
+                if peer_plan is not None and peer_plan.get("distributed"):
+                    remote_peer_count = len(peer_plan.get("remote_peers", []))
+                    if remote_peer_count > 0:
+                        self._log(f"Waiting for {remote_peer_count} peer shard(s) to finish loading...")
+                    peer_load_plan = await asyncio.to_thread(
+                        load_model_shards_on_peers,
+                        self._peer_client,
+                        model_id=self._model_id or "",
+                        backend=self._llm_backend,
+                        offline_mode=self._offline,
+                        total_layers=total_layers_from_model_config(self._model_config),
+                        peers=peer_plan.get("peers"),
+                        model_path=self._model_cache_path,
+                        model_config=self._model_config,
+                    )
+                    mismatches = validate_peer_runtime_fingerprints(
+                        peer_load_plan.get("remote_results", []),
+                        local_model_config=self._model_config,
+                        local_model_path=self._model_cache_path,
+                    )
+                    if mismatches:
+                        raise RuntimeError("; ".join(mismatches))
+                    for entry in peer_load_plan.get("remote_results", []):
+                        peer = entry.get("peer")
+                        response = entry.get("response", {}) if isinstance(entry.get("response"), dict) else {}
+                        label = self._peer_label_for_log(peer)
+                        status = "already ready" if response.get("already_loaded") else "ready"
+                        try:
+                            peer_elapsed = float(response.get("elapsed", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            peer_elapsed = 0.0
+                        shard = getattr(peer, "shard", None)
+                        self._log(f"{label} {status} in {peer_elapsed:.1f}s: {format_shard_span(shard)}.")
+                self._model_loaded = True
+                if self._thinking_checkbox is not None and "enable_thinking" not in self._gen_overrides:
+                    self._thinking_checkbox.value = default_enable_thinking(
+                        model_path=self._model_cache_path,
+                        tokenizer=self._tokenizer,
+                    )
+                if peer_plan is not None and peer_plan.get("distributed") and local_shard is not None:
+                    self._log(
+                        f"Local shard ready in {elapsed:.1f}s. Backend: {self._llm_backend}. "
+                        f"Mode: {mode_label}. {format_shard_span(local_shard)}."
+                    )
+                    self._log(f"Shard-aware model ready on {len(peer_plan.get('peers', []))} nodes.")
+                else:
+                    self._log(f"Model ready in {elapsed:.1f}s. Backend: {self._llm_backend}. Mode: {mode_label}.")
+            except Exception as exc:
+                self._clear_model(update_log=False, clear_remote=False)
+                if peer_plan is not None and peer_plan.get("distributed"):
+                    await asyncio.to_thread(
+                        clear_model_shards_on_peers,
+                        self._peer_client,
+                        peers=peer_plan.get("remote_peers"),
+                        model_id=self._model_id or "",
+                    )
+                self._log(f"Model load failed: {exc}")
+                logger.exception("Agent model load failed")
         finally:
             self._set_load_button_enabled(True)
             self._refresh_state_label()
 
-    async def _load_model(self) -> tuple[Any, dict[str, Any], AutoTokenizer, Path, float]:
+    async def _load_model(self, *, shard: Any = None) -> tuple[Any, dict[str, Any], AutoTokenizer, Path, float]:
         self._llm_backend = get_llm_backend()
         start = time.time()
         model, model_config, tokenizer, model_path = await load_model_for_backend(
             model_id=self._model_id,
-            shard=None,
+            shard=shard,
             weight_device=None,
             offline_mode=self._offline,
             backend=self._llm_backend,
@@ -465,6 +591,7 @@ class AgentScreen(Screen[None]):
         self._refresh_state_label()
 
         gen_cfg = self._effective_gen_config()
+        max_steps = int(gen_cfg["max_steps"])
         self._log(f"Agent '{name}' started.")
         self._log(f"Instructions: {instructions}")
         self._log(
@@ -474,7 +601,8 @@ class AgentScreen(Screen[None]):
             f"top_p={gen_cfg['top_p']}, "
             f"thinking={gen_cfg['enable_thinking']}, "
             f"alpha_f={gen_cfg['alpha_f']}, "
-            f"alpha_p={gen_cfg['alpha_p']}"
+            f"alpha_p={gen_cfg['alpha_p']}, "
+            f"max_steps={max_steps}"
         )
         self._log(
             f"Available functions: {len(self._agent_functions)}"
@@ -539,11 +667,7 @@ class AgentScreen(Screen[None]):
         ]
 
     async def _agent_loop(self) -> str:
-        max_steps_raw = os.getenv("TC_AGENT_MAX_STEPS", "10")
-        try:
-            max_steps = max(1, int(max_steps_raw))
-        except ValueError:
-            max_steps = 10
+        max_steps = max(1, int(self._agent_max_steps))
         max_memory_recoveries = self._env_int("TC_AGENT_MAX_MEMORY_RECOVERIES", 2, minimum=0)
 
         final_reply = ""
@@ -583,9 +707,13 @@ class AgentScreen(Screen[None]):
 
                 recovery_attempts = 0
                 final_reply = reply
-                self._log(f"[agent][step {step}] {reply}")
 
                 payload = self._extract_agent_payload(reply)
+                if payload is None:
+                    self._log(f"[agent][step {step}] raw response\n{reply}")
+                else:
+                    self._log_agent_response_json(step, payload)
+
                 function_call = self._extract_function_call_from_payload(payload)
                 if function_call is None:
                     self._log(f"[agent][step {step}] No function call found; continuing loop.")
@@ -880,7 +1008,11 @@ class AgentScreen(Screen[None]):
                 continue
             if not isinstance(payload, dict):
                 continue
-            return payload
+            if self._extract_function_call_from_payload(payload) is not None or "thoughts" in payload:
+                return payload
+        compact_payload = self._payload_from_compact_agent_text(text)
+        if compact_payload is not None:
+            return compact_payload
         return None
 
     def _extract_function_call(self, text: str) -> tuple[str, dict[str, Any] | str] | None:
@@ -935,25 +1067,47 @@ class AgentScreen(Screen[None]):
             return None
 
         thoughts = payload.get("thoughts")
-        speak = ""
-        step_completed = ""
+        compact_thoughts: dict[str, str] = {}
         if isinstance(thoughts, dict):
-            speak = self._truncate_text(str(thoughts.get("speak", "")).strip(), 120)
-            step_completed = self._truncate_text(str(thoughts.get("step completed", "")).strip(), 120)
+            step_completed = self._truncate_text(str(thoughts.get("step completed", "")).strip(), 160)
+            speak = self._truncate_text(str(thoughts.get("speak", "")).strip(), 160)
+            if step_completed:
+                compact_thoughts["step completed"] = step_completed
+            if speak:
+                compact_thoughts["speak"] = speak
 
-        parts: list[str] = []
-        if function_name:
-            parts.append(f"ability={function_name}")
-        if arguments not in (None, {}, ""):
-            parts.append(f"args={self._compact_json_text(arguments, limit=180)}")
-        if speak:
-            parts.append(f"speak={speak}")
-        elif step_completed:
-            parts.append(f"step={step_completed}")
+        ability = payload.get("ability")
+        ability_name = function_name
+        ability_args = arguments
+        if ability_name is None and isinstance(ability, dict):
+            raw_name = ability.get("name")
+            if isinstance(raw_name, str) and raw_name.strip():
+                ability_name = raw_name.strip()
+            if ability_args is None:
+                ability_args = ability.get("args", {})
 
-        if not parts:
+        compact_payload: dict[str, Any] = {}
+        if compact_thoughts:
+            compact_payload["thoughts"] = compact_thoughts
+        if ability_name:
+            compact_payload["ability"] = {
+                "name": ability_name,
+                "args": {} if ability_args is None else ability_args,
+            }
+
+        if not compact_payload:
             return None
-        return {"role": "assistant", "content": " | ".join(parts)}
+        return {
+            "role": "assistant",
+            "content": json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":")),
+        }
+
+    def _log_agent_response_json(self, step: int, payload: dict[str, Any]) -> None:
+        try:
+            rendered = json.dumps(payload, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            rendered = str(payload)
+        self._log(f"[agent][step {step}] thought/action JSON\n{rendered}")
 
     def _summarize_function_result(
         self,
@@ -1046,6 +1200,50 @@ class AgentScreen(Screen[None]):
             deduped.append(item)
         return deduped
 
+    @staticmethod
+    def _payload_from_compact_agent_text(text: str) -> dict[str, Any] | None:
+        stripped = " ".join(str(text).strip().splitlines())
+        if "ability=" not in stripped:
+            return None
+
+        ability_name = ""
+        args: dict[str, Any] | str = {}
+        speak = ""
+        step_completed = ""
+        for part in re.split(r"\s+\|\s+", stripped):
+            if part.startswith("ability="):
+                ability_name = part[len("ability=") :].strip()
+            elif part.startswith("args="):
+                raw_args = part[len("args=") :].strip()
+                if raw_args:
+                    try:
+                        parsed_args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        query_match = re.search(r'"query"\s*:\s*"([^"]+)"', raw_args)
+                        args = {"query": query_match.group(1)} if query_match else raw_args
+                    else:
+                        args = parsed_args if isinstance(parsed_args, dict) else raw_args
+            elif part.startswith("speak="):
+                speak = part[len("speak=") :].strip()
+            elif part.startswith("step="):
+                step_completed = part[len("step=") :].strip()
+
+        if not ability_name:
+            return None
+
+        thoughts: dict[str, str] = {}
+        if step_completed:
+            thoughts["step completed"] = AgentScreen._truncate_text(step_completed, 160)
+        if speak:
+            thoughts["speak"] = AgentScreen._truncate_text(speak, 160)
+        return {
+            "thoughts": thoughts,
+            "ability": {
+                "name": ability_name,
+                "args": args,
+            },
+        }
+
     def _set_agent_controls_running(self, running: bool) -> None:
         if self._start_button is not None:
             self._start_button.disabled = running
@@ -1127,9 +1325,38 @@ class AgentScreen(Screen[None]):
         if self._load_button is not None:
             self._load_button.disabled = not enabled
 
-    def _clear_model(self, *, update_log: bool = True) -> None:
+    def _peer_label_for_log(self, peer: Any) -> str:
+        if peer is None:
+            return "peer"
+        peer_id = str(getattr(peer, "peer_client_id", "") or "peer").strip()
+        host = str(getattr(peer, "ip_address", "") or getattr(peer, "address", "")).strip()
+        if not host or host == peer_id:
+            return peer_id
+        return f"{peer_id} ({host})"
+
+    def _clear_model(self, *, update_log: bool = True, clear_remote: bool = True) -> None:
+        existing_model = self._model
         if self._agent_running:
             self._stop_agent()
+        clear_runtime = getattr(self._peer_client, "clear_generation_runtime", None)
+        if callable(clear_runtime):
+            clear_runtime(model=existing_model)
+        if clear_remote:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                clear_model_shards_on_peers(
+                    self._peer_client,
+                    model_id=self._model_id or "",
+                )
+            else:
+                loop.create_task(
+                    asyncio.to_thread(
+                        clear_model_shards_on_peers,
+                        self._peer_client,
+                        model_id=self._model_id or "",
+                    )
+                )
         self._model = None
         self._model_config = None
         self._tokenizer = None

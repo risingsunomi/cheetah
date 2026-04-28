@@ -44,6 +44,7 @@ from cheetah.tui.help_screen import HelpScreen
 
 from cheetah.tui.training_path_types import TrainingNode, NODE_STATUS_STYLES, NODE_STATUS_SYMBOLS
 from cheetah.tui.training_path_screen import TrainingPathScreen
+from cheetah.orchestration.distributed_inference import distributed_shard_plan_messages
 from cheetah.tui.helpers import memory_abort_reason, relieve_memory_pressure
 try:
     import psutil  # type: ignore
@@ -952,6 +953,15 @@ def _run_training_job(
         end_layer=config_dict["num_layers"],
         total_layers=config_dict["num_layers"] + 1,
     )
+    peer_snapshot = settings.get("peer-snapshot", [])
+    local_peer_id = str(settings.get("local-peer-id", "") or "")
+    for line in distributed_shard_plan_messages(
+        peer_snapshot,
+        local_peer_id=local_peer_id,
+        model_name=model_name,
+        total_layers=shard.total_layers,
+    ):
+        print(f"[info] {line}")
 
     model = Model(config_dict, shard, use_tied=config_dict.get("tie_word_embeddings", False))
     runtime_state["model"] = model
@@ -1484,6 +1494,8 @@ class TrainScreen(Screen[None]):
             "from-scratch": from_scratch,
             "path-node-index": node_index if node_index is not None else 0,
             "path-step-mode": step_mode,
+            "peer-snapshot": self._peer_snapshot(),
+            "local-peer-id": str(getattr(self._peer_client, "peer_client_id", "") or ""),
         }
 
     def _poll_training_output(self) -> None:
@@ -1673,6 +1685,21 @@ class TrainScreen(Screen[None]):
         if cpu_model:
             return cpu_model
         return ""
+
+    def _peer_snapshot(self) -> List[Dict[str, object]]:
+        peers: List[Dict[str, object]] = []
+        for index, peer in enumerate(self._peer_client.get_peers(include_self=True)):
+            peer_id = str(getattr(peer, "peer_client_id", "") or f"peer-{index + 1}")
+            peers.append(
+                {
+                    "peer_client_id": peer_id,
+                    "ip_address": str(getattr(peer, "ip_address", "") or getattr(peer, "address", "") or ""),
+                    "gpu_vram": getattr(peer, "gpu_vram", 0.0),
+                    "cpu_ram": getattr(peer, "cpu_ram", 0.0),
+                    "gpu_flops": getattr(peer, "gpu_flops", 0.0),
+                }
+            )
+        return peers
 
     def _get_peer_count(self) -> None:
         if self.app is None:

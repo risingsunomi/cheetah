@@ -46,6 +46,16 @@ def _ram_gb() -> float:
     return 0.0
 
 
+def _available_ram_gb() -> float:
+    if psutil is not None:
+        try:
+            mem = psutil.virtual_memory()
+            return round(mem.available / (1024 ** 3), 2)
+        except Exception:
+            pass
+    return 0.0
+
+
 def _gpus() -> List[Dict[str, object]]:
     gpus: List[Dict[str, object]] = []
     system = platform.system()
@@ -94,12 +104,15 @@ def _gpus() -> List[Dict[str, object]]:
                 if not mem_from_graphics and not in_graphics and "memory" in lower and "chipset" not in lower:
                     hardware_mem = hardware_mem or _parse_mac_mem_gb(line)
             if current:
+                available_ram = _available_ram_gb()
                 if current.get("total_mem_gb", 0) == 0 and hardware_mem:
                     current["total_mem_gb"] = hardware_mem
                 elif current.get("total_mem_gb", 0) == 0:
                     current["total_mem_gb"] = _ram_gb()
                 # Apple Silicon uses unified memory shared with CPU.
                 current["ram_gb"] = current.get("total_mem_gb", _ram_gb())
+                current["available_ram_gb"] = available_ram
+                current["available_vram_gb"] = available_ram
                 current["unified_memory"] = True
                 gpus.append(current)
         except Exception as exc:
@@ -112,6 +125,10 @@ def _gpus() -> List[Dict[str, object]]:
             gpu["ram_gb"] = gpu.get("total_mem_gb", 0.0)
         if "vram_gb" not in gpu:
             gpu["vram_gb"] = gpu.get("total_mem_gb", gpu.get("ram_gb", 0.0))
+        if "available_ram_gb" not in gpu:
+            gpu["available_ram_gb"] = gpu.get("available_vram_gb", 0.0)
+        if "available_vram_gb" not in gpu:
+            gpu["available_vram_gb"] = gpu.get("available_ram_gb", 0.0)
         if "device" not in gpu:
             gpu["device"] = ""
         if not gpu.get("flops"):
@@ -155,7 +172,7 @@ def _cuda_gpus() -> List[Dict[str, object]]:
     """Detect NVIDIA GPUs via nvidia-smi, if present."""
     cmd = [
         "nvidia-smi",
-        "--query-gpu=name,memory.total",
+        "--query-gpu=name,memory.total,memory.free",
         "--format=csv,noheader,nounits",
     ]
     try:
@@ -177,7 +194,15 @@ def _cuda_gpus() -> List[Dict[str, object]]:
                     mem_gb = round(mem_gb / 1024.0, 2)
             except Exception:
                 mem_gb = 0.0
-        gpus.append({"name": name, "total_mem_gb": mem_gb, "device": "CUDA"})
+        free_gb = 0.0
+        if len(parts) > 2:
+            try:
+                free_gb = float(parts[2])
+                if free_gb > 64:
+                    free_gb = round(free_gb / 1024.0, 2)
+            except Exception:
+                free_gb = 0.0
+        gpus.append({"name": name, "total_mem_gb": mem_gb, "available_vram_gb": free_gb, "device": "CUDA"})
     return gpus
 
 
@@ -322,6 +347,7 @@ def _cpu_device() -> Dict[str, object]:
         "speed": _cpu_speed(),
         "cores": _cpu_count(),
         "ram_gb": _ram_gb(),
+        "available_ram_gb": _available_ram_gb(),
     }
 
 def _cpu_speed() -> str:
@@ -347,7 +373,9 @@ def collect_host_info() -> Dict[str, object]:
             "device": gpu.get("device", ""),
             "name": gpu.get("name", "GPU"),
             "ram_gb": gpu.get("total_mem_gb", 0.0),
+            "available_ram_gb": gpu.get("available_ram_gb", 0.0),
             "vram_gb": gpu.get("vram_gb", gpu.get("total_mem_gb", 0.0)),
+            "available_vram_gb": gpu.get("available_vram_gb", 0.0),
             "flops": gpu.get("flops", 0.0),
         }
         for gpu in gpus

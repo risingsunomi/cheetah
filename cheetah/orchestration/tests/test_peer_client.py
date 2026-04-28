@@ -1,22 +1,36 @@
 import asyncio
 import base64
+from collections import deque
 import json
+from pathlib import Path
 import unittest
 import os
+import threading
 from unittest import mock
+from types import SimpleNamespace
 
-import tinygrad as tg
+try:
+    import tinygrad as tg
+except Exception:
+    tg = None
+try:
+    import torch
+except Exception:
+    torch = None
 from cheetah.orchestration.peer_client import (
     PeerClient,
     _peer_host_from_payload,
     _resolve_advertise_address,
 )
+from cheetah.orchestration.model_engine import _encode_tensor
+from cheetah.models.llm.backend import RUNTIME_FINGERPRINT_PROTOCOL
+from cheetah.models.shard import Shard
 
 TEST_RECEIVER_BIND_HOST = "0.0.0.0"
 TEST_RECEIVER_CONNECT_HOST = "127.0.0.1"
 TEST_PORT = 6668
 TEST_TIMEOUT = 30.0
-TEST_TENSOR_PAYLOAD = tg.Tensor.randn(10, 10).numpy().tobytes()
+TEST_TENSOR_PAYLOAD = tg.Tensor.randn(10, 10).numpy().tobytes() if tg is not None else b"peer-client-test"
 
 
 def _stop_peer_client(client: PeerClient) -> None:
@@ -49,13 +63,14 @@ class TestPeerClientSender(unittest.TestCase):
         
         client = None
         try:
-            client = PeerClient()
-            _stop_peer_client(client)
-            client.send_payload(
-                _tensor_message(TEST_TENSOR_PAYLOAD),
-                expect_reply=False,
-                address=(host, port),
-            )
+            with mock.patch.dict(os.environ, {"TC_PORT": "0"}, clear=False):
+                client = PeerClient()
+                _stop_peer_client(client)
+                client.send_payload(
+                    _tensor_message(TEST_TENSOR_PAYLOAD),
+                    expect_reply=False,
+                    address=(host, port),
+                )
         finally:
             if client is not None:
                 _stop_peer_client(client)
@@ -80,15 +95,16 @@ class TestPeerClientReceiver(unittest.IsolatedAsyncioTestCase):
         client = None
         payload = None
         try:
-            client = PeerClient()
-            _stop_peer_client(client)
-            await asyncio.to_thread(
-                lambda: client.send_payload(
-                    _tensor_message(expected),
-                    expect_reply=False,
-                    address=(TEST_RECEIVER_CONNECT_HOST, port),
+            with mock.patch.dict(os.environ, {"TC_PORT": "0"}, clear=False):
+                client = PeerClient()
+                _stop_peer_client(client)
+                await asyncio.to_thread(
+                    lambda: client.send_payload(
+                        _tensor_message(expected),
+                        expect_reply=False,
+                        address=(TEST_RECEIVER_CONNECT_HOST, port),
+                    )
                 )
-            )
 
             raw = await asyncio.wait_for(payload_queue.get(), timeout=timeout)
 
@@ -104,6 +120,49 @@ class TestPeerClientReceiver(unittest.IsolatedAsyncioTestCase):
             await server.wait_closed()
 
         self.assertEqual(payload, expected)
+
+    async def test_send_payload_reads_full_chunked_json_reply(self):
+        host = TEST_RECEIVER_BIND_HOST
+        port = TEST_PORT + 1
+        timeout = TEST_TIMEOUT
+        expected = {"ok": True, "message": "chunked-response"}
+        request_seen: asyncio.Event = asyncio.Event()
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await reader.read(65536)
+            request_seen.set()
+            raw = json.dumps(expected).encode("utf-8")
+            midpoint = max(len(raw) // 2, 1)
+            writer.write(raw[:midpoint])
+            await writer.drain()
+            await asyncio.sleep(0.01)
+            writer.write(raw[midpoint:])
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(handle, host, port)
+        client = None
+        try:
+            with mock.patch.dict(os.environ, {"TC_PORT": "0"}, clear=False):
+                client = PeerClient()
+                _stop_peer_client(client)
+                response = await asyncio.to_thread(
+                    lambda: client.send_payload(
+                        {"command": "generate_token", "payload": {"input_ids": [[1]], "attention_mask": [[1]]}},
+                        expect_reply=True,
+                        address=(TEST_RECEIVER_CONNECT_HOST, port),
+                    )
+                )
+
+            await asyncio.wait_for(request_seen.wait(), timeout=timeout)
+        finally:
+            if client is not None:
+                _stop_peer_client(client)
+            server.close()
+            await server.wait_closed()
+
+        self.assertEqual(response, expected)
 
 
 class TestPeerDiscoveryHelpers(unittest.TestCase):
@@ -132,6 +191,8 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         client = PeerClient.__new__(PeerClient)
         client.port = TEST_PORT
         client._peers = {}
+        client._peer_last_seen = {}
+        client._lock = threading.RLock()
 
         peer = PeerClient.add_peer(
             client,
@@ -161,3 +222,279 @@ class TestPeerDiscoveryHelpers(unittest.TestCase):
         assert peer is not None
         self.assertEqual(peer.ip_address, "192.168.0.42")
         self.assertIn("peer-1", client._peers)
+
+    def test_get_peers_prunes_stale_entries(self):
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client.peer_device = SimpleNamespace(peer_client_id="self")
+        client._lock = threading.RLock()
+        client._peers = {
+            "peer-1": SimpleNamespace(peer_client_id="peer-1"),
+        }
+        client._peer_last_seen = {"peer-1": 10.0}
+        client._peer_stale_after = 5.0
+
+        with mock.patch("cheetah.orchestration.peer_client.time.time", return_value=20.0):
+            peers = PeerClient.get_peers(client, include_self=False)
+
+        self.assertEqual(peers, [])
+        self.assertEqual(client._peers, {})
+
+    def test_recent_flows_aggregates_transfers_by_route(self):
+        client = PeerClient.__new__(PeerClient)
+        client._lock = threading.RLock()
+        client._flow_events = deque(maxlen=256)
+
+        with mock.patch("cheetah.orchestration.peer_client.time.time", side_effect=[100.0, 101.0, 105.0]):
+            PeerClient.record_flow(client, "self", "peer-1", 64, phase="request")
+            PeerClient.record_flow(client, "self", "peer-1", 32, phase="request")
+            flows = PeerClient.recent_flows(client, max_age=10.0, limit=8)
+
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(flows[0]["source"], "self")
+        self.assertEqual(flows[0]["target"], "peer-1")
+        self.assertEqual(flows[0]["tokens"], 96)
+        self.assertEqual(flows[0]["count"], 2)
+
+    def test_peer_is_active_uses_last_seen_window(self):
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client._lock = threading.RLock()
+        client._peer_last_seen = {"peer-1": 95.0}
+        client._peer_stale_after = 10.0
+
+        with mock.patch("cheetah.orchestration.peer_client.time.time", return_value=100.0):
+            self.assertTrue(PeerClient.peer_is_active(client, "peer-1"))
+            self.assertFalse(PeerClient.peer_is_active(client, "peer-2"))
+            self.assertTrue(PeerClient.peer_is_active(client, "self"))
+
+    def test_register_generation_runtime_sets_working_default_handler(self):
+        if torch is None:
+            self.skipTest("torch is required for this test.")
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.shard = Shard("demo", 0, 1, 4)
+
+            def run_shard(
+                self,
+                x,
+                *,
+                attention_mask=None,
+                position_ids=None,
+                hidden_state=None,
+                shard=None,
+                start_pos=None,
+            ):
+                return torch.ones((1, attention_mask.shape[1], 4), dtype=torch.float32)
+
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client._lock = threading.RLock()
+        client._peer_last_seen = {}
+        client._peer_stale_after = 10.0
+        client._flow_events = deque(maxlen=256)
+        client._generation_model = None
+        client._generation_tokenizer = None
+        client._generation_backend = "torch"
+        client._generation_model_id = ""
+        client._generate_handler = None
+
+        model = FakeModel()
+        tokenizer = SimpleNamespace(eos_token_id=999)
+        PeerClient.register_generation_runtime(
+            client,
+            model=model,
+            tokenizer=tokenizer,
+            backend="torch",
+            model_id="demo",
+        )
+
+        self.assertTrue(callable(client._generate_handler))
+        response = client._generate_handler(
+            {
+                "payload": {
+                    "sender_peer_id": "peer-1",
+                    "input_ids": [[1, 2, 3]],
+                    "attention_mask": [[1, 1, 1]],
+                    "hidden_state": [[]],
+                    "prefill": True,
+                    "shard": {
+                        "model_name": "demo",
+                        "start_layer": 0,
+                        "end_layer": 1,
+                        "total_layers": 4,
+                    },
+                }
+            }
+        )
+
+        self.assertIn("hidden_state", response)
+        self.assertNotIn("error", response)
+        self.assertEqual(client._peer_last_seen["peer-1"] > 0.0, True)
+
+    def test_register_generation_runtime_accepts_encoded_bfloat16_hidden_state_payload(self):
+        if torch is None:
+            self.skipTest("torch is required for this test.")
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.shard = Shard("demo", 1, 2, 4)
+                self.hidden_state_seen = None
+
+            def run_shard(
+                self,
+                x,
+                *,
+                attention_mask=None,
+                position_ids=None,
+                hidden_state=None,
+                shard=None,
+                start_pos=None,
+            ):
+                del x, shard, start_pos
+                self.hidden_state_seen = hidden_state
+                self.position_ids_seen = position_ids
+                self.attention_mask_seen = attention_mask
+                return hidden_state + 1
+
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client._lock = threading.RLock()
+        client._peer_last_seen = {}
+        client._peer_stale_after = 10.0
+        client._flow_events = deque(maxlen=256)
+        client._generation_model = None
+        client._generation_tokenizer = None
+        client._generation_backend = "torch"
+        client._generation_model_id = ""
+        client._generate_handler = None
+
+        model = FakeModel()
+        tokenizer = SimpleNamespace(eos_token_id=999)
+        PeerClient.register_generation_runtime(
+            client,
+            model=model,
+            tokenizer=tokenizer,
+            backend="torch",
+            model_id="demo",
+        )
+
+        hidden_state = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3).to(dtype=torch.bfloat16)
+        with mock.patch.object(PeerClient, "_torch_runtime_device", return_value="cpu"):
+            response = client._generate_handler(
+                {
+                    "payload": {
+                        "sender_peer_id": "peer-1",
+                        "input_ids": [[1, 2]],
+                        "attention_mask": _encode_tensor(torch.ones((1, 2), dtype=torch.long)),
+                        "position_ids": _encode_tensor(torch.tensor([[0, 1]], dtype=torch.long)),
+                        "hidden_state": _encode_tensor(hidden_state),
+                        "prefill": True,
+                        "shard": {
+                            "model_name": "demo",
+                            "start_layer": 1,
+                            "end_layer": 2,
+                            "total_layers": 4,
+                        },
+                    },
+                }
+            )
+
+        self.assertIsNotNone(model.hidden_state_seen)
+        assert model.hidden_state_seen is not None
+        self.assertEqual(model.hidden_state_seen.dtype, torch.bfloat16)
+        self.assertEqual(response["hidden_state"]["dtype"], "bfloat16")
+
+    def test_handle_load_model_request_loads_requested_shard(self):
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client.shard = Shard("", 0, 0, 0)
+        client._lock = threading.RLock()
+        client._peer_last_seen = {}
+        client._peer_stale_after = 10.0
+        client._flow_events = deque(maxlen=256)
+        client._generation_model = None
+        client._generation_tokenizer = None
+        client._generation_backend = "torch"
+        client._generation_model_id = ""
+        client._generation_model_config = None
+        client._generation_model_path = ""
+        client._generation_shard = None
+        client._generate_handler = None
+
+        model = SimpleNamespace(shard=Shard("demo", 0, 2, 5))
+        tokenizer = object()
+
+        with mock.patch(
+            "cheetah.orchestration.peer_client.load_model_for_backend",
+            new=mock.AsyncMock(return_value=(model, {"num_layers": 4}, tokenizer, Path("/tmp/model"))),
+        ) as load_model:
+            response = PeerClient._handle_load_model_request(
+                client,
+                {
+                    "payload": {
+                        "model_id": "demo",
+                        "backend": "torch",
+                        "offline_mode": True,
+                        "shard": {
+                            "model_name": "demo",
+                            "start_layer": 0,
+                            "end_layer": 2,
+                            "total_layers": 5,
+                        },
+                    }
+                },
+            )
+
+        load_model.assert_awaited_once()
+        self.assertTrue(response["ok"])
+        self.assertFalse(response["already_loaded"])
+        self.assertTrue(response["config_fingerprint"])
+        self.assertEqual(response["fingerprint_protocol"], RUNTIME_FINGERPRINT_PROTOCOL)
+        self.assertEqual(client._generation_model, model)
+        self.assertEqual(client._generation_tokenizer, tokenizer)
+        self.assertEqual(client._generation_model_id, "demo")
+        self.assertEqual(client._generation_shard.start_layer, 0)
+        self.assertEqual(client.shard.end_layer, 2)
+
+    def test_handle_load_model_request_reuses_matching_runtime(self):
+        client = PeerClient.__new__(PeerClient)
+        client.peer_client_id = "self"
+        client.shard = Shard("demo", 0, 2, 5)
+        client._lock = threading.RLock()
+        client._peer_last_seen = {}
+        client._peer_stale_after = 10.0
+        client._flow_events = deque(maxlen=256)
+        client._generation_model = object()
+        client._generation_tokenizer = object()
+        client._generation_backend = "torch"
+        client._generation_model_id = "demo"
+        client._generation_model_config = {"num_layers": 4}
+        client._generation_model_path = ""
+        client._generation_shard = Shard("demo", 0, 2, 5)
+        client._generate_handler = None
+
+        with mock.patch("cheetah.orchestration.peer_client.load_model_for_backend", new=mock.AsyncMock()) as load_model:
+            response = PeerClient._handle_load_model_request(
+                client,
+                {
+                    "payload": {
+                        "model_id": "demo",
+                        "backend": "torch",
+                        "shard": {
+                            "model_name": "demo",
+                            "start_layer": 0,
+                            "end_layer": 2,
+                            "total_layers": 5,
+                        },
+                    }
+                },
+            )
+
+        load_model.assert_not_awaited()
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["already_loaded"])
+        self.assertTrue(response["config_fingerprint"])
+        self.assertEqual(response["fingerprint_protocol"], RUNTIME_FINGERPRINT_PROTOCOL)
+        self.assertEqual(response["shard"]["start_layer"], 0)

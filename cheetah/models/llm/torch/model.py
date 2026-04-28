@@ -88,6 +88,58 @@ class Model(nn.Module):
             if attn is not None and getattr(attn, "kv_cache", None) is not None:
                 attn.kv_cache.clear()
 
+    def _resolve_shard_window(self, shard: Shard | None) -> tuple[int, int, bool]:
+        requested = shard or self.shard
+        loaded_start = int(getattr(self.shard, "start_layer", 0) or 0)
+        loaded_end = int(getattr(self.shard, "end_layer", loaded_start + len(self.layers)) or (loaded_start + len(self.layers)))
+        requested_start = int(getattr(requested, "start_layer", loaded_start) or loaded_start)
+        requested_end = int(getattr(requested, "end_layer", loaded_end) or loaded_end)
+        total_layers = int(getattr(requested, "total_layers", getattr(self.shard, "total_layers", loaded_end + 1)) or (loaded_end + 1))
+
+        # Older shard payloads could advertise the virtual lm_head stage as the
+        # exclusive end bound. Normalize that back to the loaded transformer
+        # range so runtime slicing still works.
+        if requested_end == total_layers and loaded_end == total_layers - 1:
+            requested_end = loaded_end
+
+        if requested_start < loaded_start or requested_end > loaded_end:
+            raise ValueError(
+                f"Requested shard {requested_start}:{requested_end} is outside loaded range {loaded_start}:{loaded_end}"
+            )
+
+        local_start = requested_start - loaded_start
+        local_end = requested_end - loaded_start
+        is_final = total_layers > 0 and requested_end >= total_layers - 1
+        return local_start, local_end, is_final
+
+    def run_shard(
+        self,
+        x: torch.Tensor | None,
+        *,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        hidden_state: torch.Tensor | None = None,
+        shard: Shard | None = None,
+        start_pos: int | None = None,
+    ) -> torch.Tensor:
+        del start_pos  # torch attention derives decode position from position_ids.
+        if hidden_state is None:
+            if x is None:
+                raise ValueError("input tensor is required when hidden_state is not provided")
+            x = self.embed_tokens(x.long())
+        else:
+            x = hidden_state.to(device=self.device_name, dtype=self.inference_dtype)
+
+        local_start, local_end, is_final = self._resolve_shard_window(shard)
+        for layer in self.layers[local_start:local_end]:
+            x = layer(x, attention_mask, position_ids)
+
+        if is_final:
+            x = self.norm(x)
+            x = self.output(x)
+
+        return x
+
     def forward(
         self,
         x: torch.Tensor,
@@ -95,16 +147,10 @@ class Model(nn.Module):
         attention_mask: torch.Tensor | None = None,
         hidden_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if hidden_state is None:
-            x = self.embed_tokens(x.long())
-        else:
-            x = hidden_state
-
-        for layer in self.layers:
-            x = layer(x, attention_mask, position_ids)
-
-        if self.shard.end_layer == self.shard.total_layers - 1:
-            x = self.norm(x)
-            x = self.output(x)
-
-        return x
+        return self.run_shard(
+            x,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            hidden_state=hidden_state,
+            shard=self.shard,
+        )

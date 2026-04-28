@@ -1,7 +1,30 @@
+import json
+import tempfile
 import unittest
-import numpy as np
+from pathlib import Path
 
-from cheetah.models.llm.tinygrad.quantize import _dequantize_bnb_nf4, _dequantize_bnb_nf4_simple, is_quantized_model_config
+import numpy as np
+from safetensors.numpy import save_file
+import tinygrad as tg
+
+from cheetah.models.llm.tinygrad.quantize import (
+    _dequantize_bnb_nf4,
+    _dequantize_bnb_nf4_simple,
+    is_quantized_model_config,
+    load_quantized_safetensors,
+)
+from cheetah.models.shard import Shard
+
+
+class _DummyShardedLayerModel:
+    def __init__(self):
+        self.shard = Shard("demo", start_layer=1, end_layer=2, total_layers=3)
+        self.layers = [tg.nn.Linear(2, 2, bias=False)]
+
+
+def _write_model_index(model_dir: Path, weight_map: dict[str, str]) -> None:
+    payload = {"metadata": {"total_size": 0}, "weight_map": weight_map}
+    (model_dir / "model.safetensors.index.json").write_text(json.dumps(payload))
 
 
 class TestQuantizedLoader(unittest.TestCase):
@@ -78,3 +101,40 @@ class TestQuantizedLoader(unittest.TestCase):
 
         expected = quant_map[nibble_idx.astype(np.int64)] * 2.0
         np.testing.assert_allclose(out.reshape(-1), expected, rtol=1e-6, atol=1e-6)
+
+    def test_load_quantized_safetensors_maps_shard_local_layer_index_to_global_weight_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            weight_file = "model.safetensors"
+            global_zero = np.zeros((2, 2), dtype=np.float32)
+            global_one = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+
+            save_file(
+                {
+                    "model.layers.0.weight": global_zero,
+                    "model.layers.1.weight": global_one,
+                },
+                str(model_dir / weight_file),
+            )
+            _write_model_index(
+                model_dir,
+                {
+                    "model.layers.0.weight": weight_file,
+                    "model.layers.1.weight": weight_file,
+                },
+            )
+
+            model = _DummyShardedLayerModel()
+            load_quantized_safetensors(
+                model,
+                model_dir,
+                model_config={},
+                weight_device="CPU",
+                use_tied=False,
+            )
+
+            self.assertEqual(model.layers[0].weight.numpy().tolist(), global_one.tolist())
+
+
+if __name__ == "__main__":
+    unittest.main()

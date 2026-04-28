@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +33,7 @@ class OrchestrationScreen(Screen[None]):
         self._summary_panel: Optional[Static] = None
         self._peer_summary_panel: Optional[Static] = None
         self._peer_panel: Optional[Static] = None
+        self._flow_panel: Optional[Static] = None
         self._hostmap_panel: Optional[Static] = None
         self._refresh_label: Optional[Label] = None
         self._last_refresh = time.time()
@@ -52,12 +52,14 @@ class OrchestrationScreen(Screen[None]):
                 network_panel = Static(self._network_map_text(), id="orch-network")
                 self._peer_panel = network_panel
                 yield network_panel
+                flow_panel = Static(self._flow_text(), id="orch-flow")
+                self._flow_panel = flow_panel
+                yield flow_panel
         yield Footer()
 
     async def on_mount(self) -> None:
-        await asyncio.to_thread(self._get_peer_count)
-        self.set_interval(5.0, self._get_peer_count)
-        self.set_interval(30.0, self._refresh_panels)
+        self._refresh_panels()
+        self.set_interval(5.0, self._refresh_panels)
 
     # Textual actions ---------------------------------------------------------
     def action_refresh_panels(self) -> None:
@@ -74,12 +76,15 @@ class OrchestrationScreen(Screen[None]):
 
     def _refresh_panels(self) -> None:
         self._last_refresh = time.time()
+        self._get_peer_count()
         if self._summary_panel is not None:
             self._summary_panel.update(self._local_node_text())
         if self._peer_summary_panel is not None:
             self._peer_summary_panel.update(self._peer_summary_text())
         if self._peer_panel is not None:
             self._peer_panel.update(self._network_map_text())
+        if self._flow_panel is not None:
+            self._flow_panel.update(self._flow_text())
         if self._refresh_label is not None:
             self._refresh_label.update("")
         self._update_action_variants()
@@ -88,10 +93,7 @@ class OrchestrationScreen(Screen[None]):
         if self.app is None:
             return
         count = self._peer_client.peer_count()
-        if count > 1:
-            current = getattr(self.app, "sub_title", "")
-            new_title = f"[Nodes: {count}]"
-            self.app.title = new_title
+        self.app.title = f"[Nodes: {count}]"
 
     def _local_node_text(self) -> str:
         host_info = self._peer_client.peer_device.as_dict()
@@ -122,6 +124,10 @@ class OrchestrationScreen(Screen[None]):
         peers = [self._peer_entry_to_obj(peer) for peer in self._peer_client.get_peers(include_self=True)]
         peers = [peer for peer in peers if peer is not None]
         def _status(peer) -> str:
+            peer_id = str(getattr(peer, "peer_client_id", "") or "")
+            is_active = getattr(self._peer_client, "peer_is_active", None)
+            if callable(is_active) and peer_id:
+                return "[green]●[/]" if is_active(peer_id) else "[yellow]●[/]"
             available = getattr(peer, "available", None)
             if available is not None:
                 return "[green]●[/]" if available else "[red]●[/]"
@@ -165,8 +171,9 @@ class OrchestrationScreen(Screen[None]):
         for peer in ordered:
             flops = _flops_value(peer)
             flops_label = f"{flops:.1f} TFLOPS" if flops else "-- TFLOPS"
+            activity = self._peer_activity_label(peer)
             ring_lines.append("🖥️")
-            ring_lines.append(f"{_host_label(peer)} {flops_label} {_status(peer)}")
+            ring_lines.append(f"{_host_label(peer)} {flops_label} {_status(peer)} {activity}")
         return "\n".join(ring_lines)
 
     def _peer_summary_text(self) -> str:
@@ -193,11 +200,55 @@ class OrchestrationScreen(Screen[None]):
             gpu_model = str(getattr(peer, "gpu_model", "") or "Unknown GPU")
             gpu_vram = str(getattr(peer, "gpu_vram", "") or "0")
             lines.append(f"{host} {flops_label}")
+            lines.append(f"Status: {self._peer_activity_label(peer)}")
             lines.append(f"CPU: {cpu_model} ({cpu_cores} cores, {cpu_ram} GB)")
             lines.append(f"GPU: {gpu_model} ({gpu_vram} VRAM)")
         return "\n".join(lines)
-    
-    
+
+    def _flow_text(self) -> str:
+        recent_flows = getattr(self._peer_client, "recent_flows", None)
+        if not callable(recent_flows):
+            return "\n".join(
+                [
+                    "[b]Recent Data Flow[/]",
+                    "Flow telemetry unavailable.",
+                ]
+            )
+
+        flows = recent_flows(max_age=90.0, limit=8)
+        if not flows:
+            return "\n".join(
+                [
+                    "[b]Recent Data Flow[/]",
+                    "No distributed token traffic yet.",
+                    "Run peer-assisted generation to see node-to-node token flow.",
+                ]
+            )
+
+        labels = {
+            self._peer_client.peer_client_id: self._peer_label(self._peer_client.peer_device),
+        }
+        for peer in self._peer_client.get_peers(include_self=False):
+            peer_obj = self._peer_entry_to_obj(peer)
+            if peer_obj is None:
+                continue
+            peer_id = str(getattr(peer_obj, "peer_client_id", "") or "")
+            if peer_id:
+                labels[peer_id] = self._peer_label(peer_obj)
+
+        now = time.time()
+        lines = ["[b]Recent Data Flow[/]"]
+        for flow in flows:
+            source = labels.get(str(flow.get("source", "") or ""), str(flow.get("source", "unknown") or "unknown"))
+            target = labels.get(str(flow.get("target", "") or ""), str(flow.get("target", "unknown") or "unknown"))
+            tokens = int(flow.get("tokens", 0) or 0)
+            count = int(flow.get("count", 0) or 0)
+            age = max(now - float(flow.get("last_seen", now) or now), 0.0)
+            transfer_label = "transfer" if count == 1 else "transfers"
+            lines.append(
+                f"{source} -> {target}: {tokens} tok across {count} {transfer_label} ({age:.0f}s ago)"
+            )
+        return "\n".join(lines)
 
     def _update_action_variants(self) -> None:
         return
@@ -207,7 +258,7 @@ class OrchestrationScreen(Screen[None]):
         return "\n".join(
             [
                 "Network / Orchestration Screen",
-                "- r: Refresh host and peer panels",
+                "- r: Refresh host, peer, and flow panels",
                 "- a: Add peer by IP",
                 "- p: Open peer directory",
                 "- h: Open this help screen",
@@ -220,3 +271,32 @@ class OrchestrationScreen(Screen[None]):
         if isinstance(peer, tuple) and len(peer) == 2:
             return peer[1]
         return peer
+
+    @staticmethod
+    def _peer_label(peer: object) -> str:
+        host = str(getattr(peer, "ip_address", "") or getattr(peer, "address", "")).strip()
+        peer_id = str(getattr(peer, "peer_client_id", "") or "peer").strip()
+        if host in {"", "0.0.0.0"}:
+            return peer_id
+        return f"{peer_id} ({host})"
+
+    def _peer_activity_label(self, peer: object) -> str:
+        peer_id = str(getattr(peer, "peer_client_id", "") or "").strip()
+        if not peer_id:
+            return "Unknown"
+        if peer_id == self._peer_client.peer_client_id:
+            return "Local"
+
+        last_seen_fn = getattr(self._peer_client, "peer_last_seen", None)
+        is_active_fn = getattr(self._peer_client, "peer_is_active", None)
+        if not callable(last_seen_fn):
+            return "Unknown"
+
+        last_seen = last_seen_fn(peer_id)
+        if last_seen is None:
+            return "Offline"
+
+        age = max(time.time() - float(last_seen), 0.0)
+        is_active = bool(is_active_fn(peer_id)) if callable(is_active_fn) else False
+        prefix = "Active" if is_active else "Idle"
+        return f"{prefix} {age:.0f}s ago"

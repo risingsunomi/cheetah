@@ -31,7 +31,9 @@ class ModelEngine:
         attention_mask: Any,
         tokenizer: Any,
         hidden_state: Any | None = None,
+        position_ids: Any | None = None,
         *,
+        prefill: bool = False,
         temp: float = 1.0,
         top_k: int = 0,
         top_p: float = 0.8,
@@ -39,42 +41,85 @@ class ModelEngine:
         alpha_p: float = 0.0,
         repetition_penalty: float = 1.0,
         seen_tokens: Sequence[int] | None = None,
+        trace: bool = False,
     ) -> Dict[str, Any]:
         """Generate the next token and return a JSON-serializable payload."""
-        curr_pos = int(attention_mask.shape[1] - 1)
+        phase = "prefill" if prefill else "decode"
+        if prefill:
+            reset_kv_cache = getattr(model, "reset_kv_cache", None)
+            if callable(reset_kv_cache):
+                reset_kv_cache()
 
-        if hidden_state is not None:
-            position_ids = _position_ids_tensor(curr_pos, input_ids)
-            decode_hidden = getattr(model, "decode_hidden", None)
-            if callable(decode_hidden):
-                model_output = decode_hidden(hidden_state, start_pos=curr_pos)
-            else:
-                model_output = model(
+            if position_ids is None:
+                position_ids = _full_position_ids_tensor(
+                    attention_mask,
+                    like=input_ids if hidden_state is None else hidden_state,
+                )
+
+            model_output = _run_model_shard(
+                model,
+                input_ids if hidden_state is None else None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                hidden_state=hidden_state,
+                shard=self.shard,
+                start_pos=None,
+            )
+        else:
+            if hidden_state is not None:
+                curr_pos = int(attention_mask.shape[1] - 1)
+                _ensure_decode_cache_ready(model, curr_pos)
+                if position_ids is None:
+                    position_ids = _position_ids_tensor(curr_pos, hidden_state)
+                model_output = _run_model_shard(
+                    model,
                     None,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     hidden_state=hidden_state,
+                    shard=self.shard,
+                    start_pos=curr_pos,
                 )
-        else:
-            prev_token = _scalar_int(input_ids[:, -1], default=0)
-            next_tok = _next_token_tensor(prev_token, input_ids)
-            attention_mask = _append_attention_mask(attention_mask)
-            position_ids = _position_ids_tensor(curr_pos, input_ids)
-            decode_token = getattr(model, "decode_token", None)
-            if callable(decode_token):
-                model_output = decode_token(next_tok, start_pos=curr_pos)
             else:
-                model_output = model(next_tok, attention_mask=attention_mask, position_ids=position_ids)
+                curr_pos = int(attention_mask.shape[1])
+                _ensure_decode_cache_ready(model, curr_pos)
+                prev_token = _scalar_int(input_ids[:, -1], default=0)
+                next_tok = _next_token_tensor(prev_token, input_ids)
+                attention_mask = _append_attention_mask(attention_mask)
+                if position_ids is None:
+                    position_ids = _position_ids_tensor(curr_pos, input_ids)
+                model_output = _run_model_shard(
+                    model,
+                    next_tok,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    hidden_state=None,
+                    shard=self.shard,
+                    start_pos=curr_pos,
+                )
 
-        is_final = self.shard.end_layer == self.shard.total_layers - 1
+        is_final = _is_final_shard(self.shard)
         if not is_final:
-            return {
+            resp_data = {
                 "hidden_state": _encode_tensor(model_output),
                 "attention_mask": _encode_tensor(attention_mask),
                 "position_ids": _encode_tensor(position_ids),
                 "shard": _shard_payload(self.shard),
                 "end_token": False,
             }
+            if trace:
+                resp_data["diagnostics"] = _diagnostics_payload(
+                    model,
+                    phase=phase,
+                    prefill=prefill,
+                    shard=self.shard,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    hidden_state=hidden_state,
+                    output=model_output,
+                )
+            return resp_data
 
         next_logit = model_output[:, -1, :].flatten()
         tok = _sample_with_backend(
@@ -90,7 +135,7 @@ class ModelEngine:
         tok = int(tok)
         end_token = bool(getattr(tokenizer, "eos_token_id", None) == tok)
 
-        return {
+        resp_data = {
             "token": _encode_token_tensor(tok),
             "tensor": _encode_token_tensor(tok),
             "attention_mask": _encode_tensor(attention_mask),
@@ -98,6 +143,20 @@ class ModelEngine:
             "shard": _shard_payload(self.shard),
             "end_token": end_token,
         }
+        if trace:
+            resp_data["diagnostics"] = _diagnostics_payload(
+                model,
+                phase=phase,
+                prefill=prefill,
+                shard=self.shard,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                hidden_state=hidden_state,
+                output=model_output,
+                token=tok,
+            )
+        return resp_data
 
     def recv_tokens(
         self,
@@ -158,39 +217,27 @@ class ModelEngine:
 
     @staticmethod
     def plan_shards(peers: Sequence[Any], model_name: str, total_layers: int) -> List[Shard]:
-        capacities = []
-        for peer in peers:
-            vram = _to_float(getattr(peer, "gpu_vram", 0.0))
-            ram = _to_float(getattr(peer, "cpu_ram", 0.0))
-            flops = getattr(peer, "gpu_flops", 0.0) if hasattr(peer, "gpu_flops") else 0.0
-            capacity = max(vram, ram, flops, 1.0)
-            capacities.append((peer, capacity))
+        if total_layers <= 1:
+            return []
 
-        total_cap = sum(cap for _, cap in capacities) or 1.0
+        transformer_layers = max(int(total_layers) - 1, 1)
+        usable_peers = list(peers[: min(len(peers), transformer_layers)])
+        if not usable_peers:
+            return []
+
+        base_span, remainder = divmod(transformer_layers, len(usable_peers))
         shards: List[Shard] = []
         start = 0
-        for peer, cap in capacities:
-            fraction = cap / total_cap
-            span = max(int(total_layers * fraction), 1)
-            end = min(start + span, total_layers)
+        for index, peer in enumerate(usable_peers):
+            span = base_span + (1 if index < remainder else 0)
+            end = min(start + span, transformer_layers)
             shards.append(Shard(model_name=model_name, start_layer=start, end_layer=end, total_layers=total_layers))
             try:
                 peer.shard = shards[-1]
             except Exception:
                 pass
             start = end
-        if shards:
-            shards[-1].end_layer = total_layers
         return shards
-
-
-def _to_float(val: Any) -> float:
-    try:
-        if isinstance(val, str):
-            return float(val.lower().replace("gb", "").strip() or 0.0)
-        return float(val)
-    except Exception:
-        return 0.0
 
 
 def _sample_with_backend(*args: Any, **kwargs: Any):
@@ -208,6 +255,43 @@ def _sample_with_backend(*args: Any, **kwargs: Any):
         return backend_helpers_module("tinygrad").sample(*args, **kwargs)
 
 
+def _run_model_shard(
+    model: Any,
+    x: Any,
+    *,
+    attention_mask: Any,
+    position_ids: Any,
+    hidden_state: Any | None,
+    shard: Shard,
+    start_pos: int | None,
+) -> Any:
+    run_shard = getattr(model, "run_shard", None)
+    if callable(run_shard):
+        return run_shard(
+            x,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            hidden_state=hidden_state,
+            shard=shard,
+            start_pos=start_pos,
+        )
+
+    decode_hidden = getattr(model, "decode_hidden", None)
+    if hidden_state is not None and start_pos is not None and callable(decode_hidden):
+        return decode_hidden(hidden_state, position_ids=position_ids, start_pos=start_pos)
+
+    decode_token = getattr(model, "decode_token", None)
+    if hidden_state is None and start_pos is not None and callable(decode_token):
+        return decode_token(x, position_ids=position_ids, start_pos=start_pos)
+
+    return model(
+        x,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        hidden_state=hidden_state,
+    )
+
+
 def _encode_token_tensor(token: int) -> Dict[str, Any]:
     buf = struct.pack("<i", int(token))
     return {
@@ -218,7 +302,22 @@ def _encode_token_tensor(token: int) -> Dict[str, Any]:
 
 def _encode_tensor(tensor: Any) -> Dict[str, Any]:
     if torch is not None and isinstance(tensor, torch.Tensor):
-        arr = tensor.detach().cpu().numpy()
+        detached = tensor.detach().cpu().contiguous()
+        if detached.dtype == torch.bfloat16:
+            raw_view = detached.view(torch.float16).numpy()
+            # print(f"raw_view: {raw_view}")
+            return {
+                "buffer": base64.b64encode(raw_view.tobytes()).decode("ascii"),
+                "shape": list(detached.shape),
+                "dtype": "bfloat16",
+            }
+        try:
+            arr = detached.numpy()
+        except TypeError:
+            if detached.is_floating_point():
+                arr = detached.to(dtype=torch.float32).numpy()
+            else:
+                raise
     elif hasattr(tensor, "numpy"):
         arr = tensor.numpy()
     else:
@@ -238,16 +337,28 @@ def _decode_tensor(tensor_payload: Any, backend: str | None = None) -> Any | Non
         return None
     try:
         raw = base64.b64decode(buf)
-    
         dtype = _normalize_dtype(str(tensor_payload.get("dtype", "float32")))
-        arr = np.frombuffer(raw, dtype=np.dtype(dtype))
         shape = tensor_payload.get("shape")
-
-        if shape:
-            arr = arr.reshape(shape)
-
-        arr = np.array(arr, copy=True)
         selected_backend = str(backend or "").strip().lower()
+
+        if dtype == "bfloat16":
+            if selected_backend == "torch" and torch is not None:
+                arr = _bfloat16_buffer_to_float32(raw, shape)
+                tensor = torch.from_numpy(arr).to(dtype=torch.bfloat16)
+                target_device = _torch_target_device()
+                try:
+                    tensor = tensor.to(device=target_device)
+                except Exception:
+                    pass
+                return tensor
+
+            arr = _bfloat16_buffer_to_float32(raw, shape)
+        else:
+            arr = np.frombuffer(raw, dtype=np.dtype(_numpy_dtype(dtype)))
+            if shape:
+                arr = arr.reshape(shape)
+            arr = np.array(arr, copy=True)
+
         if selected_backend == "torch" and torch is not None:
             try:
                 tensor = torch.from_numpy(arr)
@@ -259,7 +370,8 @@ def _decode_tensor(tensor_payload: Any, backend: str | None = None) -> Any | Non
             except Exception:
                 pass
             return tensor
-        return tg.Tensor(arr)
+        target_device = get_backend_device("tinygrad", default="CPU")
+        return tg.Tensor(arr, device=target_device)
     except Exception:
         return None
 
@@ -309,10 +421,57 @@ def _append_attention_mask(attention_mask: Any) -> Any:
     )
 
 
+def _full_position_ids_tensor(attention_mask: Any, *, like: Any) -> Any:
+    if attention_mask is None:
+        seq_len = _sequence_length(like)
+        if torch is not None and isinstance(like, torch.Tensor):
+            return torch.arange(seq_len, device=like.device, dtype=torch.long).unsqueeze(0)
+        device = getattr(like, "device", None)
+        return tg.Tensor.arange(seq_len, device=device).reshape(1, seq_len).cast(tg.dtypes.int32)
+
+    if torch is not None and isinstance(attention_mask, torch.Tensor):
+        mask = attention_mask.long()
+        return (mask.cumsum(dim=1) - 1) * mask
+
+    mask = attention_mask.cast(tg.dtypes.int32)
+    return (mask.cumsum(axis=1) - 1) * mask
+
+
 def _position_ids_tensor(position: int, like: Any) -> Any:
+    batch = int(getattr(like, "shape", [1])[0]) if getattr(like, "shape", None) else 1
+
     if torch is not None and isinstance(like, torch.Tensor):
-        return torch.tensor([int(position)], device=like.device, dtype=torch.long)
-    return tg.Tensor([int(position)], device=getattr(like, "device", None), dtype=tg.dtypes.int32)
+        return torch.full(
+            (batch, 1),
+            int(position),
+            device=like.device,
+            dtype=torch.long,
+        )
+
+    return tg.Tensor(
+        [[int(position)] for _ in range(batch)],
+        device=getattr(like, "device", None),
+        dtype=tg.dtypes.int32,
+    )
+
+
+def _sequence_length(value: Any) -> int:
+    try:
+        shape = tuple(getattr(value, "shape", ()) or ())
+    except Exception:
+        shape = ()
+    if len(shape) >= 2:
+        return int(shape[1])
+    if len(shape) == 1:
+        return int(shape[0])
+    return 1
+
+
+def _is_final_shard(shard: Shard) -> bool:
+    try:
+        return int(shard.end_layer) >= int(shard.total_layers) - 1
+    except Exception:
+        return False
 
 
 def _torch_target_device() -> str:
@@ -327,8 +486,8 @@ def _torch_target_device() -> str:
 def _normalize_dtype(dtype: str) -> str:
     lower = dtype.lower()
     for candidate in (
-        "float16",
         "bfloat16",
+        "float16",
         "float32",
         "float64",
         "int64",
@@ -340,6 +499,207 @@ def _normalize_dtype(dtype: str) -> str:
         if candidate in lower:
             return candidate
     return "float32"
+
+
+def _numpy_dtype(dtype: str) -> str:
+    normalized = _normalize_dtype(dtype)
+    if normalized == "bfloat16":
+        return "float32"
+    return normalized
+
+
+def _bfloat16_buffer_to_float32(raw: bytes, shape: Any) -> np.ndarray:
+    raw_values = np.frombuffer(raw, dtype=np.uint16)
+    if shape:
+        raw_values = raw_values.reshape(shape)
+    widened = raw_values.astype(np.uint32) << 16
+    return np.array(widened.view(np.float32), copy=True)
+
+
+def _diagnostics_payload(
+    model: Any,
+    *,
+    phase: str,
+    prefill: bool,
+    shard: Shard,
+    input_ids: Any,
+    attention_mask: Any,
+    position_ids: Any,
+    hidden_state: Any,
+    output: Any,
+    token: int | None = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "phase": str(phase),
+        "prefill": bool(prefill),
+        "shard": _shard_payload(shard),
+        "input_ids": _tensor_meta(input_ids),
+        "attention_mask": _tensor_meta(attention_mask),
+        "position_ids": _tensor_meta(position_ids),
+        "hidden_state": _tensor_meta(hidden_state),
+        "output": _tensor_meta(output),
+        "kv_cache": _kv_cache_meta(model),
+    }
+    if token is not None:
+        payload["token"] = int(token)
+    return payload
+
+
+def _tensor_meta(value: Any) -> Dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        shape = value.get("shape")
+        dtype = value.get("dtype")
+        buf = value.get("buffer")
+        return {
+            "shape": list(shape) if isinstance(shape, list) else shape,
+            "dtype": str(dtype or ""),
+            "bytes": len(buf) if isinstance(buf, str) else 0,
+            "encoded": True,
+        }
+    try:
+        shape = tuple(getattr(value, "shape", ()) or ())
+    except Exception:
+        shape = ()
+    dtype = getattr(value, "dtype", None)
+    device = getattr(value, "device", None)
+    if shape:
+        meta = {
+            "shape": list(shape),
+            "dtype": str(dtype or ""),
+            "device": str(device or ""),
+        }
+        meta.update(_tensor_numeric_stats(value))
+        return meta
+    if isinstance(value, (list, tuple)):
+        meta = {
+            "shape": _nested_shape(value),
+            "dtype": type(value).__name__,
+        }
+        meta.update(_tensor_numeric_stats(value))
+        return meta
+    return {
+        "shape": [],
+        "dtype": type(value).__name__,
+    }
+
+
+def _tensor_numeric_stats(value: Any) -> Dict[str, Any]:
+    try:
+        if torch is not None and isinstance(value, torch.Tensor):
+            detached = value.detach()
+            numel = int(detached.numel())
+            if numel == 0:
+                return {"numel": 0}
+            if detached.is_complex():
+                return {"numel": numel}
+            data = detached.to(device="cpu", dtype=torch.float32)
+            finite = torch.isfinite(data)
+            finite_count = int(finite.sum().item())
+            stats: Dict[str, Any] = {
+                "numel": numel,
+                "finite": finite_count,
+                "nan": int(torch.isnan(data).sum().item()),
+                "inf": int(torch.isinf(data).sum().item()),
+            }
+            if finite_count > 0:
+                finite_values = data[finite]
+                stats.update(
+                    {
+                        "min": float(finite_values.min().item()),
+                        "max": float(finite_values.max().item()),
+                        "mean": float(finite_values.mean().item()),
+                    }
+                )
+            return stats
+
+        if isinstance(value, tg.Tensor):
+            arr = value.numpy()
+        elif hasattr(value, "numpy"):
+            arr = value.numpy()
+        elif isinstance(value, (list, tuple)):
+            arr = np.asarray(value)
+        else:
+            return {}
+
+        arr = np.asarray(arr)
+        numel = int(arr.size)
+        if numel == 0 or not np.issubdtype(arr.dtype, np.number):
+            return {"numel": numel}
+        if np.iscomplexobj(arr):
+            return {"numel": numel}
+        data = arr.astype(np.float32, copy=False)
+        finite = np.isfinite(data)
+        finite_count = int(finite.sum())
+        stats = {
+            "numel": numel,
+            "finite": finite_count,
+            "nan": int(np.isnan(data).sum()),
+            "inf": int(np.isinf(data).sum()),
+        }
+        if finite_count > 0:
+            finite_values = data[finite]
+            stats.update(
+                {
+                    "min": float(finite_values.min()),
+                    "max": float(finite_values.max()),
+                    "mean": float(finite_values.mean()),
+                }
+            )
+        return stats
+    except Exception:
+        return {}
+
+
+def _nested_shape(value: Any) -> list[int]:
+    shape: list[int] = []
+    current = value
+    while isinstance(current, (list, tuple)):
+        shape.append(len(current))
+        if not current:
+            break
+        current = current[0]
+    return shape
+
+
+def _kv_cache_meta(model: Any) -> Dict[str, Any]:
+    layers = list(getattr(model, "layers", []) or [])
+    positions: list[int | None] = []
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        cache = getattr(attn, "kv_cache", None) if attn is not None else None
+        cache_pos = getattr(cache, "cache_pos", None) if cache is not None else None
+        try:
+            positions.append(int(cache_pos) if cache_pos is not None else None)
+        except (TypeError, ValueError):
+            positions.append(None)
+
+    populated = [pos for pos in positions if pos is not None]
+    return {
+        "layer_count": len(layers),
+        "cache_pos": positions,
+        "min_cache_pos": min(populated) if populated else None,
+        "max_cache_pos": max(populated) if populated else None,
+    }
+
+
+def _ensure_decode_cache_ready(model: Any, curr_pos: int) -> None:
+    if curr_pos <= 0:
+        return
+    meta = _kv_cache_meta(model)
+    if int(meta.get("layer_count", 0) or 0) <= 0:
+        return
+    positions = meta.get("cache_pos", [])
+    if not isinstance(positions, list) or not positions:
+        return
+    bad_positions = [pos for pos in positions if pos != curr_pos]
+    if bad_positions:
+        raise RuntimeError(
+            "Shard KV cache is not primed for decode: "
+            f"expected cache_pos={curr_pos}, actual={positions}. "
+            "The shard likely missed the prefill request or received a mismatched decode step."
+        )
 
 
 def _shard_payload(shard: Shard) -> Dict[str, Any]:

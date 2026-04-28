@@ -1,5 +1,8 @@
+import json
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from textual.app import App
 from textual.widgets import Button, Checkbox, Input, Select, Static, TextArea
@@ -27,8 +30,9 @@ class TestAgentScreen(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(screen._functions_summary)
             self.assertEqual(
                 set(screen._gen_inputs),
-                {"temperature", "top_k", "top_p", "repetition_penalty", "alpha_f", "alpha_p"},
+                {"temperature", "top_k", "top_p", "repetition_penalty", "alpha_f", "alpha_p", "max_steps"},
             )
+            self.assertIsNotNone(screen.query_one("#agent-gen-max_steps", Input))
             self.assertIsNotNone(screen.query_one("#agent-gen-enable-thinking", Checkbox))
             self.assertIsNotNone(screen.query_one("#agent-gen-endless-mode", Checkbox))
             self.assertIsNotNone(screen.query_one("#agent-instructions", TextArea))
@@ -191,7 +195,7 @@ class TestAgentScreenPrompt(unittest.TestCase):
             ("write_file", {"path": "notes.txt", "content": "hello"}),
         )
 
-    def test_compact_agent_reply_for_memory_drops_verbose_thoughts(self) -> None:
+    def test_compact_agent_reply_for_memory_keeps_json_shape(self) -> None:
         screen = AgentScreen(peer_client=object())
 
         compact = screen._compact_agent_reply_for_memory(
@@ -216,9 +220,30 @@ class TestAgentScreenPrompt(unittest.TestCase):
         self.assertIsNotNone(compact)
         assert compact is not None
         self.assertEqual(compact["role"], "assistant")
-        self.assertIn("ability=write_file", compact["content"])
-        self.assertIn("speak=Writing the file now", compact["content"])
+        content = json.loads(compact["content"])
+        self.assertEqual(content["ability"]["name"], "write_file")
+        self.assertEqual(content["ability"]["args"]["path"], "notes.txt")
+        self.assertEqual(content["thoughts"]["speak"], "Writing the file now")
         self.assertNotIn("reasoning", compact["content"])
+
+    def test_extract_function_call_reads_legacy_compact_agent_line(self) -> None:
+        screen = AgentScreen(peer_client=object())
+
+        result = screen._extract_function_call(
+            'ability=web_search | args={"query":"US gas prices"} | speak=Searching reliable sources.'
+        )
+
+        self.assertEqual(result, ("web_search", {"query": "US gas prices"}))
+
+    def test_agent_max_steps_reads_env_and_input(self) -> None:
+        with patch.dict("os.environ", {"TC_AGENT_MAX_STEPS": "4"}):
+            screen = AgentScreen(peer_client=object())
+
+        self.assertEqual(screen._agent_max_steps, 4)
+        screen._gen_inputs["max_steps"] = SimpleNamespace(value="7")
+
+        self.assertEqual(screen._effective_gen_config()["max_steps"], 7)
+        self.assertEqual(screen._agent_max_steps, 7)
 
     def test_apply_agent_config_updates_prompt_name(self) -> None:
         screen = AgentScreen(peer_client=object())
@@ -231,6 +256,96 @@ class TestAgentScreenPrompt(unittest.TestCase):
         )
 
         self.assertEqual(screen._agent_prompt_name, "custom_prompt.j2")
+
+
+class TestAgentScreenModelLoad(unittest.IsolatedAsyncioTestCase):
+    async def test_start_model_load_uses_local_shard_and_waits_for_peers(self) -> None:
+        self_peer = SimpleNamespace(
+            peer_client_id="self",
+            ip_address="192.168.0.10",
+            port=8765,
+            gpu_vram="8",
+            cpu_ram="8",
+            gpu_flops=0.0,
+        )
+        remote_peer = SimpleNamespace(
+            peer_client_id="peer-1",
+            ip_address="192.168.0.20",
+            port=8765,
+            gpu_vram="8",
+            cpu_ram="8",
+            gpu_flops=0.0,
+        )
+        runtime_calls: list[dict[str, object]] = []
+        peer_client = SimpleNamespace(
+            peer_client_id="self",
+            get_peers=lambda include_self=True: [self_peer, remote_peer] if include_self else [remote_peer],
+            register_generation_runtime=lambda **kwargs: runtime_calls.append(kwargs),
+            clear_generation_runtime=lambda **kwargs: None,
+        )
+        screen = AgentScreen(peer_client=peer_client)
+        screen._model_id = "demo/model"
+        screen._set_load_button_enabled = lambda enabled: None
+        screen._refresh_backend_label = lambda: None
+        screen._refresh_state_label = lambda: None
+        log_messages: list[str] = []
+        screen._log = lambda message: log_messages.append(message)
+
+        captured: dict[str, object] = {}
+
+        async def fake_load_model(*, shard=None):
+            captured["shard"] = shard
+            return (
+                SimpleNamespace(shard=shard),
+                {"num_layers": 8, "max_seq_len": 640},
+                object(),
+                Path("/tmp/model"),
+                0.5,
+            )
+
+        screen._load_model = fake_load_model
+
+        with (
+            patch(
+                "cheetah.tui.agent_screen.resolve_model_assets_for_backend",
+                new=AsyncMock(return_value=({"num_layers": 8, "max_seq_len": 640}, Path("/tmp/model"))),
+            ),
+            patch("cheetah.tui.agent_screen.detect_quantization_mode", return_value=(False, "standard")),
+            patch(
+                "cheetah.tui.agent_screen.load_model_shards_on_peers",
+                return_value={
+                    "remote_results": [
+                        {
+                            "peer": remote_peer,
+                            "response": {
+                                "elapsed": 1.2,
+                                "already_loaded": False,
+                                "config_fingerprint": "match-config",
+                                "tokenizer_fingerprint": "match-tokenizer",
+                            },
+                        }
+                    ]
+                },
+            ) as load_peers,
+            patch(
+                "cheetah.tui.agent_screen.validate_peer_runtime_fingerprints",
+                return_value=[],
+            ) as validate_fingerprints,
+        ):
+            await screen._start_model_load()
+
+        shard = captured.get("shard")
+        self.assertIsNotNone(shard)
+        assert shard is not None
+        self.assertEqual(shard.start_layer, 0)
+        self.assertEqual(shard.end_layer, 4)
+        self.assertTrue(screen._model_loaded)
+        load_peers.assert_called_once()
+        validate_fingerprints.assert_called_once()
+        self.assertEqual(runtime_calls[0]["model_id"], "demo/model")
+        self.assertEqual(runtime_calls[0]["shard"].start_layer, 0)
+        self.assertIn("Waiting for 1 peer shard(s) to finish loading...", log_messages)
+        self.assertIn("Shard-aware model ready on 2 nodes.", log_messages)
 
 
 if __name__ == "__main__":

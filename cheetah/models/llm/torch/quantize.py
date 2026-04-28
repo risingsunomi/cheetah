@@ -15,6 +15,7 @@ import safetensors
 import torch
 
 from cheetah.logging_utils import get_logger
+from cheetah.models.shard import Shard
 
 from .load_progress import WeightLoadProgress
 
@@ -95,12 +96,44 @@ def _infer_prefix(weight_map: Mapping[str, str]) -> str:
     return ""
 
 
-def _resolve_weight_key(key: str, weight_map: Mapping[str, str], prefix: str) -> str | None:
-    if key in weight_map:
+def _global_layer_key(key: str, shard: Shard | None) -> str:
+    if shard is None:
         return key
-    prefixed = f"{prefix}{key}" if prefix else key
-    if prefixed in weight_map:
-        return prefixed
+    try:
+        start_layer = int(getattr(shard, "start_layer", 0) or 0)
+    except (TypeError, ValueError):
+        start_layer = 0
+    if start_layer <= 0:
+        return key
+
+    parts = key.split(".")
+    if len(parts) < 2 or parts[0] != "layers":
+        return key
+    try:
+        local_index = int(parts[1])
+    except (TypeError, ValueError):
+        return key
+    parts[1] = str(local_index + start_layer)
+    return ".".join(parts)
+
+
+def _resolve_weight_key(
+    key: str,
+    weight_map: Mapping[str, str],
+    prefix: str,
+    shard: Shard | None = None,
+) -> str | None:
+    global_key = _global_layer_key(key, shard)
+    candidates = [global_key]
+    if key not in candidates:
+        candidates.append(key)
+
+    for candidate in candidates:
+        if candidate in weight_map:
+            return candidate
+        prefixed = f"{prefix}{candidate}" if prefix else candidate
+        if prefixed in weight_map:
+            return prefixed
     return None
 
 
@@ -294,9 +327,10 @@ def load_quantized_safetensors(
 
     prefix = _infer_prefix(weight_map)
     progress = WeightLoadProgress(total=len(model_state_dict), label="torch-qload")
+    shard = getattr(model, "shard", None)
 
     for idx, key in enumerate(model_state_dict.keys(), start=1):
-        model_weight_key = _resolve_weight_key(key, weight_map, prefix)
+        model_weight_key = _resolve_weight_key(key, weight_map, prefix, shard)
         if model_weight_key not in weight_map:
             if use_tied and key == "output.weight":
                 embed_weight_key = "model.embed_tokens.weight"
