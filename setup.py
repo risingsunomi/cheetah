@@ -41,7 +41,7 @@ def _torch_requirement() -> str:
 
     Supported env vars:
     - TC_TORCH_VARIANT: auto|cpu|mps|cu126|cu12.6|cuda12.8|cu130|13.0|...
-    - TC_TORCH_VERSION: base torch version (default: 2.5.1)
+    - TC_TORCH_VERSION: base torch version (default: 2.10.0)
 
     Notes:
     - CUDA local-version wheels (e.g. +cu126) generally require the matching
@@ -72,7 +72,7 @@ BASE_REQUIRES = [
     _torch_requirement(),
 ]
 
-_DEFAULT_TORCH_VERSION = os.getenv("TC_TORCH_VERSION", "2.5.1").strip()
+_DEFAULT_TORCH_VERSION = os.getenv("TC_TORCH_VERSION", "2.10.0").strip()
 
 EXTRAS = {
     "dev": [
@@ -88,7 +88,7 @@ EXTRAS = {
 
 setup(
     name="cheetah",
-    version="0.1",
+    version="1.0.0",
     description="Distributed inference and training with tinygrad or torch backends",
     packages=find_packages(include=["cheetah", "cheetah.*"]),
     include_package_data=True,
